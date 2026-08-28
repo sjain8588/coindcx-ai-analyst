@@ -202,6 +202,11 @@ def score_candidate(pair, price_row, d1, h1, m15):
 
     confidence=max(35,min(95,50+raw*.45))
 
+    # History quality matters. New listings can still be analyzed, but their
+    # confidence is capped because long-term EMA/support context is incomplete.
+    history_factor = min(1.0, min(len(d1)/120.0, len(h1)/240.0, len(m15)/240.0))
+    confidence = min(confidence, 50 + 45*history_factor)
+
     aligned = (
         (side=="LONG" and b1>s1 and bh>=sh and b15>=s15 and x15.macd>x15.macd_signal) or
         (side=="SHORT" and s1>b1 and sh>=bh and s15>=b15 and x15.macd<x15.macd_signal)
@@ -369,8 +374,15 @@ if st.button("📊 Analyze My Coin"):
         h1 = get_futures_candles(pair, "60", now-120*86400, now)
         m15 = get_futures_candles(pair, "15", now-30*86400, now)
 
-        if min(len(d1), len(h1), len(m15)) < 210:
-            st.error("Not enough Futures candle history was returned for this coin.")
+        # Meme/futures listings can be very new. Do not require 210 daily
+        # candles just to produce an analysis. Use the available history and
+        # clearly reduce confidence when history is limited.
+        if len(d1) < 10 or len(h1) < 30 or len(m15) < 30:
+            st.error(
+                f"CoinDCX returned too little history for {symbol}: "
+                f"1D={len(d1)}, 1H={len(h1)}, 15m={len(m15)}. "
+                f"Need at least 10 / 30 / 30 candles."
+            )
             st.stop()
 
         x = score_candidate(
@@ -410,6 +422,10 @@ if st.button("📊 Analyze My Coin"):
         c.metric("Signal confidence", f'{x["confidence"]:.0f}%')
         d.metric("1D RSI", f'{x["rsi"]:.1f}')
 
+        st.caption(
+            f"History available: 1D {len(x['d1'])} candles • "
+            f"1H {len(x['h1'])} candles • 15m {len(x['m15'])} candles"
+        )
         st.write(
             f"**1D structure:** {x['structure']}  |  "
             f"**1H ADX:** {x['adx']:.1f}  |  "
@@ -475,7 +491,7 @@ if st.button("🔍 Scan Top Futures",type="primary"):
                 d1=get_futures_candles(pair,"1D",now-400*86400,now)
                 h1=get_futures_candles(pair,"60",now-120*86400,now)
                 m15=get_futures_candles(pair,"15",now-30*86400,now)
-                if min(len(d1),len(h1),len(m15))<210: continue
+                if len(d1)<10 or len(d1h)<30 or len(m15)<30: continue
                 results.append((symbol,score_candidate(pair,p,indicators(d1),indicators(h1),indicators(m15))))
             except Exception:
                 continue
@@ -501,6 +517,10 @@ if st.button("🔍 Scan Top Futures",type="primary"):
                 d.metric("Daily RSI",f'{x["rsi"]:.1f}')
 
                 st.write(f"**Support:** {fmt(x['support2'])} / {fmt(x['support1'])}   |   **Resistance:** {fmt(x['resistance1'])} / {fmt(x['resistance2'])}")
+                st.caption(
+                    f"History available: 1D {len(x['d1'])} candles • "
+                    f"1H {len(x['h1'])} candles • 15m {len(x['m15'])} candles"
+                )
 
                 if x["signal"] in ("LONG","SHORT"):
                     a,b,c,d=st.columns(4)
