@@ -247,6 +247,19 @@ def fmt(v):
 
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
 meme_only=st.checkbox("Meme-focused scan",value=True)
+
+def normalize_coin_input(text):
+    q = text.strip().upper().replace("/", "").replace("-", "").replace("_", "")
+    # Remove common futures quote suffixes so "VELVETUSDT" becomes "VELVET".
+    for quote in ("USDT", "INR", "USDC"):
+        if q.endswith(quote) and len(q) > len(quote):
+            q = q[:-len(quote)]
+            break
+    if q.startswith("B") and len(q) > 2:
+        # Do not blindly strip B from normal tickers. Only strip it when the
+        # remaining token looks like a contract symbol used by CoinDCX.
+        pass
+    return q
 if meme_only:
     st.caption("Meme focus uses a broad symbol/name keyword filter; turn it off to scan every active futures instrument.")
 
@@ -277,41 +290,79 @@ if st.button("📊 Analyze My Coin"):
             st.warning("Enter a coin first, for example DOGE or SHIB.")
             st.stop()
 
-        active = get_active_instruments(margin)
         prices = get_futures_prices()
 
-        raw = coin_input.strip().upper().replace("/", "_").replace("-", "_")
-        raw_compact = raw.replace("_", "")
+        # Search both common quote markets for the requested coin. This is
+        # important because a coin can exist in Futures USDT even when the
+        # currently selected margin market is different.
+        requested = normalize_coin_input(coin_input)
+        margin_list = [margin] + [q for q in ("USDT","INR") if q != margin]
 
         candidates = []
-        for pair in active:
-            pair_u = pair.upper()
-            p = prices.get(pair)
-            if not p:
-                continue
-            symbol = str(p.get("mkt", "")).upper()
+        seen = set()
 
-            pair_compact = pair_u.replace("_", "")
-            if (
-                raw in pair_u
-                or raw_compact in pair_compact
-                or raw in symbol
-                or raw_compact in symbol
-            ):
-                candidates.append((pair, p, symbol))
+        for qmargin in margin_list:
+            try:
+                active = get_active_instruments(qmargin)
+            except Exception:
+                continue
+
+            for pair in active:
+                pair_u = str(pair).upper()
+                p = prices.get(pair) if 'prices' in locals() else None
+                if not p:
+                    continue
+
+                symbol = str(p.get("mkt", "")).upper()
+                # Build clean base-token candidates from pair and market symbol.
+                names = {
+                    pair_u.replace("-", "").replace("_", ""),
+                    symbol.replace("-", "").replace("_", "")
+                }
+                matched = False
+                for name in names:
+                    n = name
+                    for prefix in ("B", "I"):
+                        # B-/I- are removed by the compact normalization only
+                        # when the resulting name contains the requested token.
+                        if n.startswith(prefix):
+                            n2 = n[1:]
+                        else:
+                            n2 = n
+                        if n2 == requested + qmargin or n2 == requested:
+                            matched = True
+                        if n2.startswith(requested + qmargin):
+                            matched = True
+                if matched and pair not in seen:
+                    candidates.append((pair, p, symbol, qmargin))
+                    seen.add(pair)
 
         if not candidates:
+            # Fallback: if the price feed uses a slightly different market
+            # label, show the closest symbols to make troubleshooting easy.
+            available = []
+            for qmargin in margin_list:
+                try:
+                    active = get_active_instruments(qmargin)
+                    for pair in active:
+                        s = str(pair).upper()
+                        if requested in s.replace("-", "").replace("_",""):
+                            available.append(s)
+                except Exception:
+                    pass
+            hint = ", ".join(available[:8])
+            extra = f" Possible matching contracts: {hint}" if hint else ""
             st.error(
-                f"No active {margin}-margin CoinDCX Futures contract was found for '{coin_input}'. "
-                "Try the coin ticker (for example DOGE) or the full pair."
+                f"No active CoinDCX Futures contract was found for '{coin_input}'. "
+                f"Tried {', '.join(margin_list)} margin markets.{extra}"
             )
             st.stop()
 
-        # Prefer an exact-looking match when several instruments match.
-        candidates.sort(key=lambda z: (
-            0 if raw_compact == z[0].upper().replace("_","").replace("-","") else 1,
-            0 if raw_compact == z[2].upper().replace("_","").replace("-","") else 1
-        ))
+        # Prefer the user's selected margin market, then USDT.
+        candidates.sort(key=lambda z: (0 if z[3] == margin else 1, len(z[0])))
+        pair, p, symbol, found_margin = candidates[0]
+        if found_margin != margin:
+            st.info(f"Found {symbol} in the **{found_margin}** Futures market; analyzing that contract.")
         pair, p, symbol = candidates[0]
 
         now = int(time.time())
