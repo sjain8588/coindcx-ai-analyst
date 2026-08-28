@@ -244,6 +244,144 @@ if meme_only:
 
 MEME_WORDS={"DOGE","SHIB","PEPE","BONK","FLOKI","WIF","BOME","MEME","BRETT","MOG","TURBO","MEW","NEIRO","BABYDOGE","1000SHIB","1000PEPE","1000BONK","1000FLOKI","1000LUNC","PONKE","MYRO","SLERF","LADYS","DEGEN","MOTHER","MAGA","TRUMP"}
 
+
+st.divider()
+st.header("💼 My Invested Coin — Long / Short Check")
+st.caption("Enter a coin you already hold. The scanner will find its CoinDCX Futures contract and evaluate whether the current setup favors LONG, SHORT, or WAIT.")
+
+coin_input = st.text_input(
+    "Coin / Futures pair",
+    placeholder="Example: DOGE, SHIB, PEPE, B-DOGE_USDT",
+    help="You can enter DOGE, DOGEUSDT, or the CoinDCX futures pair such as B-DOGE_USDT."
+)
+avg_price_input = st.number_input(
+    "Optional: your average entry price",
+    min_value=0.0,
+    value=0.0,
+    step=0.00000001,
+    format="%.8f",
+    help="Enter your actual average price if you want the scanner to compare the current price with your cost."
+)
+
+if st.button("📊 Analyze My Coin"):
+    try:
+        if not coin_input.strip():
+            st.warning("Enter a coin first, for example DOGE or SHIB.")
+            st.stop()
+
+        active = get_active_instruments(margin)
+        prices = get_futures_prices()
+
+        raw = coin_input.strip().upper().replace("/", "_").replace("-", "_")
+        raw_compact = raw.replace("_", "")
+
+        candidates = []
+        for pair in active:
+            pair_u = pair.upper()
+            p = prices.get(pair)
+            if not p:
+                continue
+            symbol = str(p.get("mkt", "")).upper()
+
+            pair_compact = pair_u.replace("_", "")
+            if (
+                raw in pair_u
+                or raw_compact in pair_compact
+                or raw in symbol
+                or raw_compact in symbol
+            ):
+                candidates.append((pair, p, symbol))
+
+        if not candidates:
+            st.error(
+                f"No active {margin}-margin CoinDCX Futures contract was found for '{coin_input}'. "
+                "Try the coin ticker (for example DOGE) or the full pair."
+            )
+            st.stop()
+
+        # Prefer an exact-looking match when several instruments match.
+        candidates.sort(key=lambda z: (
+            0 if raw_compact == z[0].upper().replace("_","").replace("-","") else 1,
+            0 if raw_compact == z[2].upper().replace("_","").replace("-","") else 1
+        ))
+        pair, p, symbol = candidates[0]
+
+        now = int(time.time())
+        d1 = get_futures_candles(pair, "1D", now-400*86400, now)
+        h1 = get_futures_candles(pair, "60", now-120*86400, now)
+        m15 = get_futures_candles(pair, "15", now-30*86400, now)
+
+        if min(len(d1), len(h1), len(m15)) < 210:
+            st.error("Not enough Futures candle history was returned for this coin.")
+            st.stop()
+
+        x = score_candidate(
+            pair, p,
+            indicators(d1),
+            indicators(h1),
+            indicators(m15)
+        )
+
+        st.subheader(f"{symbol}  •  {pair}")
+
+        current = float(x["price"])
+        if avg_price_input > 0:
+            pnl_pct = (current - avg_price_input) / avg_price_input * 100
+            st.metric("Your position vs current price", f"{pnl_pct:+.2f}%")
+
+        # Give a dedicated interpretation for an already-held spot position.
+        if x["signal"] == "LONG":
+            st.success(
+                "🟢 LONG BIAS — Current Futures structure supports the bullish direction. "
+                "For an existing spot holding, this means the trend is currently favorable to the long side."
+            )
+        elif x["signal"] == "SHORT":
+            st.error(
+                "🔴 SHORT BIAS — Current Futures structure supports the bearish direction. "
+                "For an existing spot holding, this is a warning that downside momentum is stronger."
+            )
+        else:
+            st.warning(
+                "🟡 WAIT — The coin is not giving a sufficiently clean long or short setup right now. "
+                "Avoid making a directional decision from momentum alone."
+            )
+
+        a,b,c,d = st.columns(4)
+        a.metric("Current price", fmt(current))
+        b.metric("24h move", f'{x["change"]:+.2f}%')
+        c.metric("Signal confidence", f'{x["confidence"]:.0f}%')
+        d.metric("1D RSI", f'{x["rsi"]:.1f}')
+
+        st.write(
+            f"**1D structure:** {x['structure']}  |  "
+            f"**1H ADX:** {x['adx']:.1f}  |  "
+            f"**Support:** {fmt(x['support1'])} / {fmt(x['support2'])}  |  "
+            f"**Resistance:** {fmt(x['resistance1'])} / {fmt(x['resistance2'])}"
+        )
+
+        if x["signal"] in ("LONG", "SHORT"):
+            a,b,c = st.columns(3)
+            a.metric("Reference entry", fmt(x["entry"]))
+            b.metric("Stop loss", fmt(x["sl"]))
+            c.metric("TP1 / TP2", f'{fmt(x["tp1"])} / {fmt(x["tp2"])}')
+
+        with st.expander("Why did the scanner choose this direction?"):
+            st.write(
+                "The decision combines the 1D, 1H and 15m trend with EMA 20/50/100/200, "
+                "RSI, MACD, ADX/DI, ATR, volume, Bollinger Bands, market structure, "
+                "support/resistance and futures microstructure."
+            )
+            st.write(
+                f"Daily RSI: {x['rsi']:.1f} | 1H ADX: {x['adx']:.1f} | "
+                f"Order-book imbalance: "
+                f"{('not available' if x['ob'] is None else f'{x['ob']*100:.2f}%')} | "
+                f"Trade-flow proxy: "
+                f"{('not available' if x['flow'] is None else f'{x['flow']*100:.2f}%')}"
+            )
+            st.line_chart(
+                x["d1"].set_index("time")[["close","ema20","ema50","ema100","ema200"]].tail(250)
+            )
+
 if st.button("🔍 Scan Top Futures",type="primary"):
     try:
         active=get_active_instruments(margin)
@@ -325,4 +463,4 @@ if st.button("🔍 Scan Top Futures",type="primary"):
         st.code(str(e))
 
 st.divider()
-st.caption("Analysis only. CoinDCX futures endpoints used: active instruments, futures current prices, futures candlesticks, futures trades and futures order book. No API keys, orders, balances or withdrawals are used.")
+st.caption("The My Invested Coin tool is an analysis signal, not a command to open a leveraged position. For a spot holding, a SHORT BIAS is best interpreted as a downside-risk warning unless you intentionally hedge with futures.\n\nAnalysis only. CoinDCX futures endpoints used: active instruments, futures current prices, futures candlesticks, futures trades and futures order book. No API keys, orders, balances or withdrawals are used.")
