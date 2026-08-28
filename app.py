@@ -363,7 +363,6 @@ if st.button("📊 Analyze My Coin"):
         pair, p, symbol, found_margin = candidates[0]
         if found_margin != margin:
             st.info(f"Found {symbol} in the **{found_margin}** Futures market; analyzing that contract.")
-        pair, p, symbol, found_margin = candidates[0]
 
         now = int(time.time())
         d1 = get_futures_candles(pair, "1D", now-400*86400, now)
