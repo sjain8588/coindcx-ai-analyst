@@ -382,6 +382,10 @@ if st.button("📊 Analyze My Coin"):
                 x["d1"].set_index("time")[["close","ema20","ema50","ema100","ema200"]].tail(250)
             )
 
+    except Exception as e:
+        st.error(f"My Coin analysis failed: {e}")
+        st.code(str(e))
+
 if st.button("🔍 Scan Top Futures",type="primary"):
     try:
         active=get_active_instruments(margin)
