@@ -5,292 +5,217 @@ import requests
 
 BASE = "https://api.coindcx.com"
 
-st.set_page_config(page_title="CoinDCX AI Analyst v5", page_icon="📊", layout="wide")
-st.title("📊 CoinDCX AI Market Analyst v5")
-st.caption("Analysis only • Public CoinDCX market data • No trading • No account access")
+st.set_page_config(page_title="CoinDCX Futures Scanner", page_icon="🎯", layout="wide")
 
-@st.cache_data(ttl=60)
-def get_markets():
-    r = requests.get(f"{BASE}/exchange/v1/markets_details", timeout=20)
-    r.raise_for_status()
-    return r.json()
-
-@st.cache_data(ttl=10)
-def get_ticker():
-    r = requests.get(f"{BASE}/exchange/ticker", timeout=20)
-    r.raise_for_status()
-    return r.json()
+st.title("🎯 CoinDCX Meme-Coin Futures Scanner")
+st.caption("Analysis only • Finds up to 5 high-momentum futures candidates • No trading/account access")
 
 @st.cache_data(ttl=30)
-def get_candles(pair, interval):
-    r = requests.get(f"{BASE}/market_data/candles",
-                     params={"pair": pair, "interval": interval, "limit": 1000},
-                     timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"Candle API HTTP {r.status_code}: {r.text[:500]}")
-    data = r.json()
-    if not isinstance(data, list):
-        raise RuntimeError(f"Unexpected candle response: {data}")
-    d = pd.DataFrame(data)
-    if d.empty:
-        return d
-    for c in ["open","high","low","close","volume"]:
-        if c not in d.columns:
-            raise RuntimeError(f"Missing candle field: {c}")
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-    d["time"] = pd.to_datetime(d["time"], unit="ms", errors="coerce")
+def markets():
+    r=requests.get(f"{BASE}/exchange/v1/markets_details",timeout=20)
+    r.raise_for_status(); return r.json()
+
+@st.cache_data(ttl=10)
+def ticker():
+    r=requests.get(f"{BASE}/exchange/ticker",timeout=20)
+    r.raise_for_status(); return r.json()
+
+@st.cache_data(ttl=20)
+def candles(pair,interval):
+    r=requests.get(f"{BASE}/market_data/candles",
+                   params={"pair":pair,"interval":interval,"limit":1000},timeout=30)
+    r.raise_for_status()
+    d=pd.DataFrame(r.json())
+    if d.empty:return d
+    for c in ["open","high","low","close","volume"]: d[c]=pd.to_numeric(d[c],errors="coerce")
+    d["time"]=pd.to_datetime(d["time"],unit="ms",errors="coerce")
     return d.dropna(subset=["time","open","high","low","close","volume"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
 @st.cache_data(ttl=5)
-def get_orderbook(pair, depth=100):
-    r = requests.get(f"{BASE}/market_data/orderbook",
-                     params={"pair": pair, "depth": depth}, timeout=15)
-    r.raise_for_status()
-    return r.json()
+def orderbook(pair):
+    r=requests.get(f"{BASE}/market_data/orderbook",params={"pair":pair,"depth":100},timeout=15)
+    r.raise_for_status(); return r.json()
 
 @st.cache_data(ttl=5)
-def get_trades(pair, limit=200):
-    r = requests.get(f"{BASE}/market_data/trade_history",
-                     params={"pair": pair, "limit": limit}, timeout=15)
-    r.raise_for_status()
-    data = r.json()
-    return data if isinstance(data, list) else []
+def trades(pair):
+    r=requests.get(f"{BASE}/market_data/trade_history",params={"pair":pair,"limit":200},timeout=15)
+    r.raise_for_status(); x=r.json(); return x if isinstance(x,list) else []
 
-def resolve_market(text, markets):
-    q = text.upper().strip().replace("/","").replace("-","").replace("_","")
-    exact, coin = [], []
-    for m in markets:
-        if str(m.get("status","")).lower() != "active":
-            continue
-        symbol = str(m.get("symbol",m.get("coindcx_name",""))).upper()
-        name = str(m.get("coindcx_name","")).upper()
-        base = str(m.get("base_currency_short_name","")).upper()
-        target = str(m.get("target_currency_short_name","")).upper()
-        if q in (symbol,name) or target+base == q:
-            exact.append(m)
-        elif q == target:
-            coin.append(m)
-    choices = exact or coin
-    if not choices:
-        return None
-    choices.sort(key=lambda m: (
-        str(m.get("base_currency_short_name","")).upper() not in ("INR","USDT"),
-        str(m.get("base_currency_short_name","")).upper() != "INR"
-    ))
-    return choices[0]
+def is_futures(m):
+    # CoinDCX market metadata can expose market/ecode fields differently.
+    text=" ".join(str(m.get(k,"")).upper() for k in ["market","symbol","coindcx_name","pair","ecode","market_type"])
+    return any(s in text for s in ["FUTURES","FUTURE","F-"]) or str(m.get("ecode","")).upper()=="F"
 
-def indicators(d):
+def active_candidates(ms,ts):
+    out=[]
+    for m in ms:
+        if str(m.get("status","")).lower()!="active": continue
+        # Prefer futures markets when metadata identifies them.
+        if not is_futures(m): continue
+        sym=str(m.get("symbol",m.get("coindcx_name",""))).upper()
+        if sym: out.append((m,sym))
+    return out
+
+def ind(d):
     x=d.copy()
-    x["ema20"]=x.close.ewm(span=20,adjust=False).mean()
-    x["ema50"]=x.close.ewm(span=50,adjust=False).mean()
-    x["ema200"]=x.close.ewm(span=200,adjust=False).mean()
+    for n in [20,50,100,200]: x[f"ema{n}"]=x.close.ewm(span=n,adjust=False).mean()
     delta=x.close.diff()
     gain=delta.clip(lower=0).ewm(alpha=1/14,adjust=False).mean()
     loss=(-delta.clip(upper=0)).ewm(alpha=1/14,adjust=False).mean()
-    rs=gain/loss.replace(0,np.nan)
-    x["rsi"]=100-100/(1+rs)
-    e12=x.close.ewm(span=12,adjust=False).mean()
-    e26=x.close.ewm(span=26,adjust=False).mean()
-    x["macd"]=e12-e26
-    x["macd_signal"]=x.macd.ewm(span=9,adjust=False).mean()
+    rs=gain/loss.replace(0,np.nan); x["rsi"]=100-100/(1+rs)
+    e12=x.close.ewm(span=12,adjust=False).mean(); e26=x.close.ewm(span=26,adjust=False).mean()
+    x["macd"]=e12-e26; x["macd_signal"]=x.macd.ewm(span=9,adjust=False).mean()
     tr=pd.concat([x.high-x.low,(x.high-x.close.shift()).abs(),(x.low-x.close.shift()).abs()],axis=1).max(axis=1)
     x["atr"]=tr.ewm(alpha=1/14,adjust=False).mean()
-    x["vol_ma20"]=x.volume.rolling(20).mean()
+    x["volma"]=x.volume.rolling(20).mean()
+    # Bollinger Bands
+    x["bbmid"]=x.close.rolling(20).mean(); x["bbstd"]=x.close.rolling(20).std()
+    x["bbup"]=x.bbmid+2*x.bbstd; x["bblow"]=x.bbmid-2*x.bbstd
+    # ADX
+    up=x.high.diff(); dn=-x.low.diff()
+    plus=np.where((up>dn)&(up>0),up,0.0); minus=np.where((dn>up)&(dn>0),dn,0.0)
+    atr14=x["atr"].replace(0,np.nan)
+    pdi=100*pd.Series(plus,index=x.index).ewm(alpha=1/14,adjust=False).mean()/atr14
+    mdi=100*pd.Series(minus,index=x.index).ewm(alpha=1/14,adjust=False).mean()/atr14
+    dx=100*(pdi-mdi).abs()/(pdi+mdi).replace(0,np.nan)
+    x["adx"]=dx.ewm(alpha=1/14,adjust=False).mean()
+    x["pdi"]=pdi; x["mdi"]=mdi
     return x
 
 def structure(d):
-    if len(d)<40: return "Insufficient data"
-    r=d.tail(10); p=d.iloc[-30:-10]
-    hh=r.high.max()>p.high.max(); hl=r.low.min()>p.low.min()
-    lh=r.high.max()<p.high.max(); ll=r.low.min()<p.low.min()
-    if hh and hl: return "Bullish: higher highs + higher lows"
-    if lh and ll: return "Bearish: lower highs + lower lows"
-    return "Mixed / range"
+    r=d.tail(12); p=d.iloc[-36:-12]
+    if len(p)<10:return "Mixed"
+    if r.high.max()>p.high.max() and r.low.min()>p.low.min():return "Bullish"
+    if r.high.max()<p.high.max() and r.low.min()<p.low.min():return "Bearish"
+    return "Mixed"
 
-def tf(d):
+def tfscore(d):
     x=d.iloc[-1]
-    trend="Bullish" if x.ema20>x.ema50>x.ema200 else ("Bearish" if x.ema20<x.ema50<x.ema200 else "Mixed")
-    if x.rsi>=80: mom="Extreme overbought"
-    elif x.rsi>=70: mom="Overbought"
-    elif x.rsi<=20: mom="Extreme oversold"
-    elif x.rsi<=30: mom="Oversold"
-    elif x.rsi>=55: mom="Bullish"
-    elif x.rsi<=45: mom="Bearish"
-    else: mom="Neutral"
-    return {"trend":trend,"structure":structure(d),"momentum":mom,"rsi":float(x.rsi),
-            "macd":"Bullish" if x.macd>x.macd_signal else "Bearish",
-            "volume":"Above average" if x.volume>x.vol_ma20 else "Below average",
-            "close":float(x.close),"atr":float(x.atr)}
+    bull=bear=0
+    bull += int(x.close>x.ema20)+int(x.ema20>x.ema50)+int(x.ema50>x.ema100)+int(x.ema100>x.ema200)
+    bear += int(x.close<x.ema20)+int(x.ema20<x.ema50)+int(x.ema50<x.ema100)+int(x.ema100<x.ema200)
+    bull += int(55<=x.rsi<70)+int(x.macd>x.macd_signal)+int(x.pdi>x.mdi)+int(x.volume>x.volma)
+    bear += int(30<x.rsi<=45)+int(x.macd<x.macd_signal)+int(x.mdi>x.pdi)+int(x.volume>x.volma)
+    return bull,bear
 
-def microstructure(book,trades):
-    bids=book.get("bids",{}) if isinstance(book,dict) else {}
-    asks=book.get("asks",{}) if isinstance(book,dict) else {}
-    B=sorted([(float(p),float(q)) for p,q in bids.items()],reverse=True)
-    A=sorted([(float(p),float(q)) for p,q in asks.items()])
-    if not B or not A: ob=None
-    else:
-        best_bid=B[0][0]; best_ask=A[0][0]
-        mid=(best_bid+best_ask)/2
-        # Compare liquidity close to the midpoint, reducing distortion from distant walls.
-        near_b=sum(q for p,q in B if p>=mid*0.995)
-        near_a=sum(q for p,q in A if p<=mid*1.005)
-        total=near_b+near_a
-        imb=(near_b-near_a)/total if total else 0
-        ob={"bid":near_b,"ask":near_a,"imbalance":imb,"spread":best_ask-best_bid,
-            "pressure":"Buy-side liquidity" if imb>0.15 else "Sell-side liquidity" if imb<-0.15 else "Balanced liquidity"}
-    buy=sell=0.0
-    for t in trades or []:
+def micro(book,trs):
+    bids=book.get("bids",{}); asks=book.get("asks",{})
+    B=[(float(p),float(q)) for p,q in bids.items()]; A=[(float(p),float(q)) for p,q in asks.items()]
+    if not B or not A:return 0,0
+    bb=max(p for p,_ in B); ba=min(p for p,_ in A); mid=(bb+ba)/2
+    b=sum(q for p,q in B if p>=mid*.995); a=sum(q for p,q in A if p<=mid*1.005)
+    imb=(b-a)/(b+a) if b+a else 0
+    # This is deliberately a proxy; CoinDCX m indicates whether buyer is market maker.
+    buy=sell=0
+    for t in trs:
         q=float(t.get("q",0) or 0)
-        # CoinDCX defines m as whether the buyer is market maker.
-        # We report this as maker-side proxy, not a guaranteed aggressor field.
         if bool(t.get("m",False)): sell+=q
         else: buy+=q
-    total=buy+sell
-    ratio=(buy-sell)/total if total else 0
-    flow={"buy":buy,"sell":sell,"ratio":ratio,
-          "label":"Maker-side proxy favors buying" if ratio>0.15 else "Maker-side proxy favors selling" if ratio<-0.15 else "Flow balanced"}
-    return ob,flow
-
-def decision(a15,a1h,a1d,ob,flow):
-    score=0
-    for a,w in [(a1d,3),(a1h,2),(a15,1)]:
-        score += w if a["trend"]=="Bullish" else -w if a["trend"]=="Bearish" else 0
-    score += 1 if a1d["macd"]=="Bullish" else -1
-    score += 1 if a1h["macd"]=="Bullish" else -1
-    if ob: score += 1 if ob["imbalance"]>0.15 else -1 if ob["imbalance"]<-0.15 else 0
-    if flow: score += 1 if flow["ratio"]>0.15 else -1 if flow["ratio"]<-0.15 else 0
-
-    long_align=all(a["trend"]=="Bullish" for a in [a1d,a1h,a15])
-    short_align=all(a["trend"]=="Bearish" for a in [a1d,a1h,a15])
-    if long_align and a1d["rsi"]<78: verdict="LONG SETUP"
-    elif short_align and a1d["rsi"]>22: verdict="SHORT SETUP"
-    elif score>=5: verdict="BULLISH BIAS — WAIT FOR ENTRY"
-    elif score<=-5: verdict="BEARISH BIAS — WAIT FOR ENTRY"
-    else: verdict="WAIT — NO CLEAR EDGE"
-
-    confidence=min(95,50+abs(score)*5+(12 if long_align or short_align else 0))
-    if a1d["rsi"]>=80 or a1d["rsi"]<=20: confidence=max(35,confidence-10)
-    reasons=[]
-    if a1d["trend"]!=a1h["trend"]: reasons.append("Daily and 1H trend disagree.")
-    if a15["trend"]!=a1h["trend"]: reasons.append("15m is not aligned with the 1H trend.")
-    if a1d["rsi"]>=80: reasons.append("Daily RSI is extremely overbought; avoid chasing longs.")
-    elif a1d["rsi"]<=20: reasons.append("Daily RSI is extremely oversold; avoid chasing shorts.")
-    if ob: reasons.append(ob["pressure"]+".")
-    if flow: reasons.append(flow["label"]+".")
-
-    # Explicit triggers: use 20-bar high/low from the 1H structure.
-    # These are levels to watch, not automatic entries.
-    return verdict,confidence,score,reasons
+    flow=(buy-sell)/(buy+sell) if buy+sell else 0
+    return imb,flow
 
 def fmt(v):
-    return "—" if pd.isna(v) else f"{v:,.8f}".rstrip("0").rstrip(".")
+    if pd.isna(v):return "—"
+    return f"{v:,.8f}".rstrip("0").rstrip(".")
 
-coin=st.text_input("CoinDCX coin or pair","BTC").strip()
-
-if st.button("🔎 Analyze",type="primary"):
+def evaluate(m,sym,ts):
     try:
-        market=resolve_market(coin,get_markets())
-        if not market:
-            st.error("Market not found. Try BTC, ETH, SOL, or BTCINR.")
-            st.stop()
-        pair=market["pair"]; symbol=market.get("symbol",market.get("coindcx_name",pair))
-        st.success(f"Using **{symbol}** | Internal pair **{pair}** | {market.get('target_currency_short_name','')}/{market.get('base_currency_short_name','')}")
-
-        try:
-            ticks=get_ticker()
-            t=next((z for z in ticks if str(z.get("market","")).upper()==str(symbol).upper()),None)
-            if t:
-                a,b,c,d=st.columns(4)
-                a.metric("Last price",fmt(float(t.get("last_price",0))))
-                b.metric("24h change",f'{float(t.get("change_24_hour",0)):.2f}%')
-                c.metric("24h high",fmt(float(t.get("high",0))))
-                d.metric("24h volume",fmt(float(t.get("volume",0))))
-        except Exception as ex: st.warning(f"Ticker unavailable: {ex}")
-
-        raw={}
-        for k in ["15m","1h","1d"]:
-            raw[k]=get_candles(pair,k)
-            if len(raw[k])<210:
-                st.error(f"{k}: only {len(raw[k])} candles returned; 210+ are required.")
-                st.stop()
-            raw[k]=indicators(raw[k])
-
-        a15,a1h,a1d=tf(raw["15m"]),tf(raw["1h"]),tf(raw["1d"])
-        ob,flow=None,None
-        try: ob,flow=microstructure(get_orderbook(pair,100),get_trades(pair,200))
-        except Exception as ex: st.warning(f"Microstructure data unavailable: {ex}")
-
-        verdict,confidence,score,reasons=decision(a15,a1h,a1d,ob,flow)
-
-        # Trigger levels based on the latest 1H candle and recent range.
-        h=raw["1h"]
-        trigger_up=float(h.tail(20).high.max())
-        trigger_down=float(h.tail(20).low.min())
-        atr=float(raw["15m"].iloc[-1].atr)
-
-        st.header("🧠 AI-style Market Decision")
-        a,b,c=st.columns(3)
-        a.metric("Overall view",verdict)
-        b.metric("Confidence",f"{confidence:.0f}%")
-        c.metric("Composite score",score)
-
-        if reasons:
-            st.write("**Reasoning:**")
-            for r in reasons: st.write("- "+r)
-
-        st.subheader("🎯 What we're waiting for")
-        a,b=st.columns(2)
-        a.metric("Bullish trigger to watch",fmt(trigger_up))
-        b.metric("Bearish trigger to watch",fmt(trigger_down))
-        st.caption("Triggers are observation levels derived from the recent 1H range; they are not automatic buy/sell orders.")
-
-        st.subheader("Multi-timeframe dashboard")
-        rows=[]
-        for label,x in [("1D",a1d),("1H",a1h),("15m",a15)]:
-            rows.append({"Timeframe":label,"Trend":x["trend"],"Structure":x["structure"],"Momentum":x["momentum"],"RSI":round(x["rsi"],1),"MACD":x["macd"],"Volume":x["volume"]})
-        st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-
-        if ob:
-            st.subheader("📚 Order-book intelligence")
-            a,b,c,d=st.columns(4)
-            a.metric("Near-price bids",fmt(ob["bid"])); b.metric("Near-price asks",fmt(ob["ask"]))
-            c.metric("Near-price imbalance",f'{ob["imbalance"]*100:.2f}%'); d.metric("Spread",fmt(ob["spread"]))
-            st.info(ob["pressure"]+" (within ±0.5% of mid-price)")
-
-        if flow:
-            st.subheader("⚡ Recent trade-flow proxy")
-            a,b,c=st.columns(3)
-            a.metric("Non-maker-side volume",fmt(flow["buy"]))
-            b.metric("Maker-side volume",fmt(flow["sell"]))
-            c.metric("Flow proxy",f'{flow["ratio"]*100:.2f}%')
-            st.info(flow["label"]+"; this is an interpretation of CoinDCX's `m` field, not a direct aggressor field.")
-
-        st.subheader("Trade plan")
-        if verdict=="LONG SETUP":
-            entry=float(raw["15m"].iloc[-1].close); sl=entry-1.2*atr; risk=entry-sl
-            tp1=entry+1.5*risk; tp2=entry+2.5*risk
-        elif verdict=="SHORT SETUP":
-            entry=float(raw["15m"].iloc[-1].close); sl=entry+1.2*atr; risk=sl-entry
-            tp1=entry-1.5*risk; tp2=entry-2.5*risk
-        else: entry=sl=tp1=tp2=np.nan
-
-        if pd.notna(entry):
-            a,b,c,d=st.columns(4)
-            a.metric("Entry reference",fmt(entry)); b.metric("Invalidation / SL",fmt(sl))
-            c.metric("TP1",fmt(tp1)); d.metric("TP2",fmt(tp2))
-            st.warning("Analytical setup only. No order is created.")
+        d1=ind(candles(m["pair"],"1d")); d1h=ind(candles(m["pair"],"1h")); d15=ind(candles(m["pair"],"15m"))
+        if min(len(d1),len(d1h),len(d15))<210:return None
+        a1=d1.iloc[-1]; ah=d1h.iloc[-1]; a15=d15.iloc[-1]
+        b1,s1=tfscore(d1); bh,sh=tfscore(d1h); b15,s15=tfscore(d15)
+        ob,flow=micro(orderbook(m["pair"]),trades(m["pair"]))
+        change=float(next((z.get("change_24_hour",0) for z in ts if str(z.get("market","")).upper()==sym),0) or 0)
+        direction="LONG" if change>0 else "SHORT"
+        # Momentum candidate score: start from 24h magnitude, then reward confirmation.
+        momentum=min(40,abs(change)*1.2)
+        long_score=momentum+8*(b1-s1)+5*(bh-sh)+3*(b15-s15)+8*max(0,ob)+8*max(0,flow)
+        short_score=momentum+8*(s1-b1)+5*(sh-bh)+3*(s15-b15)+8*max(0,-ob)+8*max(0,-flow)
+        score=long_score if direction=="LONG" else short_score
+        # Avoid extreme chase: distance from 1D 20 EMA and daily Bollinger upper/lower.
+        price=float(a15.close); atr=float(a15.atr)
+        ext=abs(price-float(a1.ema20))/max(float(a1.atr),1)
+        penalty=min(25,max(0,(ext-2)*6))
+        score-=penalty
+        confidence=max(35,min(95,50+score*.35))
+        # Determine if there is enough confirmation for a trade.
+        if direction=="LONG":
+            aligned=(b1>s1 and bh>=sh and b15>=s15 and a15.macd>a15.macd_signal)
+            extended=(a1.rsi>=78 or ext>3.5)
         else:
-            st.info("No high-confidence entry. WAIT until the trigger and timeframe confirmation improve.")
+            aligned=(s1>b1 and sh>=bh and s15>=b15 and a15.macd<a15.macd_signal)
+            extended=(a1.rsi<=22 or ext>3.5)
+        signal=direction if aligned and not extended and confidence>=65 else "WAIT"
+        # 1D S/R zones
+        recent=d1.tail(90)
+        support=float(recent.low.quantile(.12)); resistance=float(recent.high.quantile(.88))
+        s2=float(recent.low.quantile(.04)); r2=float(recent.high.quantile(.96))
+        return {"symbol":sym,"pair":m["pair"],"change":change,"direction":direction,"score":score,
+                "confidence":confidence,"signal":signal,"price":price,"support1":support,"support2":s2,
+                "res1":resistance,"res2":r2,"daily_rsi":float(a1.rsi),"ext":ext,
+                "atr":atr,"structure":structure(d1),"d1":d1,"d15":d15}
+    except Exception:
+        return None
 
-        for title,key in [("15 Minute","15m"),("1 Hour","1h"),("1 Day","1d")]:
-            with st.expander(f"{title} details",expanded=(key=="1h")):
-                d=raw[key]; x={"15m":a15,"1h":a1h,"1d":a1d}[key]
-                a,b,c,e=st.columns(4)
-                a.metric("Close",fmt(x["close"])); b.metric("RSI",f'{x["rsi"]:.1f}')
-                c.metric("ATR",fmt(x["atr"])); e.metric("Structure",x["structure"])
-                st.line_chart(d.set_index("time")[["close","ema20","ema50","ema200"]].tail(250))
-    except Exception as ex:
-        st.error(f"Analysis failed: {ex}")
+def setup(x):
+    p=x["price"]; atr=x["atr"]
+    if x["signal"]=="LONG":
+        sl=p-1.4*atr; risk=p-sl
+        return p,sl,p+1.5*risk,p+2.5*risk
+    if x["signal"]=="SHORT":
+        sl=p+1.4*atr; risk=sl-p
+        return p,sl,p-1.5*risk,p-2.5*risk
+    return np.nan,np.nan,np.nan,np.nan
+
+if st.button("🔍 Scan Top Futures",type="primary"):
+    try:
+        ms=markets(); ts=ticker()
+        cands=active_candidates(ms,ts)
+        if not cands:
+            st.error("CoinDCX did not expose futures markets through the current Markets Details response. The app will not pretend spot markets are futures.")
+            st.stop()
+
+        # Rank all resolvable futures by absolute 24h movement, then analyze top 12.
+        changes={str(z.get("market","")).upper():float(z.get("change_24_hour",0) or 0) for z in ts}
+        cands.sort(key=lambda x:abs(changes.get(x[1],0)),reverse=True)
+        results=[]
+        for m,sym in cands[:12]:
+            r=evaluate(m,sym,ts)
+            if r:results.append(r)
+        if not results:
+            st.error("No futures candidates could be analyzed.")
+            st.stop()
+
+        results=sorted(results,key=lambda x:x["score"],reverse=True)[:5]
+        st.header("🎯 Today's 5 Futures Candidates")
+        st.caption("The scanner first looks for the strongest 24h movers, then ranks them using multi-timeframe confirmation, volatility, volume and liquidity.")
+
+        for i,x in enumerate(results,1):
+            icon="🟢" if x["signal"]=="LONG" else "🔴" if x["signal"]=="SHORT" else "🟡"
+            with st.container(border=True):
+                st.subheader(f"{i}. {x['symbol']}  {icon} {x['signal']}")
+                a,b,c,d=st.columns(4)
+                a.metric("24h move",f"{x['change']:.2f}%")
+                b.metric("Confidence",f"{x['confidence']:.0f}%")
+                c.metric("Price",fmt(x["price"]))
+                d.metric("Daily RSI",f"{x['daily_rsi']:.1f}")
+                st.write(f"**1D Support:** {fmt(x['support2'])} / {fmt(x['support1'])}   |   **1D Resistance:** {fmt(x['res1'])} / {fmt(x['res2'])}")
+                if x["signal"]!="WAIT":
+                    en,sl,t1,t2=setup(x)
+                    a,b,c,d=st.columns(4)
+                    a.metric("Entry reference",fmt(en)); b.metric("Stop Loss",fmt(sl)); c.metric("TP1",fmt(t1)); d.metric("TP2",fmt(t2))
+                    st.success(f"{x['signal']} setup confirmed. Approx. R:R 1:{1.5:.1f} to TP1.")
+                else:
+                    if x["direction"]=="LONG": st.warning("Strong upside mover, but confirmation or entry quality is not strong enough. Do not chase.")
+                    else: st.warning("Strong downside mover, but confirmation or entry quality is not strong enough. Do not chase.")
+                st.caption(f"1D structure: {x['structure']} • Hidden engine uses EMA20/50/100/200, RSI, MACD, ADX/DI, ATR, Bollinger Bands, volume, support/resistance and market microstructure.")
+                with st.expander("Advanced analysis"):
+                    d=x["d1"]; last=d.iloc[-1]
+                    st.write(f"EMA20 {fmt(last.ema20)} | EMA50 {fmt(last.ema50)} | EMA100 {fmt(last.ema100)} | EMA200 {fmt(last.ema200)}")
+                    st.write(f"RSI {last.rsi:.1f} | ADX {last.adx:.1f} | MACD {'bullish' if last.macd>last.macd_signal else 'bearish'} | Volume {'above' if last.volume>last.volma else 'below'} average")
+                    st.line_chart(d.set_index("time")[["close","ema20","ema50","ema100","ema200"]].tail(250))
+    except Exception as e:
+        st.error(f"Scanner failed: {e}")
 
 st.divider()
-st.caption("Educational analysis only. Public CoinDCX data. No API keys, orders, balances, withdrawals, or account access.")
+st.caption("Analysis only. No CoinDCX API key is stored or requested. No orders, balances or withdrawals are accessed.")
