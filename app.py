@@ -206,6 +206,8 @@ def score_candidate(pair, price_row, d1, h1, m15):
     # confidence is capped because long-term EMA/support context is incomplete.
     history_factor = min(1.0, min(len(d1)/120.0, len(h1)/240.0, len(m15)/240.0))
     confidence = min(confidence, 50 + 45*history_factor)
+    if history_factor < 0.5:
+        confidence = min(confidence, 65)
 
     aligned = (
         (side=="LONG" and b1>s1 and bh>=sh and b15>=s15 and x15.macd>x15.macd_signal) or
@@ -426,6 +428,8 @@ if st.button("📊 Analyze My Coin"):
             f"History available: 1D {len(x['d1'])} candles • "
             f"1H {len(x['h1'])} candles • 15m {len(x['m15'])} candles"
         )
+        if min(len(x["d1"]), len(x["h1"]), len(x["m15"])) < 60:
+            st.info("This is a newer/limited-history Futures contract. The signal is intentionally given a lower confidence ceiling.")
         st.write(
             f"**1D structure:** {x['structure']}  |  "
             f"**1H ADX:** {x['adx']:.1f}  |  "
