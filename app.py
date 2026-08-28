@@ -124,8 +124,16 @@ def technical_side(d):
     x=d.iloc[-1]
     long_points = 0
     short_points = 0
-    long_points += int(x.close>x.ema20) + int(x.ema20>x.ema50) + int(x.ema50>x.ema100) + int(x.ema100>x.ema200)
-    short_points += int(x.close<x.ema20) + int(x.ema20<x.ema50) + int(x.ema50<x.ema100) + int(x.ema100<x.ema200)
+    ema_pairs = [
+        (x.close, x.ema20),
+        (x.ema20, x.ema50),
+        (x.ema50, x.ema100),
+        (x.ema100, x.ema200),
+    ]
+    for a,b in ema_pairs:
+        if pd.notna(a) and pd.notna(b):
+            long_points += int(a>b)
+            short_points += int(a<b)
 
     long_points += int(50<x.rsi<70) + int(x.macd>x.macd_signal) + int(x.pdi>x.mdi) + int(x.volume>x.volma)
     short_points += int(30<x.rsi<50) + int(x.macd<x.macd_signal) + int(x.mdi>x.pdi) + int(x.volume>x.volma)
@@ -457,6 +465,8 @@ if st.button("🔍 Scan Top Futures",type="primary"):
                 with st.expander("Advanced analysis"):
                     st.write(f"1D structure: **{x['structure']}**")
                     st.write(f"EMA20/50/100/200: {fmt(x['d1'].iloc[-1].ema20)} / {fmt(x['d1'].iloc[-1].ema50)} / {fmt(x['d1'].iloc[-1].ema100)} / {fmt(x['d1'].iloc[-1].ema200)}")
+                    if pd.isna(x['d1'].iloc[-1].ema200):
+                        st.info("This futures contract does not yet have 200 daily candles. EMA200 is therefore not used as a bearish/bullish vote for this coin.")
                     st.write(f"1H ADX: {x['adx']:.1f} | 1D RSI: {x['rsi']:.1f}")
                     if x["ob"] is not None: st.write(f"Near-price futures order-book imbalance: {x['ob']*100:.2f}%")
                     if x["flow"] is not None: st.write(f"Futures trade-flow proxy: {x['flow']*100:.2f}%")
