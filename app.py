@@ -4,6 +4,11 @@ import numpy as np
 import requests
 import time
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 API = "https://api.coindcx.com"
 PUBLIC = "https://public.coindcx.com"
 
@@ -14,6 +19,7 @@ st.set_page_config(
 )
 
 st.title("🎯 CoinDCX Futures Momentum Scanner")
+
 st.caption(
     "Analysis only • Top 5 futures candidates • "
     "Built for volatile/meme-coin momentum • No trading"
@@ -26,11 +32,20 @@ st.caption(
 
 @st.cache_data(ttl=30)
 def get_active_instruments(margin="USDT"):
-    url = f"{API}/exchange/v1/derivatives/futures/data/active_instruments"
+
+    url = (
+        f"{API}/exchange/v1/derivatives/"
+        f"futures/data/active_instruments"
+    )
 
     r = requests.get(
         url,
-        params=[("margin_currency_short_name[]", margin)],
+        params=[
+            (
+                "margin_currency_short_name[]",
+                margin
+            )
+        ],
         timeout=20
     )
 
@@ -48,6 +63,7 @@ def get_active_instruments(margin="USDT"):
 
 @st.cache_data(ttl=5)
 def get_futures_prices():
+
     r = requests.get(
         f"{PUBLIC}/market_data/v3/current_prices/futures/rt",
         timeout=20
@@ -57,11 +73,20 @@ def get_futures_prices():
 
     data = r.json()
 
-    return data.get("prices", {}) if isinstance(data, dict) else {}
+    return (
+        data.get("prices", {})
+        if isinstance(data, dict)
+        else {}
+    )
 
 
 @st.cache_data(ttl=30)
-def get_futures_candles(pair, resolution, from_ts, to_ts):
+def get_futures_candles(
+    pair,
+    resolution,
+    from_ts,
+    to_ts
+):
 
     params = {
         "pair": pair,
@@ -81,7 +106,11 @@ def get_futures_candles(pair, resolution, from_ts, to_ts):
 
     data = r.json()
 
-    rows = data.get("data", []) if isinstance(data, dict) else data
+    rows = (
+        data.get("data", [])
+        if isinstance(data, dict)
+        else data
+    )
 
     if not isinstance(rows, list):
         raise RuntimeError(
@@ -93,10 +122,18 @@ def get_futures_candles(pair, resolution, from_ts, to_ts):
     if d.empty:
         return d
 
-    for c in ["open", "high", "low", "close", "volume"]:
+    for c in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume"
+    ]:
+
         if c not in d.columns:
             raise RuntimeError(
-                f"Candle response missing '{c}' column for {pair}: "
+                f"Candle response missing '{c}' "
+                f"column for {pair}: "
                 f"{list(d.columns)}"
             )
 
@@ -106,8 +143,10 @@ def get_futures_candles(pair, resolution, from_ts, to_ts):
         )
 
     if "time" not in d.columns:
+
         raise RuntimeError(
-            f"Candle response missing 'time' column for {pair}"
+            f"Candle response missing 'time' "
+            f"column for {pair}"
         )
 
     d["time"] = pd.to_datetime(
@@ -117,7 +156,8 @@ def get_futures_candles(pair, resolution, from_ts, to_ts):
     )
 
     return (
-        d.dropna(
+        d
+        .dropna(
             subset=[
                 "time",
                 "open",
@@ -137,7 +177,8 @@ def get_futures_candles(pair, resolution, from_ts, to_ts):
 def get_futures_orderbook(pair):
 
     r = requests.get(
-        f"{PUBLIC}/market_data/v3/orderbook/{pair}-futures/50",
+        f"{PUBLIC}/market_data/v3/orderbook/"
+        f"{pair}-futures/50",
         timeout=15
     )
 
@@ -150,8 +191,11 @@ def get_futures_orderbook(pair):
 def get_futures_trades(pair):
 
     r = requests.get(
-        f"{API}/exchange/v1/derivatives/futures/data/trades",
-        params={"pair": pair},
+        f"{API}/exchange/v1/derivatives/"
+        f"futures/data/trades",
+        params={
+            "pair": pair
+        },
         timeout=15
     )
 
@@ -159,7 +203,11 @@ def get_futures_trades(pair):
 
     x = r.json()
 
-    return x if isinstance(x, list) else []
+    return (
+        x
+        if isinstance(x, list)
+        else []
+    )
 
 
 # ============================================================
@@ -174,11 +222,19 @@ def indicators(d):
     # EMA
     # --------------------------------------------------------
 
-    for n in [20, 50, 100, 200]:
-        x[f"ema{n}"] = x.close.ewm(
-            span=n,
-            adjust=False
-        ).mean()
+    for n in [
+        20,
+        50,
+        100,
+        200
+    ]:
+
+        x[f"ema{n}"] = (
+            x.close.ewm(
+                span=n,
+                adjust=False
+            ).mean()
+        )
 
     # --------------------------------------------------------
     # RSI
@@ -186,47 +242,71 @@ def indicators(d):
 
     delta = x.close.diff()
 
-    gain = delta.clip(
-        lower=0
-    ).ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    loss = (
-        -delta.clip(upper=0)
-    ).ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
-
-    rs = gain / loss.replace(
-        0,
-        np.nan
+    gain = (
+        delta
+        .clip(lower=0)
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
     )
 
-    x["rsi"] = 100 - 100 / (1 + rs)
+    loss = (
+        -delta
+        .clip(upper=0)
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    rs = (
+        gain /
+        loss.replace(
+            0,
+            np.nan
+        )
+    )
+
+    x["rsi"] = (
+        100 -
+        100 / (1 + rs)
+    )
 
     # --------------------------------------------------------
     # MACD
     # --------------------------------------------------------
 
-    e12 = x.close.ewm(
-        span=12,
-        adjust=False
-    ).mean()
+    e12 = (
+        x.close
+        .ewm(
+            span=12,
+            adjust=False
+        )
+        .mean()
+    )
 
-    e26 = x.close.ewm(
-        span=26,
-        adjust=False
-    ).mean()
+    e26 = (
+        x.close
+        .ewm(
+            span=26,
+            adjust=False
+        )
+        .mean()
+    )
 
     x["macd"] = e12 - e26
 
-    x["macd_signal"] = x.macd.ewm(
-        span=9,
-        adjust=False
-    ).mean()
+    x["macd_signal"] = (
+        x.macd
+        .ewm(
+            span=9,
+            adjust=False
+        )
+        .mean()
+    )
 
     # --------------------------------------------------------
     # ATR
@@ -235,30 +315,52 @@ def indicators(d):
     tr = pd.concat(
         [
             x.high - x.low,
-            (x.high - x.close.shift()).abs(),
-            (x.low - x.close.shift()).abs()
+            (
+                x.high -
+                x.close.shift()
+            ).abs(),
+            (
+                x.low -
+                x.close.shift()
+            ).abs()
         ],
         axis=1
     ).max(axis=1)
 
-    x["atr"] = tr.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
+    x["atr"] = (
+        tr
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
 
     # --------------------------------------------------------
-    # Volume MA
+    # VOLUME MA
     # --------------------------------------------------------
 
-    x["volma"] = x.volume.rolling(20).mean()
+    x["volma"] = (
+        x.volume
+        .rolling(20)
+        .mean()
+    )
 
     # --------------------------------------------------------
-    # Bollinger Bands
+    # BOLLINGER BANDS
     # --------------------------------------------------------
 
-    x["bbmid"] = x.close.rolling(20).mean()
+    x["bbmid"] = (
+        x.close
+        .rolling(20)
+        .mean()
+    )
 
-    x["bbstd"] = x.close.rolling(20).std()
+    x["bbstd"] = (
+        x.close
+        .rolling(20)
+        .std()
+    )
 
     x["bbup"] = (
         x.bbmid +
@@ -280,7 +382,8 @@ def indicators(d):
 
     plus = pd.Series(
         np.where(
-            (up > dn) & (up > 0),
+            (up > dn) &
+            (up > 0),
             up,
             0.0
         ),
@@ -289,7 +392,8 @@ def indicators(d):
 
     minus = pd.Series(
         np.where(
-            (dn > up) & (dn > 0),
+            (dn > up) &
+            (dn > 0),
             dn,
             0.0
         ),
@@ -303,35 +407,46 @@ def indicators(d):
 
     pdi = (
         100 *
-        plus.ewm(
+        plus
+        .ewm(
             alpha=1 / 14,
             adjust=False
-        ).mean() /
+        )
+        .mean()
+        /
         atr
     )
 
     mdi = (
         100 *
-        minus.ewm(
+        minus
+        .ewm(
             alpha=1 / 14,
             adjust=False
-        ).mean() /
+        )
+        .mean()
+        /
         atr
     )
 
     dx = (
         100 *
-        (pdi - mdi).abs() /
+        (pdi - mdi).abs()
+        /
         (pdi + mdi).replace(
             0,
             np.nan
         )
     )
 
-    x["adx"] = dx.ewm(
-        alpha=1 / 14,
-        adjust=False
-    ).mean()
+    x["adx"] = (
+        dx
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
 
     x["pdi"] = pdi
     x["mdi"] = mdi
@@ -353,20 +468,539 @@ def structure(d):
     prior = d.iloc[-36:-12]
 
     if (
-        recent.high.max() > prior.high.max()
+        recent.high.max()
+        >
+        prior.high.max()
         and
-        recent.low.min() > prior.low.min()
+        recent.low.min()
+        >
+        prior.low.min()
     ):
+
         return "Bullish"
 
     if (
-        recent.high.max() < prior.high.max()
+        recent.high.max()
+        <
+        prior.high.max()
         and
-        recent.low.min() < prior.low.min()
+        recent.low.min()
+        <
+        prior.low.min()
     ):
+
         return "Bearish"
 
     return "Mixed"
+
+
+# ============================================================
+# SUPPORT / RESISTANCE ENGINE
+# ============================================================
+
+def calculate_support_resistance(d):
+
+    """
+    Multi-level support/resistance engine.
+
+    Uses:
+
+    1. Daily swing highs/lows
+    2. Price clustering
+    3. Touch count
+    4. Recency
+    5. Monthly highs/lows
+    6. All-time high/low from available history
+
+    The goal is to produce practical trading levels rather
+    than simple statistical percentiles.
+    """
+
+    x = (
+        d.copy()
+        .sort_values("time")
+        .reset_index(drop=True)
+    )
+
+    if x.empty:
+
+        return {
+            "support1": np.nan,
+            "support2": np.nan,
+            "resistance1": np.nan,
+            "resistance2": np.nan,
+            "monthly_support": np.nan,
+            "monthly_resistance": np.nan,
+            "ath": np.nan,
+            "atl": np.nan,
+        }
+
+    current = float(
+        x.close.iloc[-1]
+    )
+
+    # --------------------------------------------------------
+    # ATR FOR CLUSTER TOLERANCE
+    # --------------------------------------------------------
+
+    tr = pd.concat(
+        [
+            x.high - x.low,
+            (
+                x.high -
+                x.close.shift()
+            ).abs(),
+            (
+                x.low -
+                x.close.shift()
+            ).abs()
+        ],
+        axis=1
+    ).max(axis=1)
+
+    atr_series = (
+        tr
+        .ewm(
+            alpha=1 / 14,
+            adjust=False
+        )
+        .mean()
+    )
+
+    atr = float(
+        atr_series.iloc[-1]
+    )
+
+    if not np.isfinite(atr):
+        atr = current * 0.02
+
+    atr = max(
+        atr,
+        current * 0.005
+    )
+
+    # --------------------------------------------------------
+    # FIND DAILY SWING HIGHS / LOWS
+    # --------------------------------------------------------
+
+    levels = []
+
+    lookback = 2
+
+    if len(x) >= 2 * lookback + 1:
+
+        for i in range(
+            lookback,
+            len(x) - lookback
+        ):
+
+            high = float(
+                x.high.iloc[i]
+            )
+
+            low = float(
+                x.low.iloc[i]
+            )
+
+            left_highs = x.high.iloc[
+                i - lookback:i
+            ]
+
+            right_highs = x.high.iloc[
+                i + 1:
+                i + lookback + 1
+            ]
+
+            left_lows = x.low.iloc[
+                i - lookback:i
+            ]
+
+            right_lows = x.low.iloc[
+                i + 1:
+                i + lookback + 1
+            ]
+
+            # ------------------------------------------------
+            # SWING HIGH
+            # ------------------------------------------------
+
+            if (
+                high >= left_highs.max()
+                and
+                high >= right_highs.max()
+            ):
+
+                levels.append(
+                    {
+                        "price": high,
+                        "type": "resistance",
+                        "index": i,
+                        "monthly": False
+                    }
+                )
+
+            # ------------------------------------------------
+            # SWING LOW
+            # ------------------------------------------------
+
+            if (
+                low <= left_lows.min()
+                and
+                low <= right_lows.min()
+            ):
+
+                levels.append(
+                    {
+                        "price": low,
+                        "type": "support",
+                        "index": i,
+                        "monthly": False
+                    }
+                )
+
+    # --------------------------------------------------------
+    # MONTHLY OHLC
+    # --------------------------------------------------------
+
+    monthly = (
+        x
+        .set_index("time")
+        .resample("ME")
+        .agg(
+            {
+                "open": "first",
+                "high": "max",
+                "low": "min",
+                "close": "last",
+                "volume": "sum"
+            }
+        )
+        .dropna(
+            subset=[
+                "high",
+                "low"
+            ]
+        )
+    )
+
+    monthly_highs = (
+        monthly["high"]
+        .tolist()
+    )
+
+    monthly_lows = (
+        monthly["low"]
+        .tolist()
+    )
+
+    # --------------------------------------------------------
+    # ADD MONTHLY HIGHS
+    # --------------------------------------------------------
+
+    for value in monthly_highs:
+
+        levels.append(
+            {
+                "price": float(value),
+                "type": "resistance",
+                "index": len(x) - 1,
+                "monthly": True
+            }
+        )
+
+    # --------------------------------------------------------
+    # ADD MONTHLY LOWS
+    # --------------------------------------------------------
+
+    for value in monthly_lows:
+
+        levels.append(
+            {
+                "price": float(value),
+                "type": "support",
+                "index": len(x) - 1,
+                "monthly": True
+            }
+        )
+
+    # --------------------------------------------------------
+    # CLUSTER NEARBY LEVELS
+    #
+    # Multiple reactions around 0.150, for example:
+    #
+    # 0.1495
+    # 0.1502
+    # 0.1510
+    #
+    # become one resistance zone.
+    # --------------------------------------------------------
+
+    tolerance = atr * 0.60
+
+    clusters = []
+
+    for level in sorted(
+        levels,
+        key=lambda z: z["price"]
+    ):
+
+        placed = False
+
+        for cluster in clusters:
+
+            if (
+                abs(
+                    level["price"]
+                    -
+                    cluster["price"]
+                )
+                <= tolerance
+            ):
+
+                cluster["prices"].append(
+                    level["price"]
+                )
+
+                cluster["indices"].append(
+                    level["index"]
+                )
+
+                if level.get(
+                    "monthly",
+                    False
+                ):
+
+                    cluster["monthly"] = True
+
+                placed = True
+
+                break
+
+        if not placed:
+
+            clusters.append(
+                {
+                    "price": level["price"],
+                    "prices": [
+                        level["price"]
+                    ],
+                    "indices": [
+                        level["index"]
+                    ],
+                    "monthly": level.get(
+                        "monthly",
+                        False
+                    )
+                }
+            )
+
+    # --------------------------------------------------------
+    # SCORE EACH LEVEL
+    # --------------------------------------------------------
+
+    scored = []
+
+    for cluster in clusters:
+
+        price = float(
+            np.mean(
+                cluster["prices"]
+            )
+        )
+
+        touches = len(
+            cluster["prices"]
+        )
+
+        latest_index = max(
+            cluster["indices"]
+        )
+
+        age = (
+            len(x)
+            -
+            latest_index
+        )
+
+        recency = max(
+            0.25,
+            1.0 -
+            age / max(
+                len(x),
+                1
+            )
+        )
+
+        score = (
+            touches * 3
+            +
+            recency * 4
+            +
+            (
+                4
+                if cluster["monthly"]
+                else 0
+            )
+        )
+
+        scored.append(
+            {
+                "price": price,
+                "score": score,
+                "touches": touches,
+                "monthly": cluster["monthly"]
+            }
+        )
+
+    # --------------------------------------------------------
+    # SUPPORT BELOW CURRENT PRICE
+    # --------------------------------------------------------
+
+    supports = [
+        z
+        for z in scored
+        if z["price"] < current
+    ]
+
+    supports.sort(
+        key=lambda z:
+        abs(
+            current -
+            z["price"]
+        ) / current
+    )
+
+    # --------------------------------------------------------
+    # RESISTANCE ABOVE CURRENT PRICE
+    # --------------------------------------------------------
+
+    resistances = [
+        z
+        for z in scored
+        if z["price"] > current
+    ]
+
+    resistances.sort(
+        key=lambda z:
+        abs(
+            z["price"] -
+            current
+        ) / current
+    )
+
+    # --------------------------------------------------------
+    # NEAREST SUPPORT LEVELS
+    # --------------------------------------------------------
+
+    support1 = (
+        supports[0]["price"]
+        if len(supports) >= 1
+        else np.nan
+    )
+
+    support2 = (
+        supports[1]["price"]
+        if len(supports) >= 2
+        else np.nan
+    )
+
+    # --------------------------------------------------------
+    # NEAREST RESISTANCE LEVELS
+    # --------------------------------------------------------
+
+    resistance1 = (
+        resistances[0]["price"]
+        if len(resistances) >= 1
+        else np.nan
+    )
+
+    resistance2 = (
+        resistances[1]["price"]
+        if len(resistances) >= 2
+        else np.nan
+    )
+
+    # --------------------------------------------------------
+    # MONTHLY SUPPORT
+    # --------------------------------------------------------
+
+    monthly_supports = [
+        float(v)
+        for v in monthly_lows
+        if float(v) < current
+    ]
+
+    if monthly_supports:
+
+        monthly_support = max(
+            monthly_supports
+        )
+
+    else:
+
+        monthly_support = float(
+            x.low.min()
+        )
+
+    # --------------------------------------------------------
+    # MONTHLY RESISTANCE
+    # --------------------------------------------------------
+
+    monthly_resistances = [
+        float(v)
+        for v in monthly_highs
+        if float(v) > current
+    ]
+
+    if monthly_resistances:
+
+        monthly_resistance = min(
+            monthly_resistances
+        )
+
+    else:
+
+        monthly_resistance = float(
+            x.high.max()
+        )
+
+    # --------------------------------------------------------
+    # ALL-TIME HIGH / LOW
+    #
+    # IMPORTANT:
+    # This is ATH/ATL from the daily history returned by
+    # CoinDCX, not necessarily the complete lifetime history
+    # if the API limits the requested date range.
+    # --------------------------------------------------------
+
+    ath = float(
+        x.high.max()
+    )
+
+    atl = float(
+        x.low.min()
+    )
+
+    return {
+
+        "support1": support1,
+
+        "support2": support2,
+
+        "resistance1": resistance1,
+
+        "resistance2": resistance2,
+
+        "monthly_support":
+            monthly_support,
+
+        "monthly_resistance":
+            monthly_resistance,
+
+        "ath": ath,
+
+        "atl": atl,
+    }
 
 
 # ============================================================
@@ -381,41 +1015,86 @@ def technical_side(d):
     short_points = 0
 
     ema_pairs = [
-        (x.close, x.ema20),
-        (x.ema20, x.ema50),
-        (x.ema50, x.ema100),
-        (x.ema100, x.ema200),
+        (
+            x.close,
+            x.ema20
+        ),
+        (
+            x.ema20,
+            x.ema50
+        ),
+        (
+            x.ema50,
+            x.ema100
+        ),
+        (
+            x.ema100,
+            x.ema200
+        ),
     ]
 
     for a, b in ema_pairs:
 
-        if pd.notna(a) and pd.notna(b):
+        if (
+            pd.notna(a)
+            and
+            pd.notna(b)
+        ):
 
-            long_points += int(a > b)
+            long_points += int(
+                a > b
+            )
 
-            short_points += int(a < b)
+            short_points += int(
+                a < b
+            )
 
     long_points += (
-        int(50 < x.rsi < 70)
+        int(
+            50 < x.rsi < 70
+        )
         +
-        int(x.macd > x.macd_signal)
+        int(
+            x.macd >
+            x.macd_signal
+        )
         +
-        int(x.pdi > x.mdi)
+        int(
+            x.pdi >
+            x.mdi
+        )
         +
-        int(x.volume > x.volma)
+        int(
+            x.volume >
+            x.volma
+        )
     )
 
     short_points += (
-        int(30 < x.rsi < 50)
+        int(
+            30 < x.rsi < 50
+        )
         +
-        int(x.macd < x.macd_signal)
+        int(
+            x.macd <
+            x.macd_signal
+        )
         +
-        int(x.mdi > x.pdi)
+        int(
+            x.mdi >
+            x.pdi
+        )
         +
-        int(x.volume > x.volma)
+        int(
+            x.volume >
+            x.volma
+        )
     )
 
-    return long_points, short_points
+    return (
+        long_points,
+        short_points
+    )
 
 
 # ============================================================
@@ -433,18 +1112,33 @@ def micro(pair):
 
     try:
 
-        b = get_futures_orderbook(pair)
+        b = get_futures_orderbook(
+            pair
+        )
 
-        bids = b.get("bids", {})
-        asks = b.get("asks", {})
+        bids = b.get(
+            "bids",
+            {}
+        )
+
+        asks = b.get(
+            "asks",
+            {}
+        )
 
         B = [
-            (float(p), float(q))
+            (
+                float(p),
+                float(q)
+            )
             for p, q in bids.items()
         ]
 
         A = [
-            (float(p), float(q))
+            (
+                float(p),
+                float(q)
+            )
             for p, q in asks.items()
         ]
 
@@ -475,13 +1169,21 @@ def micro(pair):
                 if p <= mid * 1.005
             )
 
-            if near_b + near_a:
+            if (
+                near_b +
+                near_a
+            ):
+
                 ob = (
-                    near_b - near_a
+                    near_b -
+                    near_a
                 ) / (
-                    near_b + near_a
+                    near_b +
+                    near_a
                 )
+
             else:
+
                 ob = 0
 
     except Exception:
@@ -493,7 +1195,9 @@ def micro(pair):
 
     try:
 
-        trs = get_futures_trades(pair)
+        trs = get_futures_trades(
+            pair
+        )
 
         buy = 0.0
         sell = 0.0
@@ -501,32 +1205,50 @@ def micro(pair):
         for t in trs:
 
             q = float(
-                t.get("quantity", 0)
+                t.get(
+                    "quantity",
+                    0
+                )
                 or 0
             )
 
-            # CoinDCX futures docs define is_maker;
-            # use it only as a flow proxy.
+            # CoinDCX futures docs define is_maker.
+            # Use it only as a flow proxy.
+
             if bool(
-                t.get("is_maker", False)
+                t.get(
+                    "is_maker",
+                    False
+                )
             ):
+
                 sell += q
+
             else:
+
                 buy += q
 
         if buy + sell:
+
             flow = (
-                buy - sell
+                buy -
+                sell
             ) / (
-                buy + sell
+                buy +
+                sell
             )
+
         else:
+
             flow = 0
 
     except Exception:
         pass
 
-    return ob, flow
+    return (
+        ob,
+        flow
+    )
 
 
 # ============================================================
@@ -546,22 +1268,35 @@ def score_candidate(
     x15 = m15.iloc[-1]
 
     change = float(
-        price_row.get("pc", 0)
+        price_row.get(
+            "pc",
+            0
+        )
         or 0
     )
 
-    move = abs(change)
+    move = abs(
+        change
+    )
 
-    b1, s1 = technical_side(d1)
-    bh, sh = technical_side(h1)
-    b15, s15 = technical_side(m15)
+    b1, s1 = technical_side(
+        d1
+    )
 
-    ob, flow = micro(pair)
+    bh, sh = technical_side(
+        h1
+    )
+
+    b15, s15 = technical_side(
+        m15
+    )
+
+    ob, flow = micro(
+        pair
+    )
 
     # --------------------------------------------------------
-    # Direction follows the user's strategy:
-    # strongest gainers = LONG candidates
-    # strongest losers = SHORT candidates
+    # DIRECTION
     # --------------------------------------------------------
 
     side = (
@@ -587,10 +1322,18 @@ def score_candidate(
         )
 
         if ob is not None:
-            raw += max(0, ob) * 8
+
+            raw += (
+                max(0, ob)
+                * 8
+            )
 
         if flow is not None:
-            raw += max(0, flow) * 6
+
+            raw += (
+                max(0, flow)
+                * 6
+            )
 
     # --------------------------------------------------------
     # SHORT SCORE
@@ -609,10 +1352,18 @@ def score_candidate(
         )
 
         if ob is not None:
-            raw += max(0, -ob) * 8
+
+            raw += (
+                max(0, -ob)
+                * 8
+            )
 
         if flow is not None:
-            raw += max(0, -flow) * 6
+
+            raw += (
+                max(0, -flow)
+                * 6
+            )
 
     # --------------------------------------------------------
     # CHASE PENALTY
@@ -621,12 +1372,15 @@ def score_candidate(
     ext = (
         abs(
             float(
-                x1.close - x1.ema20
+                x1.close -
+                x1.ema20
             )
         )
         /
         max(
-            float(x1.atr),
+            float(
+                x1.atr
+            ),
             1e-12
         )
     )
@@ -634,7 +1388,7 @@ def score_candidate(
     chase_penalty = (
         max(
             0,
-            (ext - 2.0)
+            ext - 2.0
         )
         * 7
     )
@@ -652,7 +1406,8 @@ def score_candidate(
         35,
         min(
             95,
-            50 + raw * 0.45
+            50 +
+            raw * 0.45
         )
     )
 
@@ -671,10 +1426,13 @@ def score_candidate(
 
     confidence = min(
         confidence,
-        50 + 45 * history_factor
+        50 +
+        45 *
+        history_factor
     )
 
     if history_factor < 0.5:
+
         confidence = min(
             confidence,
             65
@@ -688,20 +1446,30 @@ def score_candidate(
 
         (
             side == "LONG"
-            and b1 > s1
-            and bh >= sh
-            and b15 >= s15
-            and x15.macd > x15.macd_signal
+            and
+            b1 > s1
+            and
+            bh >= sh
+            and
+            b15 >= s15
+            and
+            x15.macd >
+            x15.macd_signal
         )
 
         or
 
         (
             side == "SHORT"
-            and s1 > b1
-            and sh >= bh
-            and s15 >= b15
-            and x15.macd < x15.macd_signal
+            and
+            s1 > b1
+            and
+            sh >= bh
+            and
+            s15 >= b15
+            and
+            x15.macd <
+            x15.macd_signal
         )
     )
 
@@ -710,14 +1478,19 @@ def score_candidate(
     # --------------------------------------------------------
 
     extreme = (
+
         (
             side == "LONG"
-            and x1.rsi >= 78
+            and
+            x1.rsi >= 78
         )
+
         or
+
         (
             side == "SHORT"
-            and x1.rsi <= 22
+            and
+            x1.rsi <= 22
         )
     )
 
@@ -725,36 +1498,57 @@ def score_candidate(
         side
         if (
             aligned
-            and not extreme
-            and confidence >= 68
+            and
+            not extreme
+            and
+            confidence >= 68
         )
-        else "WAIT"
+        else
+        "WAIT"
     )
 
-    # --------------------------------------------------------
+    # ========================================================
     # SUPPORT / RESISTANCE
+    # ========================================================
+
+    levels = calculate_support_resistance(
+        d1
+    )
+
+    support1 = levels[
+        "support1"
+    ]
+
+    support2 = levels[
+        "support2"
+    ]
+
+    resistance1 = levels[
+        "resistance1"
+    ]
+
+    resistance2 = levels[
+        "resistance2"
+    ]
+
+    monthly_support = levels[
+        "monthly_support"
+    ]
+
+    monthly_resistance = levels[
+        "monthly_resistance"
+    ]
+
+    ath = levels[
+        "ath"
+    ]
+
+    atl = levels[
+        "atl"
+    ]
+
     # --------------------------------------------------------
-
-    recent = d1.tail(90)
-
-    support1 = float(
-        recent.low.quantile(0.15)
-    )
-
-    support2 = float(
-        recent.low.quantile(0.05)
-    )
-
-    resistance1 = float(
-        recent.high.quantile(0.85)
-    )
-
-    resistance2 = float(
-        recent.high.quantile(0.95)
-    )
-
-    # --------------------------------------------------------
-    # ENTRY / STOP / TARGETS
+    # CURRENT PRICE
     # --------------------------------------------------------
 
     price = float(
@@ -765,25 +1559,143 @@ def score_candidate(
         x15.atr
     )
 
+    # --------------------------------------------------------
+    # DISTANCE TO LEVELS
+    # --------------------------------------------------------
+
+    def pct_distance(
+        level,
+        current,
+        direction
+    ):
+
+        if (
+            level is None
+            or
+            pd.isna(level)
+        ):
+
+            return np.nan
+
+        if direction == "resistance":
+
+            return (
+                (
+                    level -
+                    current
+                )
+                /
+                current
+                *
+                100
+            )
+
+        return (
+            (
+                current -
+                level
+            )
+            /
+            current
+            *
+            100
+        )
+
+    to_r1 = pct_distance(
+        resistance1,
+        price,
+        "resistance"
+    )
+
+    to_r2 = pct_distance(
+        resistance2,
+        price,
+        "resistance"
+    )
+
+    from_s1 = pct_distance(
+        support1,
+        price,
+        "support"
+    )
+
+    from_s2 = pct_distance(
+        support2,
+        price,
+        "support"
+    )
+
+    to_monthly_r = pct_distance(
+        monthly_resistance,
+        price,
+        "resistance"
+    )
+
+    from_monthly_s = pct_distance(
+        monthly_support,
+        price,
+        "support"
+    )
+
+    to_ath = pct_distance(
+        ath,
+        price,
+        "resistance"
+    )
+
+    from_atl = pct_distance(
+        atl,
+        price,
+        "support"
+    )
+
+    # --------------------------------------------------------
+    # STOP / TARGET
+    # --------------------------------------------------------
+
     if signal == "LONG":
 
-        sl = price - 1.4 * atr
+        sl = (
+            price -
+            1.4 * atr
+        )
 
-        risk = price - sl
+        risk = (
+            price -
+            sl
+        )
 
-        tp1 = price + 1.5 * risk
+        tp1 = (
+            price +
+            1.5 * risk
+        )
 
-        tp2 = price + 2.5 * risk
+        tp2 = (
+            price +
+            2.5 * risk
+        )
 
     elif signal == "SHORT":
 
-        sl = price + 1.4 * atr
+        sl = (
+            price +
+            1.4 * atr
+        )
 
-        risk = sl - price
+        risk = (
+            sl -
+            price
+        )
 
-        tp1 = price - 1.5 * risk
+        tp1 = (
+            price -
+            1.5 * risk
+        )
 
-        tp2 = price - 2.5 * risk
+        tp2 = (
+            price -
+            2.5 * risk
+        )
 
     else:
 
@@ -813,43 +1725,92 @@ def score_candidate(
 
         "resistance2": resistance2,
 
-        "rsi": float(x1.rsi),
+        "monthly_support":
+            monthly_support,
 
-        "adx": float(xh.adx),
+        "monthly_resistance":
+            monthly_resistance,
 
-        "structure": structure(d1),
+        "ath": ath,
 
-        "ob": ob,
+        "atl": atl,
 
-        "flow": flow,
+        "to_r1": to_r1,
 
-        "ext": ext,
+        "to_r2": to_r2,
 
-        "score": raw,
+        "from_s1": from_s1,
 
-        "entry": price,
+        "from_s2": from_s2,
 
-        "sl": sl,
+        "to_monthly_r":
+            to_monthly_r,
 
-        "tp1": tp1,
+        "from_monthly_s":
+            from_monthly_s,
 
-        "tp2": tp2,
+        "to_ath":
+            to_ath,
 
-        "d1": d1,
+        "from_atl":
+            from_atl,
 
-        "h1": h1,
+        "rsi":
+            float(x1.rsi),
 
-        "m15": m15
+        "adx":
+            float(xh.adx),
+
+        "structure":
+            structure(d1),
+
+        "ob":
+            ob,
+
+        "flow":
+            flow,
+
+        "ext":
+            ext,
+
+        "score":
+            raw,
+
+        "entry":
+            price,
+
+        "sl":
+            sl,
+
+        "tp1":
+            tp1,
+
+        "tp2":
+            tp2,
+
+        "d1":
+            d1,
+
+        "h1":
+            h1,
+
+        "m15":
+            m15
     }
 
 
 # ============================================================
-# FORMAT NUMBERS
+# NUMBER FORMAT
 # ============================================================
 
 def fmt(v):
 
-    if v is None or pd.isna(v):
+    if (
+        v is None
+        or
+        pd.isna(v)
+    ):
+
         return "—"
 
     return (
@@ -859,13 +1820,29 @@ def fmt(v):
     )
 
 
+def fmt_pct(v):
+
+    if (
+        v is None
+        or
+        pd.isna(v)
+    ):
+
+        return "—"
+
+    return f"{v:+.2f}%"
+
+
 # ============================================================
 # USER SETTINGS
 # ============================================================
 
 margin = st.selectbox(
     "Futures margin market",
-    ["USDT", "INR"],
+    [
+        "USDT",
+        "INR"
+    ],
     index=0
 )
 
@@ -938,15 +1915,13 @@ st.caption(
 def normalize_coin_input(text):
 
     q = (
-        text.strip()
+        text
+        .strip()
         .upper()
         .replace("/", "")
         .replace("-", "")
         .replace("_", "")
     )
-
-    # Remove common futures quote suffixes
-    # so VELVETUSDT becomes VELVET.
 
     for quote in (
         "USDT",
@@ -956,7 +1931,8 @@ def normalize_coin_input(text):
 
         if (
             q.endswith(quote)
-            and len(q) > len(quote)
+            and
+            len(q) > len(quote)
         ):
 
             q = q[
@@ -965,11 +1941,12 @@ def normalize_coin_input(text):
 
             break
 
-    # Do not blindly strip B from normal tickers.
-    # Only strip it when matching against a
-    # CoinDCX futures contract.
+    if (
+        q.startswith("B")
+        and
+        len(q) > 2
+    ):
 
-    if q.startswith("B") and len(q) > 2:
         pass
 
     return q
@@ -977,10 +1954,13 @@ def normalize_coin_input(text):
 
 coin_input = st.text_input(
     "Coin / Futures pair",
-    placeholder="Example: DOGE, SHIB, PEPE, B-DOGE_USDT",
+    placeholder=(
+        "Example: DOGE, SHIB, PEPE, "
+        "B-DOGE_USDT"
+    ),
     help=(
-        "You can enter DOGE, DOGEUSDT, or the CoinDCX "
-        "futures pair such as B-DOGE_USDT."
+        "You can enter DOGE, DOGEUSDT, or the "
+        "CoinDCX futures pair such as B-DOGE_USDT."
     )
 )
 
@@ -992,8 +1972,9 @@ avg_price_input = st.number_input(
     step=0.00000001,
     format="%.8f",
     help=(
-        "Enter your actual average price if you want the "
-        "scanner to compare the current price with your cost."
+        "Enter your actual average price if you want "
+        "the scanner to compare the current price "
+        "with your cost."
     )
 )
 
@@ -1002,24 +1983,29 @@ avg_price_input = st.number_input(
 # ANALYZE MY COIN
 # ============================================================
 
-if st.button("📊 Analyze My Coin"):
+if st.button(
+    "📊 Analyze My Coin"
+):
 
     try:
 
         if not coin_input.strip():
 
             st.warning(
-                "Enter a coin first, for example DOGE or SHIB."
+                "Enter a coin first, "
+                "for example DOGE or SHIB."
             )
 
             st.stop()
 
-        prices = get_futures_prices()
+        prices = (
+            get_futures_prices()
+        )
 
-        # Search both common quote markets.
-
-        requested = normalize_coin_input(
-            coin_input
+        requested = (
+            normalize_coin_input(
+                coin_input
+            )
         )
 
         margin_list = (
@@ -1027,7 +2013,10 @@ if st.button("📊 Analyze My Coin"):
             +
             [
                 q
-                for q in ("USDT", "INR")
+                for q in (
+                    "USDT",
+                    "INR"
+                )
                 if q != margin
             ]
         )
@@ -1036,12 +2025,18 @@ if st.button("📊 Analyze My Coin"):
 
         seen = set()
 
+        # ----------------------------------------------------
+        # FIND FUTURES CONTRACT
+        # ----------------------------------------------------
+
         for qmargin in margin_list:
 
             try:
 
-                active = get_active_instruments(
-                    qmargin
+                active = (
+                    get_active_instruments(
+                        qmargin
+                    )
                 )
 
             except Exception:
@@ -1054,24 +2049,41 @@ if st.button("📊 Analyze My Coin"):
                     pair
                 ).upper()
 
-                p = prices.get(pair)
+                p = prices.get(
+                    pair
+                )
 
                 if not p:
                     continue
 
                 symbol = str(
-                    p.get("mkt", "")
+                    p.get(
+                        "mkt",
+                        ""
+                    )
                 ).upper()
 
                 names = {
 
                     pair_u
-                    .replace("-", "")
-                    .replace("_", ""),
+                    .replace(
+                        "-",
+                        ""
+                    )
+                    .replace(
+                        "_",
+                        ""
+                    ),
 
                     symbol
-                    .replace("-", "")
-                    .replace("_", "")
+                    .replace(
+                        "-",
+                        ""
+                    )
+                    .replace(
+                        "_",
+                        ""
+                    )
                 }
 
                 matched = False
@@ -1085,28 +2097,38 @@ if st.button("📊 Analyze My Coin"):
                         "I"
                     ):
 
-                        if n.startswith(prefix):
+                        if n.startswith(
+                            prefix
+                        ):
+
                             n2 = n[1:]
+
                         else:
+
                             n2 = n
 
                         if (
                             n2 ==
-                            requested + qmargin
+                            requested +
+                            qmargin
                             or
                             n2 ==
                             requested
                         ):
+
                             matched = True
 
                         if n2.startswith(
-                            requested + qmargin
+                            requested +
+                            qmargin
                         ):
+
                             matched = True
 
                 if (
                     matched
-                    and pair not in seen
+                    and
+                    pair not in seen
                 ):
 
                     candidates.append(
@@ -1118,7 +2140,13 @@ if st.button("📊 Analyze My Coin"):
                         )
                     )
 
-                    seen.add(pair)
+                    seen.add(
+                        pair
+                    )
+
+        # ----------------------------------------------------
+        # NO CONTRACT
+        # ----------------------------------------------------
 
         if not candidates:
 
@@ -1128,8 +2156,10 @@ if st.button("📊 Analyze My Coin"):
 
                 try:
 
-                    active = get_active_instruments(
-                        qmargin
+                    active = (
+                        get_active_instruments(
+                            qmargin
+                        )
                     )
 
                     for pair in active:
@@ -1141,16 +2171,20 @@ if st.button("📊 Analyze My Coin"):
                         if (
                             requested
                             in
-                            s.replace(
+                            s
+                            .replace(
                                 "-",
                                 ""
-                            ).replace(
+                            )
+                            .replace(
                                 "_",
                                 ""
                             )
                         ):
 
-                            available.append(s)
+                            available.append(
+                                s
+                            )
 
                 except Exception:
                     pass
@@ -1166,25 +2200,31 @@ if st.button("📊 Analyze My Coin"):
             )
 
             st.error(
-                f"No active CoinDCX Futures contract was found "
-                f"for '{coin_input}'. Tried "
-                f"{', '.join(margin_list)} margin markets."
+                f"No active CoinDCX Futures contract "
+                f"was found for '{coin_input}'. "
+                f"Tried {', '.join(margin_list)} "
+                f"margin markets."
                 f"{extra}"
             )
 
             st.stop()
 
-        # Prefer user's selected margin market,
-        # then USDT.
+        # ----------------------------------------------------
+        # PREFER SELECTED MARGIN
+        # ----------------------------------------------------
 
         candidates.sort(
             key=lambda z: (
-                0 if z[3] == margin else 1,
+                0
+                if z[3] == margin
+                else 1,
                 len(z[0])
             )
         )
 
-        pair, p, symbol, found_margin = candidates[0]
+        pair, p, symbol, found_margin = (
+            candidates[0]
+        )
 
         if found_margin != margin:
 
@@ -1194,6 +2234,10 @@ if st.button("📊 Analyze My Coin"):
                 f"analyzing that contract."
             )
 
+        # ----------------------------------------------------
+        # GET CANDLES
+        # ----------------------------------------------------
+
         now = int(
             time.time()
         )
@@ -1201,25 +2245,30 @@ if st.button("📊 Analyze My Coin"):
         d1 = get_futures_candles(
             pair,
             "1D",
-            now - 400 * 86400,
+            now -
+            400 * 86400,
             now
         )
 
         h1 = get_futures_candles(
             pair,
             "60",
-            now - 120 * 86400,
+            now -
+            120 * 86400,
             now
         )
 
         m15 = get_futures_candles(
             pair,
             "15",
-            now - 30 * 86400,
+            now -
+            30 * 86400,
             now
         )
 
-        # New listings can have limited history.
+        # ----------------------------------------------------
+        # HISTORY CHECK
+        # ----------------------------------------------------
 
         if (
             len(d1) < 10
@@ -1230,8 +2279,8 @@ if st.button("📊 Analyze My Coin"):
         ):
 
             st.error(
-                f"CoinDCX returned too little history for "
-                f"{symbol}: "
+                f"CoinDCX returned too little history "
+                f"for {symbol}: "
                 f"1D={len(d1)}, "
                 f"1H={len(h1)}, "
                 f"15m={len(m15)}. "
@@ -1239,6 +2288,10 @@ if st.button("📊 Analyze My Coin"):
             )
 
             st.stop()
+
+        # ----------------------------------------------------
+        # SCORE
+        # ----------------------------------------------------
 
         x = score_candidate(
             pair,
@@ -1255,6 +2308,10 @@ if st.button("📊 Analyze My Coin"):
         current = float(
             x["price"]
         )
+
+        # ----------------------------------------------------
+        # POSITION P/L
+        # ----------------------------------------------------
 
         if avg_price_input > 0:
 
@@ -1275,34 +2332,39 @@ if st.button("📊 Analyze My Coin"):
             )
 
         # ----------------------------------------------------
-        # SIGNAL INTERPRETATION
+        # SIGNAL
         # ----------------------------------------------------
 
         if x["signal"] == "LONG":
 
             st.success(
                 "🟢 LONG BIAS — Current Futures structure "
-                "supports the bullish direction. For an existing "
-                "spot holding, this means the trend is currently "
-                "favorable to the long side."
+                "supports the bullish direction. For an "
+                "existing spot holding, this means the trend "
+                "is currently favorable to the long side."
             )
 
         elif x["signal"] == "SHORT":
 
             st.error(
                 "🔴 SHORT BIAS — Current Futures structure "
-                "supports the bearish direction. For an existing "
-                "spot holding, this is a warning that downside "
-                "momentum is stronger."
+                "supports the bearish direction. For an "
+                "existing spot holding, this is a warning "
+                "that downside momentum is stronger."
             )
 
         else:
 
             st.warning(
-                "🟡 WAIT — The coin is not giving a sufficiently "
-                "clean long or short setup right now. Avoid making "
-                "a directional decision from momentum alone."
+                "🟡 WAIT — The coin is not giving a "
+                "sufficiently clean long or short setup "
+                "right now. Avoid making a directional "
+                "decision from momentum alone."
             )
+
+        # ----------------------------------------------------
+        # BASIC METRICS
+        # ----------------------------------------------------
 
         a, b, c, d = st.columns(4)
 
@@ -1341,46 +2403,217 @@ if st.button("📊 Analyze My Coin"):
 
             st.info(
                 "This is a newer/limited-history Futures "
-                "contract. The signal is intentionally given "
-                "a lower confidence ceiling."
+                "contract. The signal is intentionally "
+                "given a lower confidence ceiling."
             )
 
-        st.write(
-            f"**1D structure:** {x['structure']}  |  "
-            f"**1H ADX:** {x['adx']:.1f}  |  "
-            f"**Support:** "
-            f"{fmt(x['support1'])} / "
-            f"{fmt(x['support2'])}  |  "
-            f"**Resistance:** "
-            f"{fmt(x['resistance1'])} / "
-            f"{fmt(x['resistance2'])}"
+        # ====================================================
+        # SUPPORT / RESISTANCE
+        # ====================================================
+
+        st.divider()
+
+        st.subheader(
+            "📍 Support & Resistance"
         )
+
+        a, b, c, d = st.columns(4)
+
+        a.metric(
+            "S1 — Nearest Support",
+            fmt(x["support1"]),
+            delta=(
+                f"{x['from_s1']:+.2f}% below"
+                if pd.notna(
+                    x["from_s1"]
+                )
+                else None
+            )
+        )
+
+        b.metric(
+            "S2 — Major Support",
+            fmt(x["support2"]),
+            delta=(
+                f"{x['from_s2']:+.2f}% below"
+                if pd.notna(
+                    x["from_s2"]
+                )
+                else None
+            )
+        )
+
+        c.metric(
+            "R1 — Nearest Resistance",
+            fmt(x["resistance1"]),
+            delta=(
+                f"{x['to_r1']:+.2f}% above"
+                if pd.notna(
+                    x["to_r1"]
+                )
+                else None
+            )
+        )
+
+        d.metric(
+            "R2 — Major Resistance",
+            fmt(x["resistance2"]),
+            delta=(
+                f"{x['to_r2']:+.2f}% above"
+                if pd.notna(
+                    x["to_r2"]
+                )
+                else None
+            )
+        )
+
+        # ====================================================
+        # MONTHLY / ALL-TIME
+        # ====================================================
+
+        st.subheader(
+            "📅 Monthly & All-Time Levels"
+        )
+
+        a, b, c, d = st.columns(4)
+
+        a.metric(
+            "Monthly Support",
+            fmt(x["monthly_support"]),
+            delta=(
+                f"{x['from_monthly_s']:+.2f}% below"
+                if pd.notna(
+                    x["from_monthly_s"]
+                )
+                else None
+            )
+        )
+
+        b.metric(
+            "Monthly Resistance",
+            fmt(x["monthly_resistance"]),
+            delta=(
+                f"{x['to_monthly_r']:+.2f}% above"
+                if pd.notna(
+                    x["to_monthly_r"]
+                )
+                else None
+            )
+        )
+
+        c.metric(
+            "ATL",
+            fmt(x["atl"]),
+            delta=(
+                f"{x['from_atl']:+.2f}% above"
+                if pd.notna(
+                    x["from_atl"]
+                )
+                else None
+            )
+        )
+
+        d.metric(
+            "ATH",
+            fmt(x["ath"]),
+            delta=(
+                f"{x['to_ath']:+.2f}% above"
+                if pd.notna(
+                    x["to_ath"]
+                )
+                else None
+            )
+        )
+
+        st.caption(
+            "ATH/ATL are based on the daily Futures "
+            "history currently returned by CoinDCX."
+        )
+
+        # ====================================================
+        # MARKET STRUCTURE
+        # ====================================================
+
+        st.write(
+            f"**1D structure:** "
+            f"{x['structure']}  |  "
+            f"**1H ADX:** "
+            f"{x['adx']:.1f}"
+        )
+
+        # ====================================================
+        # ENTRY / STOP / TARGET
+        # ====================================================
 
         if x["signal"] in (
             "LONG",
             "SHORT"
         ):
 
+            st.subheader(
+                "🎯 Trade Levels"
+            )
+
             a, b, c = st.columns(3)
 
             a.metric(
-                "Reference entry",
+                "Reference Entry",
                 fmt(x["entry"])
             )
 
             b.metric(
-                "Stop loss",
+                "Stop Loss",
                 fmt(x["sl"])
             )
 
             c.metric(
                 "TP1 / TP2",
-                f'{fmt(x["tp1"])} / {fmt(x["tp2"])}'
+                f"{fmt(x['tp1'])} / "
+                f"{fmt(x['tp2'])}"
             )
 
-        # ----------------------------------------------------
-        # EXPLANATION
-        # ----------------------------------------------------
+        # ====================================================
+        # INTERPRETATION
+        # ====================================================
+
+        with st.expander(
+            "📊 How to read these levels"
+        ):
+
+            st.write(
+                "S1 is the nearest meaningful support "
+                "below the current price. S2 is the next "
+                "major support."
+            )
+
+            st.write(
+                "R1 is the nearest meaningful resistance "
+                "above the current price. R2 is the next "
+                "major resistance."
+            )
+
+            st.write(
+                "Monthly Support and Monthly Resistance "
+                "come from monthly price highs/lows and "
+                "are given additional importance."
+            )
+
+            st.write(
+                "ATH is the highest daily Futures price "
+                "available in the retrieved history. "
+                "ATL is the lowest."
+            )
+
+            st.write(
+                "The system clusters nearby swing highs "
+                "and lows so several reactions around the "
+                "same price become one support/resistance "
+                "zone instead of multiple fake levels."
+            )
+
+        # ====================================================
+        # WHY SIGNAL
+        # ====================================================
 
         with st.expander(
             "Why did the scanner choose this direction?"
@@ -1395,8 +2628,10 @@ if st.button("📊 Analyze My Coin"):
             )
 
             st.write(
-                f"Daily RSI: {x['rsi']:.1f} | "
-                f"1H ADX: {x['adx']:.1f} | "
+                f"Daily RSI: "
+                f"{x['rsi']:.1f} | "
+                f"1H ADX: "
+                f"{x['adx']:.1f} | "
                 f"Order-book imbalance: "
                 f"{'not available' if x['ob'] is None else f'{x['ob'] * 100:.2f}%'} | "
                 f"Trade-flow proxy: "
@@ -1430,7 +2665,7 @@ if st.button("📊 Analyze My Coin"):
 
 
 # ============================================================
-# SCAN TOP FUTURES
+# TOP FUTURES SCANNER
 # ============================================================
 
 if st.button(
@@ -1440,21 +2675,27 @@ if st.button(
 
     try:
 
-        active = get_active_instruments(
-            margin
+        active = (
+            get_active_instruments(
+                margin
+            )
         )
 
-        prices = get_futures_prices()
+        prices = (
+            get_futures_prices()
+        )
 
         # ----------------------------------------------------
-        # KEEP INSTRUMENTS WITH CURRENT PRICE
+        # FIND CURRENTLY PRICED CONTRACTS
         # ----------------------------------------------------
 
         rows = []
 
         for pair in active:
 
-            p = prices.get(pair)
+            p = prices.get(
+                pair
+            )
 
             if not p:
                 continue
@@ -1476,10 +2717,14 @@ if st.button(
                     for word in MEME_WORDS
                 )
             ):
+
                 continue
 
             pc = float(
-                p.get("pc", 0)
+                p.get(
+                    "pc",
+                    0
+                )
                 or 0
             )
 
@@ -1504,11 +2749,12 @@ if st.button(
             st.stop()
 
         # ----------------------------------------------------
-        # SORT BY LARGEST 24H MOVEMENT
+        # LARGEST MOVERS FIRST
         # ----------------------------------------------------
 
         rows.sort(
-            key=lambda z: abs(
+            key=lambda z:
+            abs(
                 float(
                     z[1].get(
                         "pc",
@@ -1521,16 +2767,16 @@ if st.button(
         )
 
         # ----------------------------------------------------
-        # ANALYZE STRONGEST MOVERS
+        # ANALYZE TOP 12
         # ----------------------------------------------------
 
         results = []
 
+        scan_errors = []
+
         now = int(
             time.time()
         )
-
-        scan_errors = []
 
         for pair, p, symbol in rows[:12]:
 
@@ -1539,36 +2785,40 @@ if st.button(
                 d1 = get_futures_candles(
                     pair,
                     "1D",
-                    now - 400 * 86400,
+                    now -
+                    400 * 86400,
                     now
                 )
 
                 h1 = get_futures_candles(
                     pair,
                     "60",
-                    now - 120 * 86400,
+                    now -
+                    120 * 86400,
                     now
                 )
 
                 m15 = get_futures_candles(
                     pair,
                     "15",
-                    now - 30 * 86400,
+                    now -
+                    30 * 86400,
                     now
                 )
 
-                # ==================================================
-                # IMPORTANT FIX:
+                # ------------------------------------------------
+                # IMPORTANT BUG FIX
                 #
-                # OLD BUG:
+                # The previous version incorrectly used:
+                #
                 # len(d1h)
                 #
-                # CORRECT:
-                # len(h1)
+                # There is no d1h variable.
                 #
-                # d1h did not exist and caused every candidate
-                # to fail with NameError.
-                # ==================================================
+                # The correct variable is:
+                #
+                # len(h1)
+                # ------------------------------------------------
 
                 if (
                     len(d1) < 10
@@ -1604,9 +2854,9 @@ if st.button(
 
             except Exception as e:
 
-                # Do not silently hide scanner failures.
                 scan_errors.append(
-                    f"{symbol}: {type(e).__name__}: {e}"
+                    f"{symbol}: "
+                    f"{type(e).__name__}: {e}"
                 )
 
                 continue
@@ -1638,18 +2888,19 @@ if st.button(
             st.stop()
 
         # ----------------------------------------------------
-        # SORT RESULTS
+        # SORT BY SCORE
         # ----------------------------------------------------
 
         results.sort(
-            key=lambda z: z[1]["score"],
+            key=lambda z:
+            z[1]["score"],
             reverse=True
         )
 
         results = results[:5]
 
         # ----------------------------------------------------
-        # DISPLAY TOP 5
+        # DISPLAY
         # ----------------------------------------------------
 
         st.header(
@@ -1657,10 +2908,10 @@ if st.button(
         )
 
         st.caption(
-            "First filter: largest 24h movers. Second filter: "
-            "trend, EMA 20/50/100/200, RSI, MACD, ADX/DI, ATR, "
-            "volume, Bollinger Bands, daily support/resistance "
-            "and futures liquidity."
+            "First filter: largest 24h movers. Second "
+            "filter: trend, EMA 20/50/100/200, RSI, MACD, "
+            "ADX/DI, ATR, volume, support/resistance and "
+            "futures liquidity."
         )
 
         for i, (symbol, x) in enumerate(
@@ -1687,6 +2938,10 @@ if st.button(
                     f"{icon} {x['signal']}"
                 )
 
+                # ------------------------------------------------
+                # BASIC METRICS
+                # ------------------------------------------------
+
                 a, b, c, d = st.columns(4)
 
                 a.metric(
@@ -1709,21 +2964,140 @@ if st.button(
                     f'{x["rsi"]:.1f}'
                 )
 
-                st.write(
-                    f"**Support:** "
-                    f"{fmt(x['support2'])} / "
-                    f"{fmt(x['support1'])}   |   "
-                    f"**Resistance:** "
-                    f"{fmt(x['resistance1'])} / "
-                    f"{fmt(x['resistance2'])}"
-                )
-
                 st.caption(
                     f"History available: "
                     f"1D {len(x['d1'])} candles • "
                     f"1H {len(x['h1'])} candles • "
                     f"15m {len(x['m15'])} candles"
                 )
+
+                # ------------------------------------------------
+                # SUPPORT / RESISTANCE
+                # ------------------------------------------------
+
+                st.subheader(
+                    "📍 Support & Resistance"
+                )
+
+                a, b, c, d = st.columns(4)
+
+                a.metric(
+                    "S1",
+                    fmt(x["support1"]),
+                    delta=(
+                        f"{x['from_s1']:+.2f}% below"
+                        if pd.notna(
+                            x["from_s1"]
+                        )
+                        else None
+                    )
+                )
+
+                b.metric(
+                    "S2",
+                    fmt(x["support2"]),
+                    delta=(
+                        f"{x['from_s2']:+.2f}% below"
+                        if pd.notna(
+                            x["from_s2"]
+                        )
+                        else None
+                    )
+                )
+
+                c.metric(
+                    "R1",
+                    fmt(x["resistance1"]),
+                    delta=(
+                        f"{x['to_r1']:+.2f}% above"
+                        if pd.notna(
+                            x["to_r1"]
+                        )
+                        else None
+                    )
+                )
+
+                d.metric(
+                    "R2",
+                    fmt(x["resistance2"]),
+                    delta=(
+                        f"{x['to_r2']:+.2f}% above"
+                        if pd.notna(
+                            x["to_r2"]
+                        )
+                        else None
+                    )
+                )
+
+                # ------------------------------------------------
+                # MONTHLY / ALL-TIME
+                # ------------------------------------------------
+
+                st.subheader(
+                    "📅 Monthly & All-Time"
+                )
+
+                a, b, c, d = st.columns(4)
+
+                a.metric(
+                    "Monthly Support",
+                    fmt(
+                        x["monthly_support"]
+                    ),
+                    delta=(
+                        f"{x['from_monthly_s']:+.2f}% below"
+                        if pd.notna(
+                            x["from_monthly_s"]
+                        )
+                        else None
+                    )
+                )
+
+                b.metric(
+                    "Monthly Resistance",
+                    fmt(
+                        x["monthly_resistance"]
+                    ),
+                    delta=(
+                        f"{x['to_monthly_r']:+.2f}% above"
+                        if pd.notna(
+                            x["to_monthly_r"]
+                        )
+                        else None
+                    )
+                )
+
+                c.metric(
+                    "ATL",
+                    fmt(
+                        x["atl"]
+                    ),
+                    delta=(
+                        f"{x['from_atl']:+.2f}% above"
+                        if pd.notna(
+                            x["from_atl"]
+                        )
+                        else None
+                    )
+                )
+
+                d.metric(
+                    "ATH",
+                    fmt(
+                        x["ath"]
+                    ),
+                    delta=(
+                        f"{x['to_ath']:+.2f}% above"
+                        if pd.notna(
+                            x["to_ath"]
+                        )
+                        else None
+                    )
+                )
+
+                # ------------------------------------------------
+                # TRADE LEVELS
+                # ------------------------------------------------
 
                 if x["signal"] in (
                     "LONG",
@@ -1733,23 +3107,31 @@ if st.button(
                     a, b, c, d = st.columns(4)
 
                     a.metric(
-                        "Entry reference",
-                        fmt(x["entry"])
+                        "Entry Reference",
+                        fmt(
+                            x["entry"]
+                        )
                     )
 
                     b.metric(
                         "Stop Loss",
-                        fmt(x["sl"])
+                        fmt(
+                            x["sl"]
+                        )
                     )
 
                     c.metric(
                         "TP1",
-                        fmt(x["tp1"])
+                        fmt(
+                            x["tp1"]
+                        )
                     )
 
                     d.metric(
                         "TP2",
-                        fmt(x["tp2"])
+                        fmt(
+                            x["tp2"]
+                        )
                     )
 
                 else:
@@ -1768,7 +3150,7 @@ if st.button(
                     )
 
                 # ------------------------------------------------
-                # ADVANCED ANALYSIS
+                # ADVANCED
                 # ------------------------------------------------
 
                 with st.expander(
@@ -1776,7 +3158,8 @@ if st.button(
                 ):
 
                     st.write(
-                        f"1D structure: **{x['structure']}**"
+                        f"1D structure: "
+                        f"**{x['structure']}**"
                     )
 
                     st.write(
@@ -1788,26 +3171,48 @@ if st.button(
                     )
 
                     if pd.isna(
-                        x["d1"].iloc[-1].ema200
+                        x["d1"]
+                        .iloc[-1]
+                        .ema200
                     ):
 
                         st.info(
-                            "This futures contract does not yet "
-                            "have 200 daily candles. EMA200 is "
-                            "therefore not used as a bearish/bullish "
-                            "vote for this coin."
+                            "This futures contract does not "
+                            "yet have 200 daily candles. "
+                            "EMA200 is therefore not used "
+                            "as a bearish/bullish vote for "
+                            "this coin."
                         )
 
                     st.write(
-                        f"1H ADX: {x['adx']:.1f} | "
-                        f"1D RSI: {x['rsi']:.1f}"
+                        f"1H ADX: "
+                        f"{x['adx']:.1f} | "
+                        f"1D RSI: "
+                        f"{x['rsi']:.1f}"
+                    )
+
+                    st.write(
+                        f"Monthly Support: "
+                        f"{fmt(x['monthly_support'])}"
+                    )
+
+                    st.write(
+                        f"Monthly Resistance: "
+                        f"{fmt(x['monthly_resistance'])}"
+                    )
+
+                    st.write(
+                        f"ATH: "
+                        f"{fmt(x['ath'])} | "
+                        f"ATL: "
+                        f"{fmt(x['atl'])}"
                     )
 
                     if x["ob"] is not None:
 
                         st.write(
-                            f"Near-price futures order-book "
-                            f"imbalance: "
+                            f"Near-price futures "
+                            f"order-book imbalance: "
                             f"{x['ob'] * 100:.2f}%"
                         )
 
@@ -1834,7 +3239,7 @@ if st.button(
                     )
 
         # ----------------------------------------------------
-        # OPTIONAL DIAGNOSTICS
+        # DIAGNOSTICS
         # ----------------------------------------------------
 
         if scan_errors:
