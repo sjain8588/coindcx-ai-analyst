@@ -1605,344 +1605,362 @@ def extreme_status(
 # IMPROVED ATH / ATL SCANNER
 # =============================================================================
 
-def scan_extremes(
-    active,
-    prices,
-    mode,
-    limit=150
-):
+def historical_pattern_study(d, mode):
+    """Study past ATH/ATL events using the available daily history.
 
+    This is deliberately a simple descriptive study, not a trading backtest.
+    It measures what happened during the next N daily candles after an
+    historical extreme event.
+    """
+    if d is None or len(d) < 40:
+        return {
+            "events": 0,
+            "win_rate": np.nan,
+            "avg_forward": np.nan,
+            "best_forward": np.nan,
+            "worst_forward": np.nan,
+            "median_forward": np.nan,
+        }
+
+    x = d.sort_values("time").reset_index(drop=True)
+    outcomes = []
+    lookback = 30
+    forward = 7
+
+    for i in range(lookback, len(x) - forward):
+        hist = x.iloc[:i]
+        price = float(x.iloc[i].close)
+
+        if mode == "ATH":
+            extreme = float(hist.high.max())
+            dist = (price - extreme) / extreme * 100 if extreme > 0 else 0
+            # Historical breakout: close above prior ATH.
+            event = dist > 0
+        else:
+            extreme = float(hist.low.min())
+            dist = (price - extreme) / extreme * 100 if extreme > 0 else 0
+            # Historical breakdown: close below prior ATL.
+            event = dist < 0
+
+        if not event:
+            continue
+
+        future = x.iloc[i + 1:i + 1 + forward]
+        if future.empty:
+            continue
+
+        if mode == "ATH":
+            forward_return = (float(future.iloc[-1].close) - price) / price * 100
+            best = (float(future.high.max()) - price) / price * 100
+            worst = (float(future.low.min()) - price) / price * 100
+            outcomes.append((forward_return, best, worst))
+        else:
+            forward_return = (float(future.iloc[-1].close) - price) / price * 100
+            best = (float(future.high.max()) - price) / price * 100
+            worst = (float(future.low.min()) - price) / price * 100
+            outcomes.append((forward_return, best, worst))
+
+    if not outcomes:
+        return {
+            "events": 0,
+            "win_rate": np.nan,
+            "avg_forward": np.nan,
+            "best_forward": np.nan,
+            "worst_forward": np.nan,
+            "median_forward": np.nan,
+        }
+
+    arr = np.array(outcomes, dtype=float)
+    return {
+        "events": len(outcomes),
+        "win_rate": float((arr[:, 0] > 0).mean() * 100),
+        "avg_forward": float(arr[:, 0].mean()),
+        "best_forward": float(arr[:, 1].max()),
+        "worst_forward": float(arr[:, 2].min()),
+        "median_forward": float(np.median(arr[:, 0])),
+    }
+
+
+def extreme_trade_decision(mode, distance, change24, change7, rsi, adx,
+                           volume_ratio, daily_structure, h1_structure=None,
+                           m15_structure=None, current=None, extreme=None):
+    """Turn ATH/ATL context into LONG/SHORT/WAIT without assuming extremes reverse."""
+    h1_structure = h1_structure or "Mixed"
+    m15_structure = m15_structure or "Mixed"
+
+    if mode == "ATH":
+        # Confirmed continuation: breakout plus healthy momentum.
+        breakout = distance > 0
+        healthy_rsi = pd.notna(rsi) and rsi < 78
+        strong_trend = pd.notna(adx) and adx >= 20
+        bullish_tf = (
+            daily_structure == "Bullish"
+            and h1_structure in ("Bullish", "Mixed")
+            and m15_structure in ("Bullish", "Mixed")
+        )
+        volume_ok = pd.isna(volume_ratio) or volume_ratio >= 1.0
+
+        if breakout and healthy_rsi and strong_trend and bullish_tf and volume_ok and change24 > 0:
+            return "🟢 LONG", "ATH breakout continuation"
+
+        # Late parabolic move: do not automatically short; wait for rejection.
+        if (
+            breakout
+            and (
+                (pd.notna(rsi) and rsi >= 80)
+                or (pd.notna(volume_ratio) and volume_ratio >= 3)
+                or change24 >= 20
+            )
+        ):
+            return "🟡 WAIT", "🚨 Parabolic / blow-off watch — don't chase"
+
+        # ATH rejection / failed breakout.
+        if distance <= 0 and change24 < 0 and daily_structure == "Bearish":
+            return "🔴 SHORT WATCH", "ATH rejection / failed breakout"
+
+        if distance <= 0 and h1_structure == "Bearish" and m15_structure == "Bearish":
+            return "🔴 SHORT WATCH", "Lower-timeframe ATH rejection"
+
+        return "🟡 WAIT", "ATH level needs confirmation"
+
+    # ATL logic
+    breakdown = distance < 0
+    oversold = pd.notna(rsi) and rsi <= 22
+    strong_trend = pd.notna(adx) and adx >= 20
+    bearish_tf = (
+        daily_structure == "Bearish"
+        and h1_structure in ("Bearish", "Mixed")
+        and m15_structure in ("Bearish", "Mixed")
+    )
+    volume_ok = pd.isna(volume_ratio) or volume_ratio >= 1.0
+
+    # Extreme capitulation: shorting after a vertical collapse can be dangerous.
+    if (
+        (pd.notna(rsi) and rsi <= 12)
+        or (pd.notna(adx) and adx >= 60 and change24 <= -20)
+        or change24 <= -30
+        or change7 <= -60
+    ):
+        return "🟡 WAIT", "🚨 Capitulation / falling knife — don't chase SHORT"
+
+    if breakdown and strong_trend and bearish_tf and volume_ok and change24 < 0:
+        return "🔴 SHORT", "ATL breakdown continuation"
+
+    # Reclaim/reversal near ATL.
+    if (
+        distance >= 0
+        and oversold
+        and h1_structure == "Bullish"
+        and m15_structure == "Bullish"
+        and change24 > 0
+    ):
+        return "🟢 LONG", "ATL rejection / reversal confirmation"
+
+    if distance <= 5 and oversold:
+        return "🟡 WAIT", "Oversold near ATL — wait for reversal confirmation"
+
+    if change24 < 0 and change7 < 0 and daily_structure == "Bearish":
+        return "🔴 SHORT WATCH", "Persistent downside trend"
+
+    return "🟡 WAIT", "ATL level needs confirmation"
+
+
+def scan_extremes(active, prices, mode, limit=150):
     rows = []
 
-    # =========================================================
-    # BUILD COMPLETE FUTURES UNIVERSE
-    # =========================================================
-
+    # The extreme scanner intentionally ignores the Meme filter and scans
+    # the broad Futures universe.
     for pair in active:
-
         p = prices.get(pair)
-
         if not p:
             continue
 
-        symbol = str(
-            p.get("mkt", pair)
-        ).upper()
+        symbol = str(p.get("mkt", pair)).upper()
 
         try:
-
-            pc = float(
-                p.get("pc", 0) or 0
-            )
-
+            pc = float(p.get("pc", 0) or 0)
             cur = current_price(p)
-
         except Exception:
-
             continue
 
         if cur <= 0:
             continue
 
-        # ATH/ATL scanner deliberately ignores meme_only.
-        rows.append(
-            (
-                pair,
-                p,
-                symbol,
-                pc,
-                cur
-            )
-        )
+        rows.append((pair, p, symbol, pc, cur))
 
     if not rows:
         return [], []
 
-    # =========================================================
-    # PRE-FILTER
-    # =========================================================
-
+    # Daily calls are the expensive part. Check a large but bounded universe.
     if mode == "ATH":
-
-        rows.sort(
-            key=lambda z: z[3],
-            reverse=True
-        )
-
+        rows.sort(key=lambda z: z[3], reverse=True)
     else:
+        rows.sort(key=lambda z: z[3])
 
-        rows.sort(
-            key=lambda z: z[3]
-        )
-
-    # Scan up to 150 contracts.
     rows = rows[:limit]
-
     now = int(time.time())
-
     output = []
     failures = []
 
-    # =========================================================
-    # DAILY HISTORY
-    # =========================================================
-
-    for (
-        pair,
-        p,
-        symbol,
-        pc,
-        cur
-    ) in rows:
-
+    # First pass: daily history finds extreme candidates.
+    for pair, p, symbol, pc, cur in rows:
         try:
-
-            d = candles(
-                pair,
-                "1D",
-                now - 400 * 86400,
-                now
-            )
+            d = candles(pair, "1D", now - 400 * 86400, now)
 
             if len(d) < 2:
-
-                failures.append(
-                    f"{symbol}: only {len(d)} daily candles"
-                )
-
+                failures.append(f"{symbol}: only {len(d)} daily candles")
                 continue
 
-            # Exclude latest daily candle.
             history = d.iloc[:-1]
-
             if history.empty:
                 continue
 
-            previous_ath = float(
-                history.high.max()
-            )
-
-            previous_atl = float(
-                history.low.min()
-            )
-
-            # =================================================
-            # 7-DAY PERFORMANCE
-            # =================================================
-
-            if len(d) >= 8:
-                close7 = float(
-                    d.iloc[-8].close
-                )
-            else:
-                close7 = float(
-                    d.iloc[0].close
-                )
-
-            if close7 > 0:
-
-                change7 = (
-                    (
-                        cur -
-                        close7
-                    )
-                    /
-                    close7
-                    *
-                    100
-                )
-
-            else:
-
-                change7 = np.nan
-
-            # =================================================
-            # ATH
-            # =================================================
+            previous_ath = float(history.high.max())
+            previous_atl = float(history.low.min())
 
             if mode == "ATH":
-
-                distance = (
-                    (
-                        cur -
-                        previous_ath
-                    )
-                    /
-                    previous_ath
-                    *
-                    100
-                )
-
-                if distance > 0:
-
-                    status = "🔥 ATH BREAKOUT"
-
-                elif distance >= -0.5:
-
-                    status = "🟢 AT ATH"
-
-                elif distance >= -5:
-
-                    status = "🟡 NEAR ATH"
-
-                else:
-
-                    continue
-
                 extreme = previous_ath
-
-            # =================================================
-            # ATL
-            # =================================================
-
             else:
-
-                distance = (
-                    (
-                        cur -
-                        previous_atl
-                    )
-                    /
-                    previous_atl
-                    *
-                    100
-                )
-
-                if distance < 0:
-
-                    status = "🔴 ATL BREAKDOWN"
-
-                elif distance <= 0.5:
-
-                    status = "🟠 AT ATL"
-
-                elif distance <= 5:
-
-                    status = "🟡 NEAR ATL"
-
-                elif pc <= -8:
-
-                    status = "🔻 STRONG DOWN"
-
-                else:
-
-                    continue
-
                 extreme = previous_atl
 
-            # =================================================
-            # INDICATORS
-            # =================================================
+            if extreme <= 0:
+                continue
+
+            distance = (cur - extreme) / extreme * 100
+
+            if mode == "ATH":
+                if distance > 0:
+                    status = "🔥 ATH BREAKOUT"
+                elif distance >= -0.5:
+                    status = "🟢 AT ATH"
+                elif distance >= -5:
+                    status = "🟡 NEAR ATH"
+                else:
+                    continue
+            else:
+                if distance < 0:
+                    status = "🔴 ATL BREAKDOWN"
+                elif distance <= 0.5:
+                    status = "🟠 AT ATL"
+                elif distance <= 5:
+                    status = "🟡 NEAR ATL"
+                elif pc <= -8:
+                    status = "🔻 STRONG DOWN"
+                else:
+                    continue
+
+            if len(d) >= 8:
+                close7 = float(d.iloc[-8].close)
+            else:
+                close7 = float(d.iloc[0].close)
+
+            change7 = ((cur - close7) / close7 * 100) if close7 > 0 else np.nan
 
             ind = indicators(d)
-
             last = ind.iloc[-1]
 
-            if (
-                pd.notna(last.volma)
-                and
-                float(last.volma) > 0
-            ):
-
-                volume_ratio = (
-                    float(last.volume)
-                    /
-                    float(last.volma)
-                )
-
-            else:
-
-                volume_ratio = np.nan
-
-            output.append(
-                {
-                    "symbol": symbol,
-                    "pair": pair,
-                    "price": cur,
-                    "extreme": extreme,
-                    "distance": distance,
-                    "change": pc,
-                    "change7": change7,
-                    "status": status,
-                    "rsi":
-                        (
-                            float(last.rsi)
-                            if pd.notna(last.rsi)
-                            else np.nan
-                        ),
-                    "adx":
-                        (
-                            float(last.adx)
-                            if pd.notna(last.adx)
-                            else np.nan
-                        ),
-                    "volume_ratio":
-                        volume_ratio,
-                    "candles": len(d)
-                }
+            volume_ratio = (
+                float(last.volume) / float(last.volma)
+                if pd.notna(last.volma) and float(last.volma) > 0
+                else np.nan
             )
+
+            hist = historical_pattern_study(d, mode)
+
+            output.append({
+                "symbol": symbol,
+                "pair": pair,
+                "price": cur,
+                "extreme": extreme,
+                "distance": distance,
+                "change": pc,
+                "change7": change7,
+                "status": status,
+                "rsi": float(last.rsi) if pd.notna(last.rsi) else np.nan,
+                "adx": float(last.adx) if pd.notna(last.adx) else np.nan,
+                "volume_ratio": volume_ratio,
+                "structure": structure(ind),
+                "candles": len(d),
+                "d1": d,
+                "hist": hist,
+                "bias": "🟡 WAIT",
+                "setup": "Waiting for lower-timeframe confirmation",
+                "h1_structure": "Mixed",
+                "m15_structure": "Mixed"
+            })
 
         except Exception as e:
+            failures.append(f"{symbol}: {type(e).__name__}: {e}")
 
-            failures.append(
-                f"{symbol}: "
-                f"{type(e).__name__}: {e}"
-            )
-
-            continue
-
-    # =========================================================
-    # ATH RANKING
-    # =========================================================
-
+    # Rank current candidates before the lower-timeframe second pass.
     if mode == "ATH":
-
-        def ath_rank(z):
-
-            status_priority = {
-                "🔥 ATH BREAKOUT": 0,
-                "🟢 AT ATH": 1,
-                "🟡 NEAR ATH": 2
-            }
-
-            return (
-                status_priority.get(
-                    z["status"],
-                    9
-                ),
-                abs(z["distance"]),
-                -z["change"],
-                -z["change7"]
-            )
-
-        output.sort(key=ath_rank)
-
-    # =========================================================
-    # ATL RANKING
-    # =========================================================
-
+        output.sort(key=lambda z: (
+            0 if z["status"] == "🔥 ATH BREAKOUT" else 1,
+            abs(z["distance"]),
+            -z["change"],
+            -z["change7"]
+        ))
     else:
+        output.sort(key=lambda z: (
+            0 if z["status"] == "🔴 ATL BREAKDOWN" else
+            1 if z["status"] == "🟠 AT ATL" else
+            2 if z["status"] == "🟡 NEAR ATL" else 3,
+            abs(z["distance"]),
+            z["change"],
+            z["change7"]
+        ))
 
-        def atl_rank(z):
-
-            status_priority = {
-                "🔴 ATL BREAKDOWN": 0,
-                "🟠 AT ATL": 1,
-                "🟡 NEAR ATL": 2,
-                "🔻 STRONG DOWN": 3
-            }
-
-            return (
-                status_priority.get(
-                    z["status"],
-                    9
-                ),
-                abs(z["distance"]),
-                z["change"],
-                z["change7"]
+    # Second pass only for the most relevant candidates. This avoids hundreds
+    # of additional 1H/15m API calls while still making the decision engine
+    # multi-timeframe.
+    for z in output[:20]:
+        try:
+            h1 = candles(
+                z["pair"], "60", now - 30 * 86400, now
+            )
+            m15 = candles(
+                z["pair"], "15", now - 10 * 86400, now
             )
 
-        output.sort(key=atl_rank)
+            if len(h1) >= 40:
+                h1i = indicators(h1)
+                z["h1_structure"] = structure(h1i)
+            if len(m15) >= 40:
+                m15i = indicators(m15)
+                z["m15_structure"] = structure(m15i)
+
+            z["bias"], z["setup"] = extreme_trade_decision(
+                mode=mode,
+                distance=z["distance"],
+                change24=z["change"],
+                change7=z["change7"],
+                rsi=z["rsi"],
+                adx=z["adx"],
+                volume_ratio=z["volume_ratio"],
+                daily_structure=z["structure"],
+                h1_structure=z["h1_structure"],
+                m15_structure=z["m15_structure"],
+                current=z["price"],
+                extreme=z["extreme"]
+            )
+        except Exception as e:
+            failures.append(
+                f"{z['symbol']} lower TF: {type(e).__name__}: {e}"
+            )
+
+    # Final ranking favors actionable setups, but WAIT remains valid and is
+    # never converted into a forced trade.
+    def bias_priority(z):
+        b = z.get("bias", "🟡 WAIT")
+        if mode == "ATH":
+            return {"🟢 LONG": 0, "🔴 SHORT WATCH": 1, "🟡 WAIT": 2}.get(b, 3)
+        return {"🔴 SHORT": 0, "🟢 LONG": 1, "🔴 SHORT WATCH": 2, "🟡 WAIT": 3}.get(b, 4)
+
+    output.sort(key=lambda z: (
+        bias_priority(z),
+        abs(z["distance"]),
+        -z["change"] if mode == "ATH" else z["change"]
+    ))
 
     return output[:10], failures
 
@@ -1953,40 +1971,27 @@ def scan_extremes(
 
 st.divider()
 
-st.header(
-    "🔥 / 🩸 Historical Extreme Scanner"
-)
+st.header("🔥 / 🩸 Historical Extreme Scanner")
 
 st.caption(
     "Previous ATH/ATL excludes the latest daily candle. "
     "The scanner checks up to 150 Futures contracts. "
     "ATH finds breakouts and coins within 5% of ATH. "
-    "ATL finds breakdowns, coins within 5% of ATL, "
-    "and strong downside movers. "
+    "ATL finds breakdowns, coins within 5% of ATL, and strong downside movers. "
+    "The scanner also evaluates LONG / SHORT / WAIT using multi-timeframe momentum. "
     "History is based on up to 400 days of daily data."
 )
 
 a, b = st.columns(2)
 
-do_ath = a.button(
-    "🔥 Scan Top 10 Near / Above ATH"
-)
-
-do_atl = b.button(
-    "🩸 Scan Top 10 Near / Below ATL"
-)
+do_ath = a.button("🔥 Scan Top 10 Near / Above ATH")
+do_atl = b.button("🩸 Scan Top 10 Near / Below ATL")
 
 if do_ath or do_atl:
 
-    mode = (
-        "ATH"
-        if do_ath
-        else
-        "ATL"
-    )
+    mode = "ATH" if do_ath else "ATL"
 
     try:
-
         results, failures = scan_extremes(
             active_instruments(margin),
             futures_prices(),
@@ -1995,96 +2000,48 @@ if do_ath or do_atl:
         )
 
         if not results:
-
             st.warning(
-                f"No {mode} candidates found "
-                "in the scanned universe."
+                f"No {mode} candidates found in the scanned universe."
             )
 
             if failures:
-
-                with st.expander(
-                    "🔧 Extreme scanner diagnostics",
-                    expanded=True
-                ):
-
-                    st.code(
-                        "\n".join(
-                            failures[:100]
-                        )
-                    )
+                with st.expander("🔧 Extreme scanner diagnostics", expanded=True):
+                    st.code("\n".join(failures[:100]))
 
         else:
-
             if mode == "ATH":
-
-                st.subheader(
-                    "🔥 Top 10 Near / Above ATH"
-                )
-
+                st.subheader("🔥 Top 10 Near / Above ATH")
             else:
-
-                st.subheader(
-                    "🩸 Top 10 Near / Below ATL"
-                )
+                st.subheader("🩸 Top 10 Near / Below ATL")
 
             st.caption(
-                "Previous ATH/ATL excludes the latest daily "
-                "candle so the live price can actually break "
-                "the previous extreme. Values represent the "
-                "available CoinDCX Futures history, not "
-                "guaranteed lifetime exchange-wide extremes."
+                "Trade Bias is a setup classification, not a guaranteed prediction. "
+                "ATH breakout ≠ automatic LONG; ATL ≠ automatic LONG or SHORT. "
+                "The model can deliberately return WAIT when price is too extended."
             )
 
             table = []
 
-            for i, z in enumerate(
-                results,
-                1
-            ):
-
-                table.append(
-                    {
-                        "#": i,
-                        "Coin": z["symbol"],
-                        "Current":
-                            fmt(z["price"]),
-                        (
-                            "ATH"
-                            if mode == "ATH"
-                            else "ATL"
-                        ):
-                            fmt(z["extreme"]),
-                        "Distance":
-                            f'{z["distance"]:+.2f}%',
-                        "24h":
-                            f'{z["change"]:+.2f}%',
-                        "7d":
-                            f'{z["change7"]:+.2f}%',
-                        "RSI":
-                            (
-                                f'{z["rsi"]:.1f}'
-                                if pd.notna(z["rsi"])
-                                else "—"
-                            ),
-                        "ADX":
-                            (
-                                f'{z["adx"]:.1f}'
-                                if pd.notna(z["adx"])
-                                else "—"
-                            ),
-                        "Vol/20D":
-                            (
-                                f'{z["volume_ratio"]:.1f}x'
-                                if pd.notna(
-                                    z["volume_ratio"]
-                                )
-                                else "—"
-                            ),
-                        "Status":
-                            z["status"]
-                    }
-                )
+            for i, z in enumerate(results, 1):
+                table.append({
+                    "#": i,
+                    "Coin": z["symbol"],
+                    "Current": fmt(z["price"]),
+                    "ATH" if mode == "ATH" else "ATL": fmt(z["extreme"]),
+                    "Distance": f'{z["distance"]:+.2f}%',
+                    "24h": f'{z["change"]:+.2f}%',
+                    "7d": f'{z["change7"]:+.2f}%',
+                    "RSI": f'{z["rsi"]:.1f}' if pd.notna(z["rsi"]) else "—",
+                    "ADX": f'{z["adx"]:.1f}' if pd.notna(z["adx"]) else "—",
+                    "Vol/20D": (
+                        f'{z["volume_ratio"]:.1f}x'
+                        if pd.notna(z["volume_ratio"])
+                        else "—"
+                    ),
+                    "Extreme": z["status"],
+                    "Bias": z["bias"],
+                    "Setup": z["setup"]
+                })
 
             st.dataframe(
                 pd.DataFrame(table),
@@ -2092,31 +2049,91 @@ if do_ath or do_atl:
                 hide_index=True
             )
 
-            for i, z in enumerate(
-                results,
-                1
-            ):
+            for i, z in enumerate(results, 1):
+                direction = "above" if z["distance"] > 0 else "below"
 
-                direction = (
-                    "above"
-                    if z["distance"] > 0
-                    else
-                    "below"
-                )
+                with st.container(border=True):
+                    st.markdown(
+                        f"### {i}. {z['symbol']} — {z['bias']}"
+                    )
 
-                st.write(
-                    f"**{i}. {z['symbol']} — "
-                    f"{z['status']}** | "
-                    f"Price {fmt(z['price'])} | "
-                    f"Previous {mode} "
-                    f"{fmt(z['extreme'])} | "
-                    f"{abs(z['distance']):.2f}% "
-                    f"{direction} | "
-                    f"24h {z['change']:+.2f}% | "
-                    f"7d {z['change7']:+.2f}% | "
-                    f"RSI {z['rsi']:.1f} | "
-                    f"ADX {z['adx']:.1f}"
-                )
+                    st.write(
+                        f"**Extreme:** {z['status']} | "
+                        f"**Setup:** {z['setup']}"
+                    )
+
+                    a, b, c, d = st.columns(4)
+                    a.metric("Current", fmt(z["price"]))
+                    b.metric(
+                        "Previous " + mode,
+                        fmt(z["extreme"])
+                    )
+                    c.metric(
+                        "Distance",
+                        f'{z["distance"]:+.2f}%'
+                    )
+                    d.metric(
+                        "24h",
+                        f'{z["change"]:+.2f}%'
+                    )
+
+                    a, b, c, d = st.columns(4)
+                    a.metric("7d", f'{z["change7"]:+.2f}%')
+                    b.metric("RSI", f'{z["rsi"]:.1f}')
+                    c.metric("ADX", f'{z["adx"]:.1f}')
+                    d.metric(
+                        "Volume / 20D",
+                        (
+                            f'{z["volume_ratio"]:.1f}x'
+                            if pd.notna(z["volume_ratio"])
+                            else "—"
+                        )
+                    )
+
+                    st.write(
+                        f"**1D:** {z['structure']} | "
+                        f"**1H:** {z['h1_structure']} | "
+                        f"**15m:** {z['m15_structure']}"
+                    )
+
+                    hist = z.get("hist", {})
+                    if hist.get("events", 0) > 0:
+                        st.write(
+                            f"**Historical study:** {hist['events']} prior {mode} "
+                            f"event(s) | 7D positive outcome rate "
+                            f"{hist['win_rate']:.1f}% | average 7D close change "
+                            f"{hist['avg_forward']:+.2f}% | best excursion "
+                            f"{hist['best_forward']:+.2f}% | worst excursion "
+                            f"{hist['worst_forward']:+.2f}%"
+                        )
+                    else:
+                        st.write(
+                            "**Historical study:** Not enough qualifying historical events "
+                            "in the available daily history."
+                        )
+
+                    with st.expander("📈 Historical / current chart"):
+                        chart = z["d1"].copy().set_index("time")
+                        st.line_chart(
+                            chart[
+                                [
+                                    "close",
+                                    "high",
+                                    "low"
+                                ]
+                            ].tail(250)
+                        )
+
+                    st.caption(
+                        f"Current price is {abs(z['distance']):.2f}% {direction} "
+                        f"the previous {mode}. This is available CoinDCX Futures "
+                        "history, not guaranteed lifetime exchange-wide history."
+                    )
+
+            if failures:
+                with st.expander("🔧 Scanner diagnostics"):
+                    st.code("\n".join(failures[:100]))
+
 
     except Exception as e:
 
