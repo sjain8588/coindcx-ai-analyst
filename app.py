@@ -1657,40 +1657,367 @@ def confirmation_text(current):
     return checks
 
 # =============================================================================
-# UI SETTINGS
+
 # =============================================================================
+# V5: CONTINUATION vs REVERSAL ENGINE
+# =============================================================================
+# v5 keeps the historical-learning engine, but adds a critical distinction:
+# an extreme pump can remain bullish for a while before it actually reverses.
+# We therefore combine historical path behavior with CURRENT short-term
+# confirmation instead of treating overbought/extended as an immediate short.
+
+
+def v5_event_outcome(x, i, horizon, direction="UP"):
+    if i + 1 >= len(x):
+        return None
+    future = x.iloc[i+1:min(len(x), i+1+horizon)]
+    if future.empty:
+        return None
+    entry = safe(x.iloc[i].close)
+    if not np.isfinite(entry) or entry <= 0:
+        return None
+
+    closes = future.close.astype(float)
+    highs = future.high.astype(float)
+    lows = future.low.astype(float)
+    end_ret = (safe(closes.iloc[-1]) / entry - 1) * 100
+    best = (safe(highs.max()) / entry - 1) * 100
+    worst = (safe(lows.min()) / entry - 1) * 100
+
+    if direction == "DOWN":
+        if worst <= -10 and best < 12:
+            label = "CONTINUED"
+        elif best >= 20:
+            label = "REVERSED / BOUNCED"
+        else:
+            label = "SIDEWAYS / PULLBACK"
+        favorable = -worst
+        adverse = best
+        favorable_bar = int(np.argmin(lows.values)) + 1
+        adverse_bar = int(np.argmax(highs.values)) + 1
+    else:
+        if best >= 10 and worst > -15:
+            label = "CONTINUED"
+        elif worst <= -20:
+            label = "DUMPED"
+        else:
+            label = "SIDEWAYS / PULLBACK"
+        favorable = best
+        adverse = abs(worst)
+        favorable_bar = int(np.argmax(highs.values)) + 1
+        adverse_bar = int(np.argmin(lows.values)) + 1
+
+    # Track the sequence, not just the final candle.
+    first_end = []
+    for n in (1, min(2, horizon), min(3, horizon)):
+        if n <= len(closes):
+            first_end.append((n, (safe(closes.iloc[n-1]) / entry - 1) * 100))
+
+    return {
+        "end": end_ret,
+        "best": best,
+        "worst": worst,
+        "label": label,
+        "path": {
+            "favorable": favorable,
+            "adverse": adverse,
+            "favorable_bar": favorable_bar,
+            "adverse_bar": adverse_bar,
+            "end": end_ret,
+            "first_end": first_end,
+        },
+    }
+
+
+def v5_multi_horizon_outcomes(x, i, direction="UP"):
+    result = {}
+    for name, bars in [("4H",1),("8H",2),("12H",3),("24H",6)]:
+        result[name] = v5_event_outcome(x, i, bars, direction)
+
+    result["24H_path"] = result["24H"]
+    p = result["24H"]["path"] if result.get("24H") else None
+    if not p:
+        result["path_type"] = "UNKNOWN"
+        return result
+
+    if direction == "UP":
+        # A second leg means the coin first moved materially in the original
+        # direction. A delayed reversal means that the later move erased a
+        # meaningful part of that gain. This is the behavior we want to learn.
+        early_gain = max([v for _, v in p.get("first_end", [])] + [0])
+        delayed_reversal = (
+            p["favorable"] >= 15 and
+            p["favorable_bar"] <= 5 and
+            p["end"] <= p["favorable"] - 12
+        )
+        second_leg = p["favorable"] >= 10
+        early_rejection = p["adverse"] >= 12 and early_gain < 8
+        if delayed_reversal:
+            result["path_type"] = "SECOND LEG THEN REVERSAL"
+        elif second_leg and p["end"] >= 5:
+            result["path_type"] = "CLEAN CONTINUATION"
+        elif early_rejection:
+            result["path_type"] = "EARLY REJECTION"
+        elif second_leg:
+            result["path_type"] = "SECOND LEG / MIXED"
+        else:
+            result["path_type"] = "CHOP / MIXED"
+    else:
+        early_drop = min([v for _, v in p.get("first_end", [])] + [0])
+        delayed_bounce = (
+            p["favorable"] >= 15 and
+            p["favorable_bar"] <= 5 and
+            p["end"] >= -p["favorable"] + 12
+        )
+        second_leg = p["favorable"] >= 10
+        early_rejection = p["adverse"] >= 12 and early_drop > -8
+        if delayed_bounce:
+            result["path_type"] = "SECOND LEG THEN BOUNCE"
+        elif second_leg and p["end"] <= -5:
+            result["path_type"] = "CLEAN CONTINUATION"
+        elif early_rejection:
+            result["path_type"] = "EARLY REJECTION"
+        elif second_leg:
+            result["path_type"] = "SECOND LEG / MIXED"
+        else:
+            result["path_type"] = "CHOP / MIXED"
+    return result
+
+# Historical event creation calls the global function at runtime, so these
+# replacements automatically make the learning pool use the v5 path logic.
+event_outcome = v5_event_outcome
+multi_horizon_outcomes = v5_multi_horizon_outcomes
+
+
+def v5_outcome_summary(matches):
+    if not matches:
+        return None
+    usable = [
+        (idx, sim, e) for idx, (sim,e) in enumerate(matches)
+        if e.get("outcome") and e["outcome"].get("24H_path")
+    ]
+    if not usable:
+        return None
+
+    weights = np.array([max(1.0, sim/10.0) for _,sim,_ in usable])
+    labels=[e["outcome"]["24H_path"]["label"] for _,_,e in usable]
+    path_types=[e["outcome"].get("path_type","UNKNOWN") for _,_,e in usable]
+    total=len(usable)
+
+    def pct(label):
+        return labels.count(label)/total*100
+    def pathpct(label):
+        return path_types.count(label)/total*100
+    def hstats(h):
+        ends=[]; bests=[]; worsts=[]; ws=[]
+        for j,(idx,sim,e) in enumerate(usable):
+            o=e["outcome"].get(h)
+            if not o: continue
+            ends.append(o["end"]); bests.append(o["best"]); worsts.append(o["worst"]); ws.append(weights[j])
+        return {"end":_weighted_mean(ends,ws),"best":_weighted_mean(bests,ws),"worst":_weighted_mean(worsts,ws)}
+
+    reversal_times=[]; second_leg_gain=[]
+    for _,_,e in usable:
+        p=e["outcome"]["24H_path"].get("path",{})
+        if e["outcome"].get("path_type")=="SECOND LEG THEN REVERSAL":
+            if np.isfinite(safe(p.get("adverse_bar"))): reversal_times.append(safe(p.get("adverse_bar"))*4)
+            if np.isfinite(safe(p.get("favorable"))): second_leg_gain.append(safe(p.get("favorable")))
+
+    h4=hstats("4H"); h8=hstats("8H"); h12=hstats("12H"); h24=hstats("24H")
+    return {
+        "total":total,
+        "continue_pct":pct("CONTINUED"),
+        "dump_pct":pct("DUMPED"),
+        "reverse_pct":pct("REVERSED / BOUNCED"),
+        "side_pct":pct("SIDEWAYS / PULLBACK"),
+        "second_leg_pct":pathpct("SECOND LEG THEN REVERSAL"),
+        "clean_continuation_pct":pathpct("CLEAN CONTINUATION"),
+        "early_rejection_pct":pathpct("EARLY REJECTION"),
+        "second_leg_mixed_pct":pathpct("SECOND LEG / MIXED"),
+        "chop_pct":pathpct("CHOP / MIXED"),
+        "reversal_timing_hours":float(np.median(reversal_times)) if reversal_times else np.nan,
+        "second_leg_gain":float(np.median(second_leg_gain)) if second_leg_gain else np.nan,
+        "4H":h4,"8H":h8,"12H":h12,"24H":h24,
+        "avg_end":h24["end"],"avg_best":h24["best"],"avg_worst":h24["worst"],
+        "median_similarity":float(np.median([sim for _,sim,_ in usable])),
+        "max_similarity":float(max(sim for _,sim,_ in usable)),
+        "min_similarity":float(min(sim for _,sim,_ in usable)),
+    }
+
+outcome_summary = v5_outcome_summary
+
+
+def short_term_state(current):
+    d=current.get("tf_data",{}).get("15m")
+    if d is None or len(d)<30:
+        return {"state":"NO DATA","score":0,"reversal_confirmed":False,"reasons":[]}
+    x=indicators(completed(d))
+    if len(x)<25:
+        return {"state":"NO DATA","score":0,"reversal_confirmed":False,"reasons":[]}
+    r=x.iloc[-1]
+    close=safe(r.close); ema20=safe(r.ema20); ema50=safe(r.ema50); ema100=safe(r.ema100)
+    adx=safe(r.adx); macd=safe(r.macd); sig=safe(r.macd_signal); vol=safe(r.vol_ratio); rsi=safe(r.rsi)
+    slope20=((safe(x.iloc[-1].ema20)/safe(x.iloc[-5].ema20))-1)*100 if safe(x.iloc[-5].ema20)>0 else np.nan
+    recent=x.tail(8); prior=x.iloc[-16:-8]
+    hh=recent.high.max()>prior.high.max() if not prior.empty else False
+    hl=recent.low.min()>prior.low.min() if not prior.empty else False
+    recent_high=safe(x.tail(24).high.max())
+    pullback=(close/recent_high-1)*100 if recent_high>0 else np.nan
+
+    score=0; reasons=[]
+    if close>ema20: score+=20; reasons.append("15m price is above EMA20")
+    if ema20>ema50: score+=15; reasons.append("15m EMA20 is above EMA50")
+    if ema50>ema100: score+=10; reasons.append("15m EMA50 is above EMA100")
+    if np.isfinite(adx) and adx>=25: score+=15; reasons.append(f"ADX is strong ({adx:.0f})")
+    if np.isfinite(macd) and np.isfinite(sig) and macd>sig: score+=10; reasons.append("MACD is bullish")
+    if np.isfinite(slope20) and slope20>0.15: score+=10; reasons.append("EMA20 is still rising")
+    if hh and hl: score+=15; reasons.append("recent candles are making higher highs/higher lows")
+    if np.isfinite(vol) and vol>=1: score+=5; reasons.append("volume is supporting the move")
+
+    # Do not call an overbought coin a reversal until the short-term structure
+    # actually breaks. This is deliberately conservative.
+    below20=close<ema20
+    below50=close<ema50
+    slope_down=np.isfinite(slope20) and slope20<-0.10
+    lower_structure=(not hh) and (recent.low.min()<prior.low.min() if not prior.empty else False)
+    four_h=current.get("4h")
+    four_h_break=(safe(four_h.close)<safe(four_h.ema20)) if four_h is not None else False
+    reversal_confirmed = (below20 and slope_down and lower_structure) or (below50 and four_h_break)
+
+    if reversal_confirmed:
+        state="REVERSAL CONFIRMED"
+    elif score>=70:
+        state="STRONG CONTINUATION"
+    elif score>=50:
+        state="BULLISH / CONTINUATION"
+    else:
+        state="WEAK / WAIT"
+
+    return {
+        "state":state,"score":score,"reversal_confirmed":reversal_confirmed,
+        "close":close,"ema20":ema20,"ema50":ema50,"ema100":ema100,
+        "adx":adx,"macd":macd,"signal":sig,"volume":vol,"rsi":rsi,
+        "ema20_slope":slope20,"pullback":pullback,"higher_highs":hh,"higher_lows":hl,
+        "reasons":reasons,
+        "break_ema20":below20,"break_ema50":below50,"lower_structure":lower_structure,
+    }
+
+
+def v5_decision(summary,current):
+    st15=short_term_state(current)
+    event=current.get("event","")
+    down=event in {"ATL BREAKDOWN","FAST DUMP"}
+    extreme=event_is_extreme(current.get("target"))
+    enough=bool(summary and summary.get("total",0)>=8)
+    quality=(summary.get("median_similarity",0)>=48) if summary else False
+
+    if down:
+        if st15["reversal_confirmed"]:
+            return "🔴 DOWN MOVE CONFIRMED", "The short-term structure is still bearish and has not shown a strong reversal."
+        return "🟡 DOWN TREND / WAIT", "The coin is weak, but the short-term structure is not strong enough to claim the next move with confidence."
+
+    # Most important v5 rule: extreme + bullish structure + no break = continuation
+    # mode, even if RSI/extension is very high.
+    if extreme and not st15["reversal_confirmed"] and st15["score"]>=65:
+        if summary and summary.get("second_leg_pct",0)>=30:
+            return "🚀 CONTINUATION MODE — DELAYED REVERSAL RISK", (
+                "The coin is extremely extended, but its short-term trend is still intact. "
+                f"Historically, {summary['second_leg_pct']:.0f}% of comparable cases made another leg before a major reversal."
+            )
+        return "🚀 CONTINUATION MODE — REVERSAL NOT CONFIRMED", (
+            "The coin is very extended, but the short-term bullish structure is still intact. "
+            "High RSI alone is not treated as a reversal signal."
+        )
+
+    if st15["reversal_confirmed"]:
+        return "🔴 REVERSAL CONFIRMED", (
+            "The short-term structure has actually broken: price/EMA structure and price action now support a reversal."
+        )
+
+    if enough and quality and summary.get("continue_pct",0)>=58 and summary.get("continue_pct",0)-summary.get("dump_pct",0)>=15:
+        return "🟢 HISTORICAL CONTINUATION BIAS", "Similar historical setups favored continuation and the current short-term structure has not confirmed a reversal."
+
+    return "🟡 BULLISH BUT WAIT FOR CONFIRMATION", "The trend may continue, but the evidence is not strong enough to call the next move."
+
+
+def v5_simple_language(summary,current,decision_title):
+    s15=short_term_state(current)
+    target=current.get("target") or {}
+    rsi=safe(target.get("rsi")); ema=safe(target.get("ema20_dist"))
+    lines=[]
+    if decision_title.startswith("🚀"):
+        lines.append("The important point: this coin is still pumping because the trend has not broken.")
+        lines.append("Being overbought or far above EMA20 does NOT automatically mean the next candle must dump.")
+        if summary and summary.get("second_leg_pct",0)>=30:
+            lines.append(f"Historical matches show a delayed pattern in about {summary['second_leg_pct']:.0f}% of cases: another leg up first, reversal later.")
+        lines.append("Watch for a real 15m structure break before treating this as a reversal.")
+    elif decision_title.startswith("🔴"):
+        lines.append("This is different from simply being overbought: the short-term structure has actually started breaking.")
+        lines.append("A reversal signal becomes more meaningful when price loses EMA20/EMA50 and starts making lower highs/lows.")
+    else:
+        lines.append("The trend is not enough by itself to predict the next candle. Wait for confirmation rather than guessing.")
+    if np.isfinite(rsi): lines.append(f"Current RSI: {rsi:.1f}.")
+    if np.isfinite(ema): lines.append(f"Price vs EMA20: {ema:+.1f}%.")
+    lines.append(f"15m state: {s15['state']} ({s15['score']}/100).")
+    return lines
+
+
+def confirmation_text_v5(current):
+    s=short_term_state(current); out=[]
+    out.extend(s.get("reasons",[])[:6])
+    if s["reversal_confirmed"]:
+        out.append("⚠️ Reversal confirmation is active on the short-term structure.")
+    else:
+        out.append("🟢 No confirmed short-term reversal yet.")
+        out.append("⚠️ If price breaks 15m EMA20/EMA50 and starts making lower highs/lows, reassess the pump.")
+    return out
+
+confirmation_text=confirmation_text_v5
+
+# =============================================================================
+# V5 UI
+# =============================================================================
+st.title("🧠 CoinDCX Historical Pattern Learning Scanner V5")
+st.caption("Learns from historical CoinDCX Futures behavior and separates active continuation from a confirmed reversal. Analysis only — no orders.")
+
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
-meme_only=st.checkbox("Use meme-focused learning universe",value=False,help="Turn this on if you only want meme-style contracts in the comparison universe.")
-peer_limit=st.slider("Historical comparison universe",20,150,80,10,help="More coins = more historical examples but more CoinDCX API work.")
-st.caption(
-    "Learning model: the scanner searches for similar historical market states, "
-    "then measures what happened 4H, 12H and 24H later. It does not assume that "
-    "a pump must reverse or that a breakout must continue."
-)
+meme_only=st.checkbox("Use meme-focused learning universe",value=False)
+peer_limit=st.slider("Historical comparison universe",20,150,100,10,help="More contracts provide more historical examples but require more CoinDCX API calls.")
+st.info("V5 rule: an extreme pump is NOT treated as an immediate short. The scanner checks whether the short-term trend is still intact and whether a real reversal has been confirmed.")
 
 st.divider()
 st.header("🔎 Analyze a Coin")
-coin=st.text_input("Coin / Futures pair",placeholder="MARSCOIN, DOGE, PEPE, B-DOGE_USDT")
+coin=st.text_input("Coin / Futures pair",placeholder="USELESS, DOGE, PEPE, B-DOGE_USDT")
 
 if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
     try:
-        with st.spinner("Fetching CoinDCX history and studying the pattern..."):
-            prices=futures_prices(); req=normalize(coin)
-            found=[]
+        with st.spinner("Fetching CoinDCX history and studying continuation vs reversal..."):
+            prices=futures_prices(); req=normalize(coin); found=[]
             for q in [margin]+[x for x in ("USDT","INR") if x!=margin]:
                 for pair in active_instruments(q):
                     p=prices.get(pair)
                     if not p: continue
                     symbol=str(p.get("mkt",pair)).upper()
                     if coin_matches(pair,symbol,req,q): found.append((pair,p,symbol,q))
-            if not found: st.error(f"No active CoinDCX Futures contract found for '{coin}'."); st.stop()
+            if not found:
+                st.error(f"No active CoinDCX Futures contract found for '{coin}'."); st.stop()
             found.sort(key=lambda z:(0 if z[3]==margin else 1,len(z[0])))
             pair,p,symbol,_=found[0]
             current=analyze_current_coin(pair,p)
+            mode="ATH" if current["event"]=="ATH BREAKOUT" else "ATL" if current["event"]=="ATL BREAKDOWN" else "PUMP"
+            universe=universe_rows(margin,meme_only,peer_limit)
+            pairs_sig=tuple((z[0],z[2]) for z in universe if z[0]!=pair)
+            pool,failures=build_learning_pool(pairs_sig,margin,peer_limit,mode)
+            same_coin_pool=build_same_coin_pool(pair,mode)
+            extreme_pool=build_extreme_pool(pool)
+            combined_pool=merge_learning_pools(pool,same_coin_pool,extreme_pool)
+            raw_matches=similar_events(current["target"],combined_pool,max_matches=100)
+            matches=diversified_matches(raw_matches,max_matches=60,per_coin=4)
+            summary=outcome_summary(matches)
+            decision_title,decision_text=v5_decision(summary,current)
 
-            st.subheader(f"{symbol} — Simple Prediction")
-            event=current["event"]
-            st.write(f"**What the tool sees:** {event}")
+            st.subheader(f"{symbol} — V5 Simple Prediction")
+            st.write(f"**Event:** {current['event']}")
             a,b,c,d=st.columns(4)
             a.metric("Current",fmt(current["current"]))
             b.metric("24h",f"{safe(p.get('pc',0),0):+.2f}%")
@@ -1698,241 +2025,96 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
             c.metric("4H RSI",f"{safe(b4.rsi):.1f}" if pd.notna(b4.rsi) else "—")
             d.metric("4H Volume",f"{safe(b4.vol_ratio):.1f}x" if pd.notna(b4.vol_ratio) else "—")
 
-            # Build historical pool according to current event type.
-            mode="ATH" if event=="ATH BREAKOUT" else "ATL" if event=="ATL BREAKDOWN" else "PUMP"
-            universe=universe_rows(margin,meme_only,peer_limit)
+            if decision_title.startswith("🚀") or decision_title.startswith("🟢"):
+                st.success(decision_title)
+            elif decision_title.startswith("🔴"):
+                st.error(decision_title)
+            else:
+                st.warning(decision_title)
+            st.markdown(f"### {decision_title}")
+            st.write(decision_text)
 
-            # Keep both pair and symbol so peer-group tagging can be used.
-            pairs_sig=tuple(
-                (z[0], z[2])
-                for z in universe
-                if z[0] != pair
-            )
+            s15=short_term_state(current)
+            st.markdown("### 📱 What is happening RIGHT NOW? (15-minute)")
+            q1,q2,q3,q4,q5=st.columns(5)
+            q1.metric("15m state",s15["state"])
+            q2.metric("Trend score",f"{s15['score']}/100")
+            q3.metric("ADX",f"{s15['adx']:.1f}" if np.isfinite(s15['adx']) else "—")
+            q4.metric("EMA20 slope",f"{s15['ema20_slope']:+.2f}%" if np.isfinite(s15['ema20_slope']) else "—")
+            q5.metric("Pullback from 24-bar high",f"{s15['pullback']:+.1f}%" if np.isfinite(s15['pullback']) else "—")
 
-            pool,failures=build_learning_pool(
-                pairs_sig,margin,peer_limit,mode
-            )
-
-            same_coin_pool=build_same_coin_pool(pair,mode)
-            extreme_pool=build_extreme_pool(pool)
-
-            combined_pool=merge_learning_pools(
-                pool,
-                same_coin_pool,
-                extreme_pool
-            )
-
-            raw_matches=similar_events(
-                current["target"],
-                combined_pool,
-                max_matches=80
-            )
-            matches=diversified_matches(
-                raw_matches,
-                max_matches=50,
-                per_coin=4
-            )
-
-            summary=outcome_summary(matches)
-            title,text=human_result(summary,current)
-            if title.startswith("🟢"): st.success(title)
-            elif title.startswith("🔴"): st.error(title)
-            else: st.warning(title)
-            st.markdown(f"### {title}")
-            st.write(text)
+            st.markdown("### 🧭 Trend vs. reversal")
+            t1,t2,t3,t4=st.columns(4)
+            t1.metric("Current trend", "BULLISH" if current["bull"]>=current["bear"] else "MIXED")
+            t2.metric("Momentum", "EXTREME" if event_is_extreme(current["target"]) else "NORMAL")
+            t3.metric("Reversal confirmed", "YES" if s15["reversal_confirmed"] else "NO")
+            t4.metric("15m structure",current.get("structure15","Mixed"))
 
             if summary:
-                st.write(f"**Similar historical cases:** {summary['total']}")
-                st.write(
-                    f"**Match quality:** median similarity {summary['median_similarity']:.0f}% "
-                    f"| strongest match {summary['max_similarity']:.0f}% "
-                    f"| evidence grade: **{evidence_grade(summary)}**"
-                )
+                st.markdown("### 📚 What happened to similar coins AFTER the setup?")
+                h1,h2,h3,h4=st.columns(4)
+                for col,label,key in [(h1,"4H later","4H"),(h2,"8H later","8H"),(h3,"12H later","12H"),(h4,"24H later","24H")]:
+                    val=summary[key]["end"]
+                    col.metric(label,f"{val:+.1f}%" if np.isfinite(val) else "—")
 
-                current_bucket=behavior_bucket(current["target"])
-                st.write(
-                    f"**Current behavior regime:** `{current_bucket.replace('|', ' • ')}`"
-                )
+                a,b,c,d=st.columns(4)
+                a.metric("Continued",f"{summary['continue_pct']:.0f}%")
+                b.metric("Dumped",f"{summary['dump_pct']:.0f}%")
+                c.metric("Sideways",f"{summary['side_pct']:.0f}%")
+                d.metric("Strong bounce",f"{summary['reverse_pct']:.0f}%")
 
-                st.markdown("#### 📈 What happened after similar setups?")
-                h1, h2, h3, h4 = st.columns(4)
-                h1.metric(
-                    "After 4H",
-                    f"{summary['4H']['end']:+.1f}%"
-                    if np.isfinite(summary['4H']['end']) else "—"
-                )
-                h2.metric(
-                    "After 8H",
-                    f"{summary['8H']['end']:+.1f}%"
-                    if np.isfinite(summary['8H']['end']) else "—"
-                )
-                h3.metric(
-                    "After 12H",
-                    f"{summary['12H']['end']:+.1f}%"
-                    if np.isfinite(summary['12H']['end']) else "—"
-                )
-                h4.metric(
-                    "After 24H",
-                    f"{summary['24H']['end']:+.1f}%"
-                    if np.isfinite(summary['24H']['end']) else "—"
-                )
+                st.markdown("### 🛣️ The sequence the engine learned")
+                p1,p2,p3,p4=st.columns(4)
+                p1.metric("Another leg → reversal",f"{summary['second_leg_pct']:.0f}%")
+                p2.metric("Clean continuation",f"{summary['clean_continuation_pct']:.0f}%")
+                p3.metric("Early rejection",f"{summary['early_rejection_pct']:.0f}%")
+                p4.metric("Typical reversal time",f"{summary['reversal_timing_hours']:.0f}H" if np.isfinite(summary['reversal_timing_hours']) else "—")
 
-                a, b, c, d = st.columns(4)
-                a.metric("Continued", f"{summary['continue_pct']:.0f}%")
-                b.metric("Sideways / Pullback", f"{summary['side_pct']:.0f}%")
-                c.metric("Dumped", f"{summary['dump_pct']:.0f}%")
-                d.metric("Strong bounce/reversal", f"{summary['reverse_pct']:.0f}%")
+                st.write(f"**Sample:** {summary['total']} historical cases | median similarity {summary['median_similarity']:.0f}% | strongest {summary['max_similarity']:.0f}% | evidence: **{evidence_grade(summary)}**")
+                if np.isfinite(summary.get("second_leg_gain",np.nan)):
+                    st.write(f"**When the second-leg pattern occurred, the typical maximum move before the reversal was about +{summary['second_leg_gain']:.0f}%.**")
 
-                st.markdown("#### 🛣️ Historical price path")
-                p1, p2, p3, p4 = st.columns(4)
-                p1.metric(
-                    "Second leg → reversal",
-                    f"{summary['second_leg_pct']:.0f}%"
-                )
-                p2.metric(
-                    "Clean continuation",
-                    f"{summary['path_continuation_pct']:.0f}%"
-                )
-                p3.metric(
-                    "Early rejection",
-                    f"{summary['early_rejection_pct']:.0f}%"
-                )
-                p4.metric(
-                    "Avg reversal timing",
-                    (
-                        f"{summary['reversal_timing_hours']:.0f}H"
-                        if np.isfinite(summary['reversal_timing_hours'])
-                        else "—"
-                    )
-                )
+            st.markdown("### 📌 Simple explanation")
+            for line in v5_simple_language(summary,current,decision_title):
+                st.write("• "+line)
 
-                st.markdown("#### 📊 Historical range of outcomes")
-                r1, r2, r3 = st.columns(3)
-                r1.metric(
-                    "Avg best move",
-                    f"{summary['avg_best']:+.1f}%"
-                    if np.isfinite(summary['avg_best']) else "—"
-                )
-                r2.metric(
-                    "Avg worst move",
-                    f"{summary['avg_worst']:+.1f}%"
-                    if np.isfinite(summary['avg_worst']) else "—"
-                )
-                r3.metric(
-                    "Avg 24H result",
-                    f"{summary['avg_end']:+.1f}%"
-                    if np.isfinite(summary['avg_end']) else "—"
-                )
-
-            st.markdown("### 📌 What this means in simple language")
-            st.write(simple_path_conclusion(summary, current))
-
-            if summary and summary["total"] >= 8:
-                risk = risk_profile(summary, current)
-
-                st.markdown("### 🎯 Trend vs. risk")
-                rr1, rr2, rr3, rr4, rr5 = st.columns(5)
-                rr1.metric("Trend", risk["trend"])
-                rr2.metric("Exhaustion", risk["exhaustion"])
-                rr3.metric("Immediate", risk["immediate"])
-                rr4.metric("24H reversal risk", risk["reversal_24h"])
-                rr5.metric("Volatility", risk["volatility"])
-
-            st.markdown("### 🧠 What pattern did the engine learn?")
-            if current["target"]:
-                for item in setup_description(current["target"]):
-                    st.write("• " + item)
-
-                st.write(
-                    "The engine compares this complete setup against historical setups using "
-                    "momentum, RSI, volume, volatility, EMA extension/alignment, candle shape "
-                    "and market structure. Similarity is a ranking mechanism, not a prediction."
-                )
-
-            st.markdown("### 👀 What to watch now")
-            for item in confirmation_text(current):
-                st.write("• " + item)
+            st.markdown("### 👀 What should be watched now?")
+            for line in confirmation_text(current):
+                st.write("• "+line)
 
             st.markdown("### 📊 7-Timeframe EMA picture")
             ema_table=[]
             for tf in ["1m","5m","15m","1H","4H","1D","1W"]:
                 r=current["ema_rows"].get(tf,{})
-                ema_table.append({
-                    "Timeframe":tf,
-                    "EMA20/50/100":r.get("state","NO DATA"),
-                    "Alignment":f"{r.get('count',0)}/3"
-                })
+                ema_table.append({"Timeframe":tf,"EMA20/50/100":r.get("state","NO DATA"),"Alignment":f"{r.get('count',0)}/3"})
             st.dataframe(pd.DataFrame(ema_table),use_container_width=True,hide_index=True)
-            st.write(
-                f"**Full 21-condition EMA alignment:** "
-                f"{current['bull']*3}/21 bullish conditions, "
-                f"{current['bear']*3}/21 bearish conditions."
-            )
-
-            st.markdown("### 📌 What this means in simple language")
-            if summary and summary["total"]>=8:
-                if summary["continue_pct"]>summary["dump_pct"]:
-                    st.write("Historically, coins that looked like this more often kept moving in the same direction than completely reversed. That does **not** mean this coin must do the same.")
-                else:
-                    st.write("Historically, similar setups often struggled after the initial move. It is better to wait for confirmation instead of chasing the move.")
-            else:
-                st.write("There is not enough historical evidence yet. Treat this as an observation, not a prediction.")
+            st.write(f"**Full EMA alignment:** {current['bull']*3}/21 bullish conditions | {current['bear']*3}/21 bearish conditions.")
 
             if matches:
                 st.markdown("### 🔎 Closest historical examples")
                 rows=[]
-                for sim,e in matches[:15]:
-                    f=e["features"]
-                    o=e["outcome"]
+                for sim,e in matches[:20]:
+                    f=e["features"]; o=e["outcome"]
                     rows.append({
-                        "Similarity":f"{sim:.0f}%",
-                        "Coin":e.get("pair","—"),
-                        "Peer group":e.get("peer_group","—"),
-                        "Regime":e.get("behavior_bucket","—"),
-                        "Date":str(e["time"])[:16],
-                        "24-bar move":f"{safe(f['ret24']):+.1f}%",
-                        "RSI":f"{safe(f['rsi']):.0f}",
-                        "Volume":f"{safe(f['vol_ratio']):.1f}x",
-                        "EMA20 dist":f"{safe(f['ema20_dist']):+.1f}%",
-                        "4H later":(
-                            f"{o['4H']['end']:+.1f}%"
-                            if o.get("4H") else "—"
-                        ),
-                        "12H later":(
-                            f"{o['12H']['end']:+.1f}%"
-                            if o.get("12H") else "—"
-                        ),
-                        "24H later":(
-                            f"{o['24H']['end']:+.1f}%"
-                            if o.get("24H") else "—"
-                        ),
-                        "Path":o.get("path_type","—"),
-                        "Best":(
-                            f"{o['24H']['best']:+.1f}%"
-                            if o.get("24H") else "—"
-                        ),
-                        "Worst":(
-                            f"{o['24H']['worst']:+.1f}%"
-                            if o.get("24H") else "—"
-                        ),
-                        "What happened":o["24H_path"]["label"],
+                        "Similarity":f"{sim:.0f}%","Coin":e.get("pair","—"),"Date":str(e.get("time","—"))[:16],
+                        "Regime":e.get("behavior_bucket","—"),"24-bar move":f"{safe(f.get('ret24')):+.1f}%",
+                        "RSI":f"{safe(f.get('rsi')):.0f}","Volume":f"{safe(f.get('vol_ratio')):.1f}x",
+                        "4H":f"{o['4H']['end']:+.1f}%" if o.get("4H") else "—",
+                        "12H":f"{o['12H']['end']:+.1f}%" if o.get("12H") else "—",
+                        "24H":f"{o['24H']['end']:+.1f}%" if o.get("24H") else "—",
+                        "Path":o.get("path_type","—"),"Best":f"{o['24H']['best']:+.1f}%" if o.get("24H") else "—",
+                        "Worst":f"{o['24H']['worst']:+.1f}%" if o.get("24H") else "—",
                     })
-                st.dataframe(
-                    pd.DataFrame(rows),
-                    use_container_width=True,
-                    hide_index=True
-                )
+                st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
 
             with st.expander("Advanced details"):
-                st.write(f"**4H structure:** {current['structure4']} | **1D structure:** {current['structure1']} | **15m structure:** {current['structure15']}")
-                st.write(f"**4H ADX:** {safe(b4.adx):.1f} | **4H MACD:** {'Bullish' if safe(b4.macd)>safe(b4.macd_signal) else 'Bearish'}")
-                st.write(f"**Historical learning pool:** {len(pool)} events from {len(pairs_sig)} comparison contracts.")
-                st.write("The engine compares normalized historical conditions across momentum, RSI, volume, EMA extension/alignment, volatility, candle shape and structure. It then measures what happened 4H, 12H and 24H after each historical match. It does not guarantee future price movement.")
+                st.write(f"**4H structure:** {current['structure4']} | **1D:** {current['structure1']} | **15m:** {current['structure15']}")
+                st.write(f"**15m:** ADX {s15['adx']:.1f} | MACD {'Bullish' if s15['macd']>s15['signal'] else 'Bearish'} | EMA20 slope {s15['ema20_slope']:+.2f}%" if np.isfinite(s15['adx']) else "15m indicators unavailable")
+                st.write(f"**Learning pool:** {len(pool)} events from {len(pairs_sig)} comparison contracts + {len(same_coin_pool)} same-coin events + {len(extreme_pool)} extreme events.")
+                st.write("V5 learns both the historical outcome and the sequence: continuation first, delayed reversal, early rejection or mixed behavior. Current 15m structure is used to decide whether a reversal is actually confirmed.")
                 if failures: st.code("\n".join(failures[:50]))
 
-            # Save results in session state for optional further inspection.
             st.session_state["last_analysis"]={"symbol":symbol,"pair":pair,"current":current,"summary":summary,"matches":matches}
-
     except Exception as e:
         st.error(f"Analysis failed: {type(e).__name__}: {e}")
 
@@ -1941,13 +2123,11 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
 # =============================================================================
 st.divider()
 st.header("🔥 Hot / ATH / ATL Discovery")
-st.caption("This section finds current events first. Click a coin above to perform the deeper historical similarity study.")
-
+st.caption("Find current movers first. Copy a coin into Analyze a Coin for the deeper V5 study.")
 if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
     try:
         with st.spinner("Reading current CoinDCX Futures prices..."):
-            prices=futures_prices(); rows=[]
-            active=active_instruments(margin)
+            prices=futures_prices(); rows=[]; active=active_instruments(margin)
             for pair in active:
                 p=prices.get(pair)
                 if not p: continue
@@ -1964,8 +2144,7 @@ if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
                     prior_ath=safe(dc.iloc[:-1].high.max()); prior_atl=safe(dc.iloc[:-1].low.min())
                     ath_dist=(cur/prior_ath-1)*100 if prior_ath>0 else np.nan
                     atl_dist=(cur/prior_atl-1)*100 if prior_atl>0 else np.nan
-                    ind=indicators(dc); last=ind.iloc[-1]
-                    tag=None
+                    ind=indicators(dc); last=ind.iloc[-1]; tag=None
                     if ath_dist>0: tag="🔥 ATH BREAKOUT"
                     elif ath_dist>=-5: tag="🟢 NEAR ATH"
                     elif atl_dist<0: tag="🩸 ATL BREAKDOWN"
@@ -1976,9 +2155,7 @@ if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
                         out.append({"Coin":symbol,"Price":fmt(cur),"24h":f"{pc:+.2f}%","ATH distance":f"{ath_dist:+.2f}%","ATL distance":f"{atl_dist:+.2f}%","RSI":f"{safe(last.rsi):.1f}" if pd.notna(last.rsi) else "—","Volume":f"{safe(last.vol_ratio):.1f}x" if pd.notna(last.vol_ratio) else "—","Event":tag})
                 except Exception as exc:
                     failures.append(f"{symbol}: {type(exc).__name__}: {exc}")
-            if out:
-                st.dataframe(pd.DataFrame(out),use_container_width=True,hide_index=True)
-                st.info("Copy a coin name from this table into the Analyze a Coin box to run the historical pattern study.")
+            if out: st.dataframe(pd.DataFrame(out),use_container_width=True,hide_index=True)
             else: st.warning("No current hot/ATH/ATL candidates were found in the scanned universe.")
             if failures:
                 with st.expander("Scan diagnostics"): st.code("\n".join(failures[:50]))
@@ -1986,4 +2163,4 @@ if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
         st.error(f"Discovery scan failed: {type(e).__name__}: {e}")
 
 st.divider()
-st.caption("Analysis only. No orders, balances, API keys or withdrawals are used. Historical similarity is evidence, not a guarantee or financial advice.")
+st.caption("Analysis only. No orders, balances, API keys or withdrawals are used. Historical behavior is evidence, not a guarantee or financial advice.")
