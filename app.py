@@ -10,7 +10,7 @@ from datetime import datetime, timezone
 # =============================================================================
 st.set_page_config(page_title="CoinDCX Pattern Learning Scanner", page_icon="🧠", layout="wide")
 st.title("🧠 CoinDCX Historical Pattern Learning Scanner")
-st.caption("Automatically fetches CoinDCX Futures history, finds similar historical setups, and explains what happened next.")
+st.caption("Automatically fetches CoinDCX Futures history, learns from similar market behavior across multiple historical pools, and explains what happened next.")
 
 API = "https://api.coindcx.com"
 PUBLIC = "https://public.coindcx.com"
@@ -537,15 +537,85 @@ def classify_current_event(d):
     return "NORMAL"
 
 
+
+def behavior_bucket(f):
+    """Convert extreme numerical moves into comparable behavioral regimes."""
+    if not f:
+        return "UNKNOWN"
+
+    r24 = safe(f.get("ret24"))
+    r12 = safe(f.get("ret12"))
+    rsi = safe(f.get("rsi"))
+    ema = safe(f.get("ema20_dist"))
+    vol = safe(f.get("vol_ratio"))
+
+    if np.isfinite(r24):
+        abs_move = abs(r24)
+    else:
+        abs_move = 0
+
+    if abs_move >= 200:
+        move_regime = "EXTREME_200"
+    elif abs_move >= 100:
+        move_regime = "EXTREME_100"
+    elif abs_move >= 60:
+        move_regime = "EXTREME_60"
+    elif abs_move >= 30:
+        move_regime = "STRONG_30"
+    elif abs_move >= 15:
+        move_regime = "STRONG_15"
+    else:
+        move_regime = "NORMAL"
+
+    if np.isfinite(rsi):
+        momentum_regime = (
+            "OVERHEATED" if rsi >= 85
+            else "HOT" if rsi >= 70
+            else "WEAK" if rsi <= 35
+            else "NORMAL"
+        )
+    else:
+        momentum_regime = "UNKNOWN"
+
+    if np.isfinite(ema):
+        extension_regime = (
+            "VERY_EXTENDED" if abs(ema) >= 50
+            else "EXTENDED" if abs(ema) >= 25
+            else "MODERATE"
+        )
+    else:
+        extension_regime = "UNKNOWN"
+
+    if np.isfinite(vol):
+        volume_regime = (
+            "SURGE" if vol >= 2.5
+            else "ELEVATED" if vol >= 1.3
+            else "NORMAL"
+        )
+    else:
+        volume_regime = "UNKNOWN"
+
+    direction = "UP" if np.isfinite(r24) and r24 >= 0 else "DOWN"
+
+    return "|".join([
+        direction,
+        move_regime,
+        momentum_regime,
+        extension_regime,
+        volume_regime,
+    ])
+
+
 def similarity_components(target_features, event_features):
     """Return interpretable similarity dimensions for the UI."""
     keys = [
-        ("Momentum", "ret24", 40),
+        ("Momentum", "ret24", 80),
+        ("Recent momentum", "ret4", 30),
         ("RSI", "rsi", 20),
         ("Volume", "vol_ratio", 3),
-        ("EMA extension", "ema20_dist", 12),
-        ("Volatility", "atr_pct", 10),
-        ("Momentum acceleration", "acceleration", 15),
+        ("EMA extension", "ema20_dist", 25),
+        ("Volatility", "atr_pct", 15),
+        ("Acceleration", "acceleration", 25),
     ]
 
     result = {}
@@ -554,6 +624,14 @@ def similarity_components(target_features, event_features):
         b = safe(event_features.get(key))
         if np.isfinite(a) and np.isfinite(b):
             diff = abs(a - b)
+
+            # For very large price moves, absolute percentage difference is
+            # less useful than regime similarity. Compress the return feature.
+            if key in {"ret24", "ret4", "acceleration"}:
+                aa = np.sign(a) * np.log1p(abs(a))
+                bb = np.sign(b) * np.log1p(abs(b))
+                diff = abs(aa - bb) * scale / np.log1p(scale)
+
             result[name] = max(0, 100 * (1 - diff / scale))
         else:
             result[name] = 0
@@ -561,28 +639,94 @@ def similarity_components(target_features, event_features):
     return result
 
 
-def similar_events(target_features, event_pool, max_matches=40):
+def adaptive_similarity(target_features, event_features, event_type=None):
+    """
+    Behavioral similarity score.
+
+    Exact numerical similarity is useful for normal markets. For extreme
+    movers, regime/shape similarity gets more weight so a +180% historical
+    move can still teach us about a +250% current move.
+    """
     tv = feature_vector(target_features)
-    if tv is None:
+    ev = feature_vector(event_features)
+
+    if tv is None or ev is None:
+        return 0.0, {}
+
+    raw_dist = scaled_distance(tv, ev)
+    numerical = max(0, 100 * (1 - raw_dist))
+
+    t_bucket = behavior_bucket(target_features)
+    e_bucket = behavior_bucket(event_features)
+
+    t_parts = t_bucket.split("|")
+    e_parts = e_bucket.split("|")
+
+    matches = sum(a == b for a, b in zip(t_parts, e_parts))
+    regime_score = matches / max(1, len(t_parts)) * 100
+
+    components = similarity_components(target_features, event_features)
+    shape_score = float(np.mean(list(components.values()))) if components else 0
+
+    extreme_target = any(
+        tag in t_bucket for tag in ("EXTREME_60", "EXTREME_100", "EXTREME_200")
+    )
+
+    if extreme_target:
+        # Behavioral regime dominates for extreme events.
+        score = (
+            0.35 * numerical +
+            0.40 * regime_score +
+            0.25 * shape_score
+        )
+    else:
+        score = (
+            0.55 * numerical +
+            0.20 * regime_score +
+            0.25 * shape_score
+        )
+
+    return float(max(0, min(100, score))), {
+        "numerical": numerical,
+        "regime": regime_score,
+        "shape": shape_score,
+        "target_bucket": t_bucket,
+        "event_bucket": e_bucket,
+    }
+
+
+def similar_events(target_features, event_pool, max_matches=50, min_similarity=None):
+    if target_features is None:
         return []
+
+    target_bucket = behavior_bucket(target_features)
+    extreme_target = any(
+        tag in target_bucket for tag in ("EXTREME_60", "EXTREME_100", "EXTREME_200")
+    )
+
+    if min_similarity is None:
+        # Adaptive threshold: extreme patterns get a wider neighborhood.
+        min_similarity = 38 if extreme_target else 50
 
     scored = []
 
     for e in event_pool:
-        ev = e.get("vector")
-        if ev is None:
+        ev_features = e.get("features")
+        if not ev_features:
             continue
 
-        dist = scaled_distance(tv, ev)
-        similarity = max(0, 100 * (1 - dist))
+        similarity, meta = adaptive_similarity(
+            target_features,
+            ev_features,
+            e.get("event_type")
+        )
 
-        # 50% is intentionally not treated as "identical"; it is a broad
-        # historical neighborhood. Stronger matches naturally rank first.
-        if similarity >= 50:
+        if similarity >= min_similarity:
             e2 = dict(e)
             e2["similarity_components"] = similarity_components(
-                target_features, e["features"]
+                target_features, ev_features
             )
+            e2["similarity_meta"] = meta
             scored.append((similarity, e2))
 
     scored.sort(key=lambda z: z[0], reverse=True)
@@ -592,9 +736,25 @@ def similar_events(target_features, event_pool, max_matches=40):
 def _weighted_mean(values, weights):
     vals = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
+
     mask = np.isfinite(vals) & np.isfinite(w)
     if not mask.any():
         return np.nan
+
+    return float(np.average(vals[mask], weights=w[mask]))
+
+
+def _weighted_percent(values, weights):
+    if not values:
+        return 0.0
+
+    vals = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    mask = np.isfinite(vals) & np.isfinite(w)
+
+    if not mask.any():
+        return 0.0
+
     return float(np.average(vals[mask], weights=w[mask]))
 
 
@@ -602,11 +762,20 @@ def outcome_summary(matches):
     if not matches:
         return None
 
-    # Similar examples matter more than weakly similar examples.
-    weights = np.array([max(1.0, sim / 10) for sim, _ in matches])
+    weights = np.array([
+        max(1.0, sim / 10)
+        for sim, _ in matches
+    ])
 
-    labels = [e["outcome"]["24H_path"]["label"] for _, e in matches]
+    labels = [
+        e["outcome"]["24H_path"]["label"]
+        for _, e in matches
+        if e.get("outcome") and e["outcome"].get("24H_path")
+    ]
+
     total = len(labels)
+    if total == 0:
+        return None
 
     counts = {
         k: labels.count(k)
@@ -619,22 +788,23 @@ def outcome_summary(matches):
     }
 
     def horizon_stats(h):
-        ends = []
-        bests = []
-        worsts = []
+        ends, bests, worsts = [], [], []
+        local_weights = []
 
-        for _, e in matches:
-            o = e["outcome"].get(h)
+        for idx, (_, e) in enumerate(matches):
+            o = e.get("outcome", {}).get(h)
             if not o:
                 continue
+
             ends.append(o["end"])
             bests.append(o["best"])
             worsts.append(o["worst"])
+            local_weights.append(weights[idx])
 
         return {
-            "end": _weighted_mean(ends, weights[:len(ends)]),
-            "best": _weighted_mean(bests, weights[:len(bests)]),
-            "worst": _weighted_mean(worsts, weights[:len(worsts)]),
+            "end": _weighted_mean(ends, local_weights),
+            "best": _weighted_mean(bests, local_weights),
+            "worst": _weighted_mean(worsts, local_weights),
         }
 
     return {
@@ -652,6 +822,7 @@ def outcome_summary(matches):
         "avg_worst": horizon_stats("24H")["worst"],
         "median_similarity": float(np.median([sim for sim, _ in matches])),
         "max_similarity": float(max(sim for sim, _ in matches)),
+        "min_similarity": float(min(sim for sim, _ in matches)),
     }
 
 
@@ -659,11 +830,30 @@ def historical_edge(summary):
     if not summary or summary["total"] < 8:
         return 0
 
-    # Continuation vs. dump edge, adjusted for the neutral bucket.
     return float(
-        summary["continue_pct"] - summary["dump_pct"]
-        + 0.20 * (summary["reverse_pct"] - summary["side_pct"])
+        summary["continue_pct"] -
+        summary["dump_pct"] +
+        0.20 * (
+            summary["reverse_pct"] -
+            summary["side_pct"]
+        )
     )
+
+
+def evidence_grade(summary):
+    if not summary:
+        return "INSUFFICIENT"
+
+    n = summary["total"]
+    median = summary["median_similarity"]
+
+    if n >= 25 and median >= 60:
+        return "STRONG"
+    if n >= 15 and median >= 55:
+        return "GOOD"
+    if n >= 8 and median >= 50:
+        return "MODERATE"
+    return "LIMITED"
 
 
 def human_result(summary, current):
@@ -686,14 +876,14 @@ def human_result(summary, current):
         if c >= 58 and c - r >= 18 and edge < -5:
             title = "🔴 LIKELY CONTINUATION DOWN"
             text = (
-                f"I found {summary['total']} similar breakdowns. "
+                f"I found {summary['total']} similar historical breakdowns. "
                 f"About {c:.0f}% kept falling, while {r:.0f}% bounced strongly. "
                 "Historically this type of downside setup has favored continuation."
             )
         elif r >= 55 and r - c >= 15:
             title = "🟢 HIGH BOUNCE RISK"
             text = (
-                f"I found {summary['total']} similar breakdowns. "
+                f"I found {summary['total']} similar historical breakdowns. "
                 f"About {r:.0f}% bounced strongly versus {c:.0f}% that continued down. "
                 "Historically this type of fall has often produced a reversal."
             )
@@ -772,6 +962,11 @@ def setup_description(f):
     ema = safe(f.get("ema20_dist"))
     accel = safe(f.get("acceleration"))
 
+    bucket = behavior_bucket(f)
+
+    if bucket != "UNKNOWN":
+        out.append(f"behavior regime: {bucket.replace('|', ' • ')}")
+
     if np.isfinite(r24):
         out.append(f"24-bar momentum: {r24:+.1f}%")
     if np.isfinite(r4):
@@ -790,6 +985,87 @@ def setup_description(f):
         )
 
     return out
+
+
+def market_cap_bucket(pair, symbol):
+    """
+    We cannot reliably infer market cap from the public futures feed.
+    Use contract naming only as a coarse peer grouping and label it honestly.
+    """
+    s = f"{pair} {symbol}".upper()
+
+    if any(x in s for x in ["1000", "10000"]):
+        return "MULTIPLIER_STYLE"
+
+    if any(w in s for w in MEME_WORDS):
+        return "MEME"
+
+    return "GENERAL"
+
+
+def peer_group(pair, symbol):
+    return market_cap_bucket(pair, symbol)
+
+
+def event_is_extreme(f):
+    if not f:
+        return False
+
+    r24 = safe(f.get("ret24"))
+    r12 = safe(f.get("ret12"))
+    rsi = safe(f.get("rsi"))
+    ema = safe(f.get("ema20_dist"))
+
+    return (
+        (np.isfinite(r24) and abs(r24) >= 60)
+        or (np.isfinite(r12) and abs(r12) >= 80)
+        or (np.isfinite(rsi) and rsi >= 85)
+        or (np.isfinite(ema) and abs(ema) >= 50)
+    )
+
+
+def event_profile_score(target_features, event):
+    """
+    Secondary score used to diversify the historical sample.
+
+    A single coin with a long uninterrupted pump should not dominate the
+    result. We therefore reward different contracts and different dates while
+    still ranking primarily by pattern similarity.
+    """
+    if not event:
+        return 0
+
+    score = 0
+
+    if event_is_extreme(target_features) == event_is_extreme(event.get("features")):
+        score += 20
+
+    if target_features.get("ema_stack") == event.get("features", {}).get("ema_stack"):
+        score += 10
+
+    if target_features.get("structure") == event.get("features", {}).get("structure"):
+        score += 10
+
+    return score
+
+
+def diversified_matches(matches, max_matches=50, per_coin=4):
+    """Limit repeated examples from one contract so the model learns broadly."""
+    selected = []
+    counts = {}
+
+    for sim, e in matches:
+        coin = e.get("pair", "UNKNOWN")
+        if counts.get(coin, 0) >= per_coin:
+            continue
+
+        selected.append((sim, e))
+        counts[coin] = counts.get(coin, 0) + 1
+
+        if len(selected) >= max_matches:
+            break
+
+    return selected
 
 # =============================================================================
 # CURRENT COIN PROFILE
@@ -837,22 +1113,109 @@ def universe_rows(margin, meme_only, max_coins):
 
 @st.cache_data(ttl=900, show_spinner=False)
 def build_learning_pool(pairs_signature, margin, max_coins, event_mode):
-    # pairs_signature is a tuple of pairs, making the cache key deterministic.
-    pool=[]; failures=[]; now=int(time.time())
-    for pair in pairs_signature:
+    """
+    Build a broader learning universe.
+
+    The target event is still the primary filter, but historical examples are
+    tagged by behavioral regime and peer group. This allows the matcher to
+    learn from:
+      1. normal event matches,
+      2. extreme-mover behavior,
+      3. meme/general peer behavior,
+      4. different contracts/dates.
+
+    We intentionally keep event construction free of future leakage.
+    """
+    pool = []
+    failures = []
+
+    for pair, symbol in pairs_signature:
         try:
-            # 4H history is the main pattern-learning timeframe.
-            d=get_tf(pair,"4H",240)
-            if len(d)<100: continue
-            if event_mode=="PUMP": events=find_pump_events(d,horizon=6,min_pump=15)
-            elif event_mode=="ATH": events=find_breakout_events(d,"ATH",horizon=6)
-            else: events=find_breakout_events(d,"ATL",horizon=6)
+            d = get_tf(pair, "4H", 240)
+            if len(d) < 100:
+                continue
+
+            if event_mode == "PUMP":
+                events = find_pump_events(d, horizon=6, min_pump=15)
+                event_type = "PUMP"
+            elif event_mode == "ATH":
+                events = find_breakout_events(d, "ATH", horizon=6)
+                event_type = "ATH"
+            else:
+                events = find_breakout_events(d, "ATL", horizon=6)
+                event_type = "ATL"
+
+            group = peer_group(pair, symbol)
+
             for e in events:
-                e["pair"]=pair
+                e = dict(e)
+                e["pair"] = pair
+                e["symbol"] = symbol
+                e["peer_group"] = group
+                e["event_type"] = event_type
+                e["behavior_bucket"] = behavior_bucket(e["features"])
                 pool.append(e)
+
         except Exception as exc:
-            failures.append(f"{pair}: {type(exc).__name__}: {exc}")
+            failures.append(
+                f"{pair}: {type(exc).__name__}: {exc}"
+            )
+
     return pool, failures
+
+
+def build_same_coin_pool(pair, event_mode):
+    """Learn from the target contract's own historical behavior."""
+    try:
+        d = get_tf(pair, "4H", 700)
+
+        if len(d) < 150:
+            return []
+
+        if event_mode == "PUMP":
+            events = find_pump_events(d, horizon=6, min_pump=15)
+        elif event_mode == "ATH":
+            events = find_breakout_events(d, "ATH", horizon=6)
+        else:
+            events = find_breakout_events(d, "ATL", horizon=6)
+
+        for e in events:
+            e["pair"] = pair
+            e["event_type"] = event_mode
+
+        return events
+
+    except Exception:
+        return []
+
+
+def build_extreme_pool(pool):
+    """Extract the historical extreme-mover subset."""
+    return [
+        e for e in pool
+        if event_is_extreme(e.get("features"))
+    ]
+
+
+def merge_learning_pools(*pools):
+    """Deduplicate examples by contract + historical timestamp."""
+    merged = []
+    seen = set()
+
+    for pool in pools:
+        for e in pool:
+            key = (
+                e.get("pair"),
+                str(e.get("time")),
+                e.get("event_type"),
+            )
+            if key in seen:
+                continue
+
+            seen.add(key)
+            merged.append(e)
+
+    return merged
 
 # =============================================================================
 # SIMPLE PREDICTION LANGUAGE
@@ -903,7 +1266,7 @@ def confirmation_text(current):
 # =============================================================================
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
 meme_only=st.checkbox("Use meme-focused learning universe",value=False,help="Turn this on if you only want meme-style contracts in the comparison universe.")
-peer_limit=st.slider("Historical comparison universe",20,120,60,10,help="More coins = more historical examples but more CoinDCX API work.")
+peer_limit=st.slider("Historical comparison universe",20,150,80,10,help="More coins = more historical examples but more CoinDCX API work.")
 st.caption(
     "Learning model: the scanner searches for similar historical market states, "
     "then measures what happened 4H, 12H and 24H later. It does not assume that "
@@ -943,9 +1306,38 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
             # Build historical pool according to current event type.
             mode="ATH" if event=="ATH BREAKOUT" else "ATL" if event=="ATL BREAKDOWN" else "PUMP"
             universe=universe_rows(margin,meme_only,peer_limit)
-            pairs_sig=tuple(z[0] for z in universe if z[0]!=pair)
-            pool,failures=build_learning_pool(pairs_sig,margin,peer_limit,mode)
-            matches=similar_events(current["target"],pool,max_matches=40)
+
+            # Keep both pair and symbol so peer-group tagging can be used.
+            pairs_sig=tuple(
+                (z[0], z[2])
+                for z in universe
+                if z[0] != pair
+            )
+
+            pool,failures=build_learning_pool(
+                pairs_sig,margin,peer_limit,mode
+            )
+
+            same_coin_pool=build_same_coin_pool(pair,mode)
+            extreme_pool=build_extreme_pool(pool)
+
+            combined_pool=merge_learning_pools(
+                pool,
+                same_coin_pool,
+                extreme_pool
+            )
+
+            raw_matches=similar_events(
+                current["target"],
+                combined_pool,
+                max_matches=80
+            )
+            matches=diversified_matches(
+                raw_matches,
+                max_matches=50,
+                per_coin=4
+            )
+
             summary=outcome_summary(matches)
             title,text=human_result(summary,current)
             if title.startswith("🟢"): st.success(title)
@@ -958,7 +1350,13 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                 st.write(f"**Similar historical cases:** {summary['total']}")
                 st.write(
                     f"**Match quality:** median similarity {summary['median_similarity']:.0f}% "
-                    f"| strongest match {summary['max_similarity']:.0f}%"
+                    f"| strongest match {summary['max_similarity']:.0f}% "
+                    f"| evidence grade: **{evidence_grade(summary)}**"
+                )
+
+                current_bucket=behavior_bucket(current["target"])
+                st.write(
+                    f"**Current behavior regime:** `{current_bucket.replace('|', ' • ')}`"
                 )
 
                 st.markdown("#### 📈 What happened after similar setups?")
@@ -1020,8 +1418,10 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                     )
             else:
                 st.write(
-                    "There is not enough historical evidence yet. Treat this as an observation, "
-                    "not a prediction."
+                    "There is not enough historical evidence yet. The scanner searched "
+                    "multiple behavioral regimes and historical pools, but did not find "
+                    "enough sufficiently similar completed examples. Treat this as an "
+                    "observation, not a prediction."
                 )
 
             st.markdown("### 🧠 What pattern did the engine learn?")
@@ -1073,6 +1473,8 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                     rows.append({
                         "Similarity":f"{sim:.0f}%",
                         "Coin":e.get("pair","—"),
+                        "Peer group":e.get("peer_group","—"),
+                        "Regime":e.get("behavior_bucket","—"),
                         "Date":str(e["time"])[:16],
                         "24-bar move":f"{safe(f['ret24']):+.1f}%",
                         "RSI":f"{safe(f['rsi']):.0f}",
