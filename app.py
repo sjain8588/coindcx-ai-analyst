@@ -211,66 +211,185 @@ def ema_alignment(tf_data):
 # =============================================================================
 # HISTORICAL EVENT / PATTERN ENGINE
 # =============================================================================
+
 def rolling_features(x, i):
-    if i < 40:
+    """
+    Build a normalized description of the market at candle i.
+
+    The old engine concentrated heavily on absolute returns. This version also
+    learns the *shape* of the setup: momentum acceleration, EMA extension,
+    EMA stack, volume behavior, volatility, RSI, candle rejection and trend
+    structure. That makes BTC, large caps and tiny meme coins more comparable.
+    """
+    if i < 50 or i >= len(x):
         return None
+
     row = x.iloc[i]
     close = safe(row.close)
-    atr = safe(row.atr)
     if not np.isfinite(close) or close <= 0:
         return None
-    look = x.iloc[max(0,i-24):i+1]
-    ret4 = (close / safe(x.iloc[i-4].close)-1)*100 if i >= 4 else np.nan
-    ret12 = (close / safe(x.iloc[i-12].close)-1)*100 if i >= 12 else np.nan
-    ret24 = (close / safe(x.iloc[i-24].close)-1)*100 if i >= 24 else np.nan
-    hi24 = safe(look.high.max())
-    lo24 = safe(look.low.min())
-    range_pct = ((hi24-lo24)/close*100) if hi24 > 0 else np.nan
-    body = abs(safe(row.close)-safe(row.open))/close*100
-    upper_wick = (safe(row.high)-max(safe(row.open),safe(row.close)))/close*100
-    lower_wick = (min(safe(row.open),safe(row.close))-safe(row.low))/close*100
-    ema20 = safe(row.ema20); ema50 = safe(row.ema50); ema100 = safe(row.ema100)
-    stack = 1 if ema20 > ema50 > ema100 else -1 if ema20 < ema50 < ema100 else 0
+
+    def ret(n):
+        if i < n:
+            return np.nan
+        prev = safe(x.iloc[i-n].close)
+        return (close / prev - 1) * 100 if prev > 0 else np.nan
+
+    look24 = x.iloc[max(0, i-24):i+1]
+    look12 = x.iloc[max(0, i-12):i+1]
+    look6 = x.iloc[max(0, i-6):i+1]
+
+    hi24 = safe(look24.high.max())
+    lo24 = safe(look24.low.min())
+    hi12 = safe(look12.high.max())
+    lo12 = safe(look12.low.min())
+
+    ema20 = safe(row.ema20)
+    ema50 = safe(row.ema50)
+    ema100 = safe(row.ema100)
+    atr_pct = safe(row.atr_pct)
+
+    range24 = ((hi24 - lo24) / close * 100) if hi24 > 0 else np.nan
+    range12 = ((hi12 - lo12) / close * 100) if hi12 > 0 else np.nan
+
+    body_pct = abs(safe(row.close) - safe(row.open)) / close * 100
+    upper_wick_pct = max(
+        0,
+        (safe(row.high) - max(safe(row.open), safe(row.close))) / close * 100
+    )
+    lower_wick_pct = max(
+        0,
+        (min(safe(row.open), safe(row.close)) - safe(row.low)) / close * 100
+    )
+
+    stack = (
+        1 if np.isfinite(ema20) and np.isfinite(ema50) and np.isfinite(ema100)
+        and ema20 > ema50 > ema100
+        else -1 if np.isfinite(ema20) and np.isfinite(ema50) and np.isfinite(ema100)
+        and ema20 < ema50 < ema100
+        else 0
+    )
+
+    ema20_dist = ((close / ema20) - 1) * 100 if ema20 > 0 else np.nan
+    ema50_dist = ((close / ema50) - 1) * 100 if ema50 > 0 else np.nan
+    ema100_dist = ((close / ema100) - 1) * 100 if ema100 > 0 else np.nan
+
+    vol_ratio = safe(row.vol_ratio)
+    prior_vol = safe(x.iloc[max(0, i-5):i].volume.mean()) if i > 5 else np.nan
+    vol_accel = safe(row.volume) / prior_vol if prior_vol > 0 else np.nan
+
+    # Momentum acceleration: is the move getting faster or slower?
+    r4 = ret(4)
+    r12 = ret(12)
+    r24 = ret(24)
+    acceleration = r4 - (r12 / 3 if np.isfinite(r12) else 0)
+
+    # Location inside the recent range. Near 1 = pressing highs, near 0 = lows.
+    range_position = (
+        (close - lo24) / (hi24 - lo24)
+        if hi24 > lo24 else 0.5
+    )
+
     return {
-        "ret4":ret4, "ret12":ret12, "ret24":ret24,
-        "range_pct":range_pct,
-        "body_pct":body, "upper_wick_pct":upper_wick, "lower_wick_pct":lower_wick,
-        "rsi":safe(row.rsi), "adx":safe(row.adx), "vol_ratio":safe(row.vol_ratio),
-        "atr_pct":safe(row.atr_pct), "ema_stack":stack,
-        "above20":1 if close > ema20 else 0,
-        "above50":1 if close > ema50 else 0,
-        "above100":1 if close > ema100 else 0,
-        "structure":structure(x.iloc[:i+1]),
+        "ret4": r4,
+        "ret12": r12,
+        "ret24": r24,
+        "range_pct": range24,
+        "range12_pct": range12,
+        "range_position": range_position,
+        "body_pct": body_pct,
+        "upper_wick_pct": upper_wick_pct,
+        "lower_wick_pct": lower_wick_pct,
+        "rsi": safe(row.rsi),
+        "adx": safe(row.adx),
+        "vol_ratio": vol_ratio,
+        "vol_accel": vol_accel,
+        "atr_pct": atr_pct,
+        "acceleration": acceleration,
+        "ema_stack": stack,
+        "ema20_dist": ema20_dist,
+        "ema50_dist": ema50_dist,
+        "ema100_dist": ema100_dist,
+        "above20": 1 if close > ema20 else 0,
+        "above50": 1 if close > ema50 else 0,
+        "above100": 1 if close > ema100 else 0,
+        "structure": structure(x.iloc[:i+1]),
     }
 
+
 def feature_vector(f):
-    if f is None: return None
-    # Normalized features make BTC, DOGE and tiny coins comparable.
+    if f is None:
+        return None
+
+    # Robust scales. These are deliberately broad so a setup does not need
+    # to be numerically identical to qualify as historically similar.
     vals = [
-        safe(f["ret4"]), safe(f["ret12"]), safe(f["ret24"]), safe(f["range_pct"]),
-        safe(f["body_pct"]), safe(f["upper_wick_pct"]), safe(f["lower_wick_pct"]),
-        safe(f["rsi"]), safe(f["adx"]), safe(f["vol_ratio"]), safe(f["atr_pct"]),
-        safe(f["ema_stack"]), safe(f["above20"]), safe(f["above50"]), safe(f["above100"])
+        safe(f["ret4"]),
+        safe(f["ret12"]),
+        safe(f["ret24"]),
+        safe(f["range_pct"]),
+        safe(f["range12_pct"]),
+        safe(f["range_position"]),
+        safe(f["body_pct"]),
+        safe(f["upper_wick_pct"]),
+        safe(f["lower_wick_pct"]),
+        safe(f["rsi"]),
+        safe(f["adx"]),
+        safe(f["vol_ratio"]),
+        safe(f["vol_accel"]),
+        safe(f["atr_pct"]),
+        safe(f["acceleration"]),
+        safe(f["ema_stack"]),
+        safe(f["ema20_dist"]),
+        safe(f["ema50_dist"]),
+        safe(f["ema100_dist"]),
+        safe(f["above20"]),
+        safe(f["above50"]),
+        safe(f["above100"]),
     ]
-    return np.array([0 if not np.isfinite(v) else v for v in vals], dtype=float)
 
-def scaled_distance(a,b):
-    # Robust scale: percentage/indicator ranges are intentionally normalized.
-    scales = np.array([10,20,35,20,5,5,5,20,20,3,10,1,1,1,1], dtype=float)
-    return float(np.sqrt(np.mean(((a-b)/scales)**2)))
+    return np.array(
+        [0 if not np.isfinite(v) else v for v in vals],
+        dtype=float
+    )
 
-def event_outcome(x, i, horizon, direction="UP"):
-    if i+1 >= len(x): return None
+
+def scaled_distance(a, b):
+    # Feature-specific scales + weights.
+    scales = np.array([
+        12, 22, 40, 25, 20, 0.50,
+        6, 5, 5, 20, 20, 3, 2.5, 10, 15,
+        1, 12, 18, 25, 1, 1, 1
+    ], dtype=float)
+
+    weights = np.array([
+        1.5, 1.4, 1.2, 0.8, 0.7, 0.6,
+        0.5, 0.6, 0.6, 1.4, 0.8, 1.2, 0.9, 0.8, 1.2,
+        1.1, 1.0, 0.8, 0.6, 0.8, 0.8, 0.8
+    ], dtype=float)
+
+    z = ((a - b) / scales) ** 2
+    return float(np.sqrt(np.sum(z * weights) / np.sum(weights)))
+
+
+def event_outcome(x, i, horizon=24, direction="UP"):
+    if i + 1 >= len(x):
+        return None
+
     future = x.iloc[i+1:min(len(x), i+1+horizon)]
-    if future.empty: return None
+    if future.empty:
+        return None
+
     entry = safe(x.iloc[i].close)
-    if entry <= 0: return None
-    end_ret = (safe(future.iloc[-1].close)/entry-1)*100
-    best = (safe(future.high.max())/entry-1)*100
-    worst = (safe(future.low.min())/entry-1)*100
-    # A practical classification, not a promise. For an UP event, continuation
-    # means the move kept working; for a DOWN event, continuation means the
-    # breakdown kept working.
+    if entry <= 0:
+        return None
+
+    end_ret = (safe(future.iloc[-1].close) / entry - 1) * 100
+    best = (safe(future.high.max()) / entry - 1) * 100
+    worst = (safe(future.low.min()) / entry - 1) * 100
+
+    # A setup can first continue and then reverse. Preserve both dimensions
+    # instead of reducing the whole future path to one number.
     if direction == "DOWN":
         if worst <= -10 and best < 12:
             label = "CONTINUED"
@@ -285,89 +404,392 @@ def event_outcome(x, i, horizon, direction="UP"):
             label = "DUMPED"
         else:
             label = "SIDEWAYS / PULLBACK"
-    return {"end":end_ret,"best":best,"worst":worst,"label":label}
 
-def find_pump_events(d, horizon=24, min_pump=15):
-    """Find completed historical pump events without using future data to define the event."""
-    if d is None or len(d) < 90:
+    return {
+        "end": end_ret,
+        "best": best,
+        "worst": worst,
+        "label": label,
+    }
+
+
+def multi_horizon_outcomes(x, i, direction="UP"):
+    """
+    Store separate 4H, 12H and 24H results.
+
+    The learning timeframe is 4H, so these correspond to 1, 3 and 6
+    completed 4H candles after the historical setup.
+    """
+    result = {}
+    for name, bars in [("4H", 1), ("12H", 3), ("24H", 6)]:
+        result[name] = event_outcome(x, i, bars, direction)
+    result["24H_path"] = event_outcome(x, i, 6, direction)
+    return result
+
+
+def find_pump_events(d, horizon=6, min_pump=15):
+    """Find completed pump setups without using future candles to define them."""
+    if d is None or len(d) < 100:
         return []
+
     x = indicators(completed(d))
     events = []
     last_event = -999
-    for i in range(40, len(x)-horizon-1):
-        f = rolling_features(x,i)
-        if not f: continue
-        # Event is a completed 4H/1D move already visible at time i.
+
+    for i in range(50, len(x)-horizon-1):
+        f = rolling_features(x, i)
+        if not f:
+            continue
+
+        # The event itself is already visible at candle i.
         if safe(f["ret24"]) >= min_pump:
-            # Keep distinct events separated so one long pump does not dominate.
-            if i-last_event < 12: continue
-            outcome = event_outcome(x,i,horizon,"UP")
-            if outcome:
-                events.append({"i":i,"time":x.iloc[i].time, "features":f, "vector":feature_vector(f), "outcome":outcome})
-                last_event=i
+            # Avoid collecting every candle of one long pump as independent examples.
+            if i - last_event < 12:
+                continue
+
+            outcomes = multi_horizon_outcomes(x, i, "UP")
+            if outcomes["24H_path"]:
+                events.append({
+                    "i": i,
+                    "time": x.iloc[i].time,
+                    "features": f,
+                    "vector": feature_vector(f),
+                    "outcome": outcomes,
+                })
+                last_event = i
+
     return events
 
-def find_breakout_events(d, mode="ATH", horizon=24):
-    if d is None or len(d) < 90: return []
+
+def find_breakout_events(d, mode="ATH", horizon=6):
+    if d is None or len(d) < 100:
+        return []
+
     x = indicators(completed(d))
-    events=[]
-    last=-999
-    for i in range(40, len(x)-horizon-1):
-        hist=x.iloc[:i]
-        price=safe(x.iloc[i].close)
-        if price <= 0: continue
-        extreme=safe(hist.high.max() if mode=="ATH" else hist.low.min())
-        if extreme <= 0: continue
-        event=(price>extreme) if mode=="ATH" else (price<extreme)
-        if event and i-last>=8:
-            f=rolling_features(x,i)
-            outcome=event_outcome(x,i,horizon,"UP" if mode=="ATH" else "DOWN")
-            if f and outcome:
-                events.append({"i":i,"time":x.iloc[i].time,"features":f,"vector":feature_vector(f),"outcome":outcome})
-                last=i
+    events = []
+    last = -999
+
+    for i in range(50, len(x)-horizon-1):
+        hist = x.iloc[:i]
+        price = safe(x.iloc[i].close)
+        if price <= 0:
+            continue
+
+        extreme = safe(hist.high.max() if mode == "ATH" else hist.low.min())
+        if extreme <= 0:
+            continue
+
+        event = price > extreme if mode == "ATH" else price < extreme
+
+        if event and i - last >= 8:
+            f = rolling_features(x, i)
+            outcomes = multi_horizon_outcomes(
+                x, i, "UP" if mode == "ATH" else "DOWN"
+            )
+            if f and outcomes["24H_path"]:
+                events.append({
+                    "i": i,
+                    "time": x.iloc[i].time,
+                    "features": f,
+                    "vector": feature_vector(f),
+                    "outcome": outcomes,
+                })
+                last = i
+
     return events
+
 
 def current_pattern(d):
-    x=indicators(completed(d))
-    if len(x)<50: return None
-    return rolling_features(x,len(x)-1)
+    x = indicators(completed(d))
+    if len(x) < 55:
+        return None
+    return rolling_features(x, len(x)-1)
+
 
 def classify_current_event(d):
-    x=completed(d)
-    if len(x)<40: return "NORMAL"
-    ind=indicators(x); last=ind.iloc[-1]; hist=ind.iloc[:-1]
-    price=safe(last.close)
-    prior_ath=safe(hist.high.max())
-    prior_atl=safe(hist.low.min())
-    if prior_ath>0 and price>prior_ath: return "ATH BREAKOUT"
-    if prior_atl>0 and price<prior_atl: return "ATL BREAKDOWN"
-    ret24=(price/safe(x.iloc[-24].close)-1)*100 if len(x)>24 else 0
-    if ret24>=15: return "HOT / PUMP"
-    if ret24<=-15: return "FAST DUMP"
+    x = completed(d)
+    if len(x) < 40:
+        return "NORMAL"
+
+    ind = indicators(x)
+    last = ind.iloc[-1]
+    hist = ind.iloc[:-1]
+
+    price = safe(last.close)
+    prior_ath = safe(hist.high.max())
+    prior_atl = safe(hist.low.min())
+
+    if prior_ath > 0 and price > prior_ath:
+        return "ATH BREAKOUT"
+    if prior_atl > 0 and price < prior_atl:
+        return "ATL BREAKDOWN"
+
+    ret24 = (
+        (price / safe(x.iloc[-24].close) - 1) * 100
+        if len(x) > 24 else 0
+    )
+
+    if ret24 >= 15:
+        return "HOT / PUMP"
+    if ret24 <= -15:
+        return "FAST DUMP"
+
     return "NORMAL"
 
+
+def similarity_components(target_features, event_features):
+    """Return interpretable similarity dimensions for the UI."""
+    keys = [
+        ("Momentum", "ret24", 40),
+        ("RSI", "rsi", 20),
+        ("Volume", "vol_ratio", 3),
+        ("EMA extension", "ema20_dist", 12),
+        ("Volatility", "atr_pct", 10),
+        ("Momentum acceleration", "acceleration", 15),
+    ]
+
+    result = {}
+    for name, key, scale in keys:
+        a = safe(target_features.get(key))
+        b = safe(event_features.get(key))
+        if np.isfinite(a) and np.isfinite(b):
+            diff = abs(a - b)
+            result[name] = max(0, 100 * (1 - diff / scale))
+        else:
+            result[name] = 0
+
+    return result
+
+
 def similar_events(target_features, event_pool, max_matches=40):
-    tv=feature_vector(target_features)
-    if tv is None: return []
-    scored=[]
+    tv = feature_vector(target_features)
+    if tv is None:
+        return []
+
+    scored = []
+
     for e in event_pool:
-        if e.get("vector") is None: continue
-        dist=scaled_distance(tv,e["vector"])
-        similarity=max(0,100*(1-dist))
-        if similarity>=45:
-            scored.append((similarity,e))
-    scored.sort(key=lambda z:z[0],reverse=True)
+        ev = e.get("vector")
+        if ev is None:
+            continue
+
+        dist = scaled_distance(tv, ev)
+        similarity = max(0, 100 * (1 - dist))
+
+        # 50% is intentionally not treated as "identical"; it is a broad
+        # historical neighborhood. Stronger matches naturally rank first.
+        if similarity >= 50:
+            e2 = dict(e)
+            e2["similarity_components"] = similarity_components(
+                target_features, e["features"]
+            )
+            scored.append((similarity, e2))
+
+    scored.sort(key=lambda z: z[0], reverse=True)
     return scored[:max_matches]
 
+
+def _weighted_mean(values, weights):
+    vals = np.asarray(values, dtype=float)
+    w = np.asarray(weights, dtype=float)
+    mask = np.isfinite(vals) & np.isfinite(w)
+    if not mask.any():
+        return np.nan
+    return float(np.average(vals[mask], weights=w[mask]))
+
+
 def outcome_summary(matches):
-    if not matches: return None
-    labels=[e["outcome"]["label"] for _,e in matches]
-    total=len(labels)
-    counts={k:labels.count(k) for k in ["CONTINUED","SIDEWAYS / PULLBACK","DUMPED","REVERSED / BOUNCED"]}
-    best=np.mean([e["outcome"]["best"] for _,e in matches])
-    worst=np.mean([e["outcome"]["worst"] for _,e in matches])
-    end=np.mean([e["outcome"]["end"] for _,e in matches])
-    return {"total":total,"counts":counts,"continue_pct":counts["CONTINUED"]/total*100,"dump_pct":counts["DUMPED"]/total*100,"reverse_pct":counts["REVERSED / BOUNCED"]/total*100,"side_pct":counts["SIDEWAYS / PULLBACK"]/total*100,"avg_end":end,"avg_best":best,"avg_worst":worst}
+    if not matches:
+        return None
+
+    # Similar examples matter more than weakly similar examples.
+    weights = np.array([max(1.0, sim / 10) for sim, _ in matches])
+
+    labels = [e["outcome"]["24H_path"]["label"] for _, e in matches]
+    total = len(labels)
+
+    counts = {
+        k: labels.count(k)
+        for k in [
+            "CONTINUED",
+            "SIDEWAYS / PULLBACK",
+            "DUMPED",
+            "REVERSED / BOUNCED",
+        ]
+    }
+
+    def horizon_stats(h):
+        ends = []
+        bests = []
+        worsts = []
+
+        for _, e in matches:
+            o = e["outcome"].get(h)
+            if not o:
+                continue
+            ends.append(o["end"])
+            bests.append(o["best"])
+            worsts.append(o["worst"])
+
+        return {
+            "end": _weighted_mean(ends, weights[:len(ends)]),
+            "best": _weighted_mean(bests, weights[:len(bests)]),
+            "worst": _weighted_mean(worsts, weights[:len(worsts)]),
+        }
+
+    return {
+        "total": total,
+        "counts": counts,
+        "continue_pct": counts["CONTINUED"] / total * 100,
+        "dump_pct": counts["DUMPED"] / total * 100,
+        "reverse_pct": counts["REVERSED / BOUNCED"] / total * 100,
+        "side_pct": counts["SIDEWAYS / PULLBACK"] / total * 100,
+        "4H": horizon_stats("4H"),
+        "12H": horizon_stats("12H"),
+        "24H": horizon_stats("24H"),
+        "avg_end": horizon_stats("24H")["end"],
+        "avg_best": horizon_stats("24H")["best"],
+        "avg_worst": horizon_stats("24H")["worst"],
+        "median_similarity": float(np.median([sim for sim, _ in matches])),
+        "max_similarity": float(max(sim for sim, _ in matches)),
+    }
+
+
+def historical_edge(summary):
+    if not summary or summary["total"] < 8:
+        return 0
+
+    # Continuation vs. dump edge, adjusted for the neutral bucket.
+    return float(
+        summary["continue_pct"] - summary["dump_pct"]
+        + 0.20 * (summary["reverse_pct"] - summary["side_pct"])
+    )
+
+
+def human_result(summary, current):
+    if not summary or summary["total"] < 8:
+        return (
+            "🟡 NOT ENOUGH EVIDENCE",
+            "I found too few similar historical situations. "
+            "The tool should not pretend it knows what happens next."
+        )
+
+    c = summary["continue_pct"]
+    d = summary["dump_pct"]
+    r = summary["reverse_pct"]
+    side = summary["side_pct"]
+    edge = historical_edge(summary)
+
+    down_event = current["event"] in {"ATL BREAKDOWN", "FAST DUMP"}
+
+    if down_event:
+        if c >= 58 and c - r >= 18 and edge < -5:
+            title = "🔴 LIKELY CONTINUATION DOWN"
+            text = (
+                f"I found {summary['total']} similar breakdowns. "
+                f"About {c:.0f}% kept falling, while {r:.0f}% bounced strongly. "
+                "Historically this type of downside setup has favored continuation."
+            )
+        elif r >= 55 and r - c >= 15:
+            title = "🟢 HIGH BOUNCE RISK"
+            text = (
+                f"I found {summary['total']} similar breakdowns. "
+                f"About {r:.0f}% bounced strongly versus {c:.0f}% that continued down. "
+                "Historically this type of fall has often produced a reversal."
+            )
+        else:
+            title = "🟡 MIXED / WAIT"
+            text = (
+                f"I found {summary['total']} similar breakdowns, but outcomes are mixed: "
+                f"{c:.0f}% continued down, {r:.0f}% bounced and "
+                f"{side:.0f}% were sideways/pullback cases."
+            )
+    else:
+        if c >= 58 and c - d >= 18 and edge > 5:
+            title = "🟢 LIKELY CONTINUATION"
+            text = (
+                f"I found {summary['total']} similar historical setups. "
+                f"About {c:.0f}% continued and {d:.0f}% dumped. "
+                "Historically the pattern favors continuation, although it is not guaranteed."
+            )
+        elif d >= 55 and d - c >= 15:
+            title = "🔴 HIGH DUMP RISK"
+            text = (
+                f"I found {summary['total']} similar historical setups. "
+                f"About {d:.0f}% dumped and {c:.0f}% continued. "
+                "Historically this type of setup has often weakened after the initial move."
+            )
+        else:
+            title = "🟡 MIXED / WAIT"
+            text = (
+                f"I found {summary['total']} similar historical setups, but the outcomes "
+                f"are mixed: {c:.0f}% continued, {side:.0f}% pulled back/sideways and "
+                f"{d:.0f}% dumped. There is not a strong historical edge."
+            )
+
+    return title, text
+
+
+def confirmation_text(current):
+    last4 = current["4h"]
+    last1 = current["1d"]
+
+    checks = []
+
+    if safe(last4.close) > safe(last4.ema20):
+        checks.append("4H price is above EMA20")
+    else:
+        checks.append("4H price is below EMA20")
+
+    if safe(last4.macd) > safe(last4.macd_signal):
+        checks.append("4H momentum is improving")
+    else:
+        checks.append("4H momentum is weak")
+
+    if safe(last4.vol_ratio) >= 1:
+        checks.append("4H volume is above its average")
+    else:
+        checks.append("4H volume is below its average")
+
+    if safe(last1.close) > safe(last1.ema20):
+        checks.append("1D price is above EMA20")
+    else:
+        checks.append("1D price is below EMA20")
+
+    return checks
+
+
+def setup_description(f):
+    if not f:
+        return []
+
+    out = []
+
+    r24 = safe(f.get("ret24"))
+    r4 = safe(f.get("ret4"))
+    rsi = safe(f.get("rsi"))
+    vol = safe(f.get("vol_ratio"))
+    ema = safe(f.get("ema20_dist"))
+    accel = safe(f.get("acceleration"))
+
+    if np.isfinite(r24):
+        out.append(f"24-bar momentum: {r24:+.1f}%")
+    if np.isfinite(r4):
+        out.append(f"recent 4-bar momentum: {r4:+.1f}%")
+    if np.isfinite(rsi):
+        out.append(f"RSI: {rsi:.1f}")
+    if np.isfinite(vol):
+        out.append(f"volume: {vol:.1f}x average")
+    if np.isfinite(ema):
+        out.append(f"price vs EMA20: {ema:+.1f}%")
+    if np.isfinite(accel):
+        out.append(
+            "momentum accelerating" if accel > 3
+            else "momentum decelerating" if accel < -3
+            else "momentum stable"
+        )
+
+    return out
 
 # =============================================================================
 # CURRENT COIN PROFILE
@@ -422,9 +844,9 @@ def build_learning_pool(pairs_signature, margin, max_coins, event_mode):
             # 4H history is the main pattern-learning timeframe.
             d=get_tf(pair,"4H",240)
             if len(d)<100: continue
-            if event_mode=="PUMP": events=find_pump_events(d,horizon=24,min_pump=15)
-            elif event_mode=="ATH": events=find_breakout_events(d,"ATH",horizon=24)
-            else: events=find_breakout_events(d,"ATL",horizon=24)
+            if event_mode=="PUMP": events=find_pump_events(d,horizon=6,min_pump=15)
+            elif event_mode=="ATH": events=find_breakout_events(d,"ATH",horizon=6)
+            else: events=find_breakout_events(d,"ATL",horizon=6)
             for e in events:
                 e["pair"]=pair
                 pool.append(e)
@@ -482,6 +904,11 @@ def confirmation_text(current):
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
 meme_only=st.checkbox("Use meme-focused learning universe",value=False,help="Turn this on if you only want meme-style contracts in the comparison universe.")
 peer_limit=st.slider("Historical comparison universe",20,120,60,10,help="More coins = more historical examples but more CoinDCX API work.")
+st.caption(
+    "Learning model: the scanner searches for similar historical market states, "
+    "then measures what happened 4H, 12H and 24H later. It does not assume that "
+    "a pump must reverse or that a breakout must continue."
+)
 
 st.divider()
 st.header("🔎 Analyze a Coin")
@@ -529,11 +956,104 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
 
             if summary:
                 st.write(f"**Similar historical cases:** {summary['total']}")
-                a,b,c,d=st.columns(4)
-                a.metric("Continued",f"{summary['continue_pct']:.0f}%")
-                b.metric("Sideways / Pullback",f"{summary['side_pct']:.0f}%")
-                c.metric("Dumped",f"{summary['dump_pct']:.0f}%")
-                d.metric("Avg next-period move",f"{summary['avg_end']:+.1f}%")
+                st.write(
+                    f"**Match quality:** median similarity {summary['median_similarity']:.0f}% "
+                    f"| strongest match {summary['max_similarity']:.0f}%"
+                )
+
+                st.markdown("#### 📈 What happened after similar setups?")
+                h1, h2, h3 = st.columns(3)
+                h1.metric(
+                    "After 4H",
+                    f"{summary['4H']['end']:+.1f}%"
+                    if np.isfinite(summary['4H']['end']) else "—"
+                )
+                h2.metric(
+                    "After 12H",
+                    f"{summary['12H']['end']:+.1f}%"
+                    if np.isfinite(summary['12H']['end']) else "—"
+                )
+                h3.metric(
+                    "After 24H",
+                    f"{summary['24H']['end']:+.1f}%"
+                    if np.isfinite(summary['24H']['end']) else "—"
+                )
+
+                a, b, c, d = st.columns(4)
+                a.metric("Continued", f"{summary['continue_pct']:.0f}%")
+                b.metric("Sideways / Pullback", f"{summary['side_pct']:.0f}%")
+                c.metric("Dumped", f"{summary['dump_pct']:.0f}%")
+                d.metric("Strong bounce/reversal", f"{summary['reverse_pct']:.0f}%")
+
+                st.markdown("#### 📊 Historical range of outcomes")
+                r1, r2, r3 = st.columns(3)
+                r1.metric(
+                    "Avg best move",
+                    f"{summary['avg_best']:+.1f}%"
+                    if np.isfinite(summary['avg_best']) else "—"
+                )
+                r2.metric(
+                    "Avg worst move",
+                    f"{summary['avg_worst']:+.1f}%"
+                    if np.isfinite(summary['avg_worst']) else "—"
+                )
+                r3.metric(
+                    "Avg 24H result",
+                    f"{summary['avg_end']:+.1f}%"
+                    if np.isfinite(summary['avg_end']) else "—"
+                )
+
+            st.markdown("### 📌 What this means in simple language")
+            if summary and summary["total"] >= 8:
+                if summary["continue_pct"] > summary["dump_pct"]:
+                    st.write(
+                        "Historically, similar setups more often continued than completely "
+                        "failed. However, the average best and worst moves show how wide the "
+                        "range of possible outcomes was. Do not treat the historical percentage "
+                        "as a guarantee."
+                    )
+                else:
+                    st.write(
+                        "Historically, similar setups struggled more often than they continued. "
+                        "This is a warning against chasing the move; waiting for confirmation "
+                        "is safer than assuming the historical pattern will repeat."
+                    )
+            else:
+                st.write(
+                    "There is not enough historical evidence yet. Treat this as an observation, "
+                    "not a prediction."
+                )
+
+            st.markdown("### 🧠 What pattern did the engine learn?")
+            if current["target"]:
+                for item in setup_description(current["target"]):
+                    st.write("• " + item)
+
+                st.write(
+                    "The engine compares this complete setup against historical setups using "
+                    "momentum, RSI, volume, volatility, EMA extension/alignment, candle shape "
+                    "and market structure. Similarity is a ranking mechanism, not a prediction."
+                )
+
+            st.markdown("### 👀 What to watch now")
+            for item in confirmation_text(current):
+                st.write("• " + item)
+
+            st.markdown("### 📊 7-Timeframe EMA picture")
+            ema_table=[]
+            for tf in ["1m","5m","15m","1H","4H","1D","1W"]:
+                r=current["ema_rows"].get(tf,{})
+                ema_table.append({
+                    "Timeframe":tf,
+                    "EMA20/50/100":r.get("state","NO DATA"),
+                    "Alignment":f"{r.get('count',0)}/3"
+                })
+            st.dataframe(pd.DataFrame(ema_table),use_container_width=True,hide_index=True)
+            st.write(
+                f"**Full 21-condition EMA alignment:** "
+                f"{current['bull']*3}/21 bullish conditions, "
+                f"{current['bear']*3}/21 bearish conditions."
+            )
 
             st.markdown("### 📌 What this means in simple language")
             if summary and summary["total"]>=8:
@@ -544,36 +1064,53 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
             else:
                 st.write("There is not enough historical evidence yet. Treat this as an observation, not a prediction.")
 
-            st.markdown("### 👀 What to watch now")
-            for item in confirmation_text(current):
-                st.write("• "+item)
-
-            st.markdown("### 📊 7-Timeframe EMA picture")
-            ema_table=[]
-            for tf in ["1m","5m","15m","1H","4H","1D","1W"]:
-                r=current["ema_rows"].get(tf,{})
-                ema_table.append({"Timeframe":tf,"EMA20/50/100":r.get("state","NO DATA"),"Alignment":f"{r.get('count',0)}/3"})
-            st.dataframe(pd.DataFrame(ema_table),use_container_width=True,hide_index=True)
-            st.write(f"**Full 21-condition EMA alignment:** {current['bull']*3}/21 bullish conditions, {current['bear']*3}/21 bearish conditions.")
-
             if matches:
                 st.markdown("### 🔎 Closest historical examples")
                 rows=[]
                 for sim,e in matches[:15]:
-                    f=e["features"]; o=e["outcome"]
+                    f=e["features"]
+                    o=e["outcome"]
                     rows.append({
-                        "Similarity":f"{sim:.0f}%","Coin":e.get("pair","—"),"Date":str(e["time"])[:16],
-                        "Pump 24 bars":f"{safe(f['ret24']):+.1f}%","RSI":f"{safe(f['rsi']):.0f}",
-                        "Volume":f"{safe(f['vol_ratio']):.1f}x","EMA stack":"Bullish" if f["ema_stack"]==1 else "Bearish" if f["ema_stack"]==-1 else "Mixed",
-                        "What happened":o["label"],"Next-period":f"{o['end']:+.1f}%"
+                        "Similarity":f"{sim:.0f}%",
+                        "Coin":e.get("pair","—"),
+                        "Date":str(e["time"])[:16],
+                        "24-bar move":f"{safe(f['ret24']):+.1f}%",
+                        "RSI":f"{safe(f['rsi']):.0f}",
+                        "Volume":f"{safe(f['vol_ratio']):.1f}x",
+                        "EMA20 dist":f"{safe(f['ema20_dist']):+.1f}%",
+                        "4H later":(
+                            f"{o['4H']['end']:+.1f}%"
+                            if o.get("4H") else "—"
+                        ),
+                        "12H later":(
+                            f"{o['12H']['end']:+.1f}%"
+                            if o.get("12H") else "—"
+                        ),
+                        "24H later":(
+                            f"{o['24H']['end']:+.1f}%"
+                            if o.get("24H") else "—"
+                        ),
+                        "Best":(
+                            f"{o['24H']['best']:+.1f}%"
+                            if o.get("24H") else "—"
+                        ),
+                        "Worst":(
+                            f"{o['24H']['worst']:+.1f}%"
+                            if o.get("24H") else "—"
+                        ),
+                        "What happened":o["24H_path"]["label"],
                     })
-                st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+                st.dataframe(
+                    pd.DataFrame(rows),
+                    use_container_width=True,
+                    hide_index=True
+                )
 
             with st.expander("Advanced details"):
                 st.write(f"**4H structure:** {current['structure4']} | **1D structure:** {current['structure1']} | **15m structure:** {current['structure15']}")
                 st.write(f"**4H ADX:** {safe(b4.adx):.1f} | **4H MACD:** {'Bullish' if safe(b4.macd)>safe(b4.macd_signal) else 'Bearish'}")
                 st.write(f"**Historical learning pool:** {len(pool)} events from {len(pairs_sig)} comparison contracts.")
-                st.write("The engine compares normalized historical conditions and then checks what happened in the following 24 four-hour candles. It does not guarantee future price movement.")
+                st.write("The engine compares normalized historical conditions across momentum, RSI, volume, EMA extension/alignment, volatility, candle shape and structure. It then measures what happened 4H, 12H and 24H after each historical match. It does not guarantee future price movement.")
                 if failures: st.code("\n".join(failures[:50]))
 
             # Save results in session state for optional further inspection.
