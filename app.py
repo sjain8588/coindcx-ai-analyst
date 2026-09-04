@@ -372,7 +372,8 @@ def scaled_distance(a, b):
     return float(np.sqrt(np.sum(z * weights) / np.sum(weights)))
 
 
-def event_outcome(x, i, horizon=24, direction="UP"):
+
+def event_outcome(x, i, horizon, direction="UP"):
     if i + 1 >= len(x):
         return None
 
@@ -384,12 +385,14 @@ def event_outcome(x, i, horizon=24, direction="UP"):
     if entry <= 0:
         return None
 
-    end_ret = (safe(future.iloc[-1].close) / entry - 1) * 100
-    best = (safe(future.high.max()) / entry - 1) * 100
-    worst = (safe(future.low.min()) / entry - 1) * 100
+    closes = future.close.astype(float)
+    highs = future.high.astype(float)
+    lows = future.low.astype(float)
 
-    # A setup can first continue and then reverse. Preserve both dimensions
-    # instead of reducing the whole future path to one number.
+    end_ret = (safe(closes.iloc[-1]) / entry - 1) * 100
+    best = (safe(highs.max()) / entry - 1) * 100
+    worst = (safe(lows.min()) / entry - 1) * 100
+
     if direction == "DOWN":
         if worst <= -10 and best < 12:
             label = "CONTINUED"
@@ -405,25 +408,88 @@ def event_outcome(x, i, horizon=24, direction="UP"):
         else:
             label = "SIDEWAYS / PULLBACK"
 
+    # Path metrics. These tell us whether the coin continued first and reversed
+    # later, which an endpoint-only model cannot see.
+    if direction == "UP":
+        mfe_idx = int(np.argmax(highs.values))
+        mae_idx = int(np.argmin(lows.values))
+        favorable = best
+        adverse = worst
+    else:
+        # For a DOWN event, favorable movement is negative and adverse movement
+        # is positive.
+        favorable = -worst
+        adverse = best
+        mfe_idx = int(np.argmin(lows.values))
+        mae_idx = int(np.argmax(highs.values))
+
+    path = {
+        "favorable": favorable,
+        "adverse": adverse,
+        "favorable_bar": mfe_idx + 1,
+        "adverse_bar": mae_idx + 1,
+        "end": end_ret,
+    }
+
     return {
         "end": end_ret,
         "best": best,
         "worst": worst,
         "label": label,
+        "path": path,
     }
 
 
 def multi_horizon_outcomes(x, i, direction="UP"):
     """
-    Store separate 4H, 12H and 24H results.
+    Measure the historical path at 4H, 8H, 12H and 24H.
 
-    The learning timeframe is 4H, so these correspond to 1, 3 and 6
+    Because the learning timeframe is 4H, these are 1, 2, 3 and 6
     completed 4H candles after the historical setup.
     """
     result = {}
-    for name, bars in [("4H", 1), ("12H", 3), ("24H", 6)]:
+
+    for name, bars in [
+        ("4H", 1),
+        ("8H", 2),
+        ("12H", 3),
+        ("24H", 6),
+    ]:
         result[name] = event_outcome(x, i, bars, direction)
-    result["24H_path"] = event_outcome(x, i, 6, direction)
+
+    # Full 24H path is used for the primary historical classification.
+    result["24H_path"] = result["24H"]
+
+    if result["24H"]:
+        p = result["24H"]["path"]
+
+        # Detect the important "another leg then reversal" pattern.
+        if direction == "UP":
+            another_leg = p["favorable"] >= 10
+            ended_lower = p["end"] <= 0
+            significant_reversal = (
+                p["favorable"] >= 15 and
+                p["end"] <= p["favorable"] - 15
+            )
+        else:
+            another_leg = p["favorable"] >= 10
+            ended_lower = p["end"] >= 0
+            significant_reversal = (
+                p["favorable"] >= 15 and
+                p["end"] >= -p["favorable"] + 15
+            )
+
+        if significant_reversal:
+            result["path_type"] = "SECOND LEG THEN REVERSAL"
+        elif another_leg and not ended_lower:
+            result["path_type"] = "CONTINUATION"
+        elif p["adverse"] >= 15:
+            result["path_type"] = "EARLY REJECTION"
+        else:
+            result["path_type"] = "CHOP / MIXED"
+    else:
+        result["path_type"] = "UNKNOWN"
+
     return result
 
 
@@ -758,6 +824,7 @@ def _weighted_percent(values, weights):
     return float(np.average(vals[mask], weights=w[mask]))
 
 
+
 def outcome_summary(matches):
     if not matches:
         return None
@@ -767,15 +834,21 @@ def outcome_summary(matches):
         for sim, _ in matches
     ])
 
-    labels = [
-        e["outcome"]["24H_path"]["label"]
-        for _, e in matches
+    usable = [
+        (idx, sim, e)
+        for idx, (sim, e) in enumerate(matches)
         if e.get("outcome") and e["outcome"].get("24H_path")
     ]
 
-    total = len(labels)
-    if total == 0:
+    if not usable:
         return None
+
+    labels = [
+        e["outcome"]["24H_path"]["label"]
+        for _, _, e in usable
+    ]
+
+    total = len(labels)
 
     counts = {
         k: labels.count(k)
@@ -788,11 +861,10 @@ def outcome_summary(matches):
     }
 
     def horizon_stats(h):
-        ends, bests, worsts = [], [], []
-        local_weights = []
+        ends, bests, worsts, local_weights = [], [], [], []
 
-        for idx, (_, e) in enumerate(matches):
-            o = e.get("outcome", {}).get(h)
+        for idx, sim, e in usable:
+            o = e["outcome"].get(h)
             if not o:
                 continue
 
@@ -807,6 +879,33 @@ def outcome_summary(matches):
             "worst": _weighted_mean(worsts, local_weights),
         }
 
+    path_types = [
+        e["outcome"].get("path_type", "UNKNOWN")
+        for _, _, e in usable
+    ]
+
+    path_counts = {
+        "SECOND LEG THEN REVERSAL": path_types.count("SECOND LEG THEN REVERSAL"),
+        "CONTINUATION": path_types.count("CONTINUATION"),
+        "EARLY REJECTION": path_types.count("EARLY REJECTION"),
+        "CHOP / MIXED": path_types.count("CHOP / MIXED"),
+    }
+
+    # Estimate when the strongest adverse move occurred.
+    reversal_bars = []
+    for _, _, e in usable:
+        p = e["outcome"]["24H_path"].get("path", {})
+        favorable = safe(p.get("favorable"))
+        adverse = safe(p.get("adverse"))
+
+        if favorable >= 15 and adverse >= 15:
+            reversal_bars.append(safe(p.get("adverse_bar")))
+
+    reversal_timing = (
+        float(np.mean(reversal_bars)) * 4
+        if reversal_bars else np.nan
+    )
+
     return {
         "total": total,
         "counts": counts,
@@ -814,15 +913,25 @@ def outcome_summary(matches):
         "dump_pct": counts["DUMPED"] / total * 100,
         "reverse_pct": counts["REVERSED / BOUNCED"] / total * 100,
         "side_pct": counts["SIDEWAYS / PULLBACK"] / total * 100,
+
+        "path_counts": path_counts,
+        "second_leg_pct": path_counts["SECOND LEG THEN REVERSAL"] / total * 100,
+        "path_continuation_pct": path_counts["CONTINUATION"] / total * 100,
+        "early_rejection_pct": path_counts["EARLY REJECTION"] / total * 100,
+        "chop_pct": path_counts["CHOP / MIXED"] / total * 100,
+        "reversal_timing_hours": reversal_timing,
+
         "4H": horizon_stats("4H"),
+        "8H": horizon_stats("8H"),
         "12H": horizon_stats("12H"),
         "24H": horizon_stats("24H"),
+
         "avg_end": horizon_stats("24H")["end"],
         "avg_best": horizon_stats("24H")["best"],
         "avg_worst": horizon_stats("24H")["worst"],
-        "median_similarity": float(np.median([sim for sim, _ in matches])),
-        "max_similarity": float(max(sim for sim, _ in matches)),
-        "min_similarity": float(min(sim for sim, _ in matches)),
+        "median_similarity": float(np.median([sim for _, sim, _ in usable])),
+        "max_similarity": float(max(sim for _, sim, _ in usable)),
+        "min_similarity": float(min(sim for _, sim, _ in usable)),
     }
 
 
@@ -856,12 +965,163 @@ def evidence_grade(summary):
     return "LIMITED"
 
 
+
+def risk_profile(summary, current):
+    """
+    Separate trend direction from exhaustion/reversal risk.
+
+    This prevents a weak sample from being converted directly into a strong
+    LONG/SHORT-style conclusion.
+    """
+    if not summary:
+        return {
+            "trend": "UNKNOWN",
+            "exhaustion": "UNKNOWN",
+            "immediate": "UNKNOWN",
+            "reversal_24h": "UNKNOWN",
+            "volatility": "UNKNOWN",
+        }
+
+    target = current.get("target") or {}
+    extreme = event_is_extreme(target)
+    rsi = safe(target.get("rsi"))
+    ema = safe(target.get("ema20_dist"))
+    accel = safe(target.get("acceleration"))
+
+    if current.get("event") in {"ATH BREAKOUT", "HOT / PUMP"}:
+        trend = (
+            "BULLISH" if current.get("bull", 0) >= current.get("bear", 0)
+            else "MIXED"
+        )
+    elif current.get("event") in {"ATL BREAKDOWN", "FAST DUMP"}:
+        trend = (
+            "BEARISH" if current.get("bear", 0) >= current.get("bull", 0)
+            else "MIXED"
+        )
+    else:
+        trend = "MIXED"
+
+    exhaustion_score = 0
+
+    if extreme:
+        exhaustion_score += 2
+    if np.isfinite(rsi) and rsi >= 85:
+        exhaustion_score += 2
+    elif np.isfinite(rsi) and rsi >= 75:
+        exhaustion_score += 1
+
+    if np.isfinite(ema) and abs(ema) >= 50:
+        exhaustion_score += 2
+    elif np.isfinite(ema) and abs(ema) >= 25:
+        exhaustion_score += 1
+
+    if np.isfinite(accel) and accel < -3 and trend == "BULLISH":
+        exhaustion_score += 2
+
+    exhaustion = (
+        "VERY HIGH" if exhaustion_score >= 6
+        else "HIGH" if exhaustion_score >= 4
+        else "MODERATE" if exhaustion_score >= 2
+        else "LOW"
+    )
+
+    # Immediate direction should remain unknown unless the short horizon has
+    # a meaningful historical edge.
+    h4 = summary["4H"]["end"]
+    h12 = summary["12H"]["end"]
+    h24 = summary["24H"]["end"]
+
+    if np.isfinite(h4) and abs(h4) >= 5:
+        immediate = "BULLISH" if h4 > 0 else "BEARISH"
+    else:
+        immediate = "UNKNOWN"
+
+    if summary["second_leg_pct"] >= 35:
+        reversal_24h = "HIGH"
+    elif summary["dump_pct"] >= 55 or summary["reverse_pct"] >= 55:
+        reversal_24h = "HIGH"
+    elif abs(h24) >= 8:
+        reversal_24h = "ELEVATED"
+    else:
+        reversal_24h = "UNKNOWN"
+
+    worst = abs(summary["avg_worst"]) if np.isfinite(summary["avg_worst"]) else 0
+    best = abs(summary["avg_best"]) if np.isfinite(summary["avg_best"]) else 0
+
+    volatility = (
+        "VERY HIGH" if max(best, worst) >= 30
+        else "HIGH" if max(best, worst) >= 20
+        else "MODERATE"
+    )
+
+    return {
+        "trend": trend,
+        "exhaustion": exhaustion,
+        "immediate": immediate,
+        "reversal_24h": reversal_24h,
+        "volatility": volatility,
+    }
+
+
+def simple_path_conclusion(summary, current):
+    if not summary or summary["total"] < 8:
+        return (
+            "There is not enough historical evidence to describe the likely path. "
+            "The scanner will not force a directional prediction."
+        )
+
+    risk = risk_profile(summary, current)
+
+    if summary["second_leg_pct"] >= 35:
+        return (
+            f"In {summary['second_leg_pct']:.0f}% of the comparable cases, the coin "
+            "made another meaningful move in the original direction before a "
+            "significant reversal. This means the danger may not be an immediate "
+            "dump; the larger historical risk is a delayed reversal after another leg."
+        )
+
+    if risk["exhaustion"] in {"HIGH", "VERY HIGH"} and summary["dump_pct"] >= 45:
+        return (
+            "The trend can remain bullish while the setup becomes increasingly "
+            "dangerous. Similar cases frequently experienced a large pullback, so "
+            "the historical evidence supports caution rather than chasing the move."
+        )
+
+    if summary["continue_pct"] >= 55:
+        return (
+            "Similar setups more often continued than failed. The historical path "
+            "still contained pullbacks, so continuation should not be interpreted "
+            "as a guarantee."
+        )
+
+    return (
+        "The historical paths are mixed. There is no strong enough directional "
+        "edge to treat the setup as a reliable long or short signal."
+    )
+
+
 def human_result(summary, current):
     if not summary or summary["total"] < 8:
         return (
             "🟡 NOT ENOUGH EVIDENCE",
             "I found too few similar historical situations. "
             "The tool should not pretend it knows what happens next."
+        )
+
+    # A strong label requires both enough observations and reasonable match quality.
+    # A nine-case sample with 39% median similarity is therefore not promoted to
+    # HIGH DUMP RISK simply because most examples happened to fall.
+    if (
+        summary["total"] < 12
+        or summary["median_similarity"] < 48
+    ):
+        return (
+            "🟠 LIMITED HISTORICAL EDGE",
+            f"I found {summary['total']} comparable cases, but the historical "
+            f"match quality is limited (median similarity "
+            f"{summary['median_similarity']:.0f}%). The results can still show "
+            "risk and historical behavior, but they are not strong enough for a "
+            "high-confidence directional call."
         )
 
     c = summary["continue_pct"]
@@ -1220,6 +1480,141 @@ def merge_learning_pools(*pools):
 # =============================================================================
 # SIMPLE PREDICTION LANGUAGE
 # =============================================================================
+
+def risk_profile(summary, current):
+    """
+    Separate trend direction from exhaustion/reversal risk.
+
+    This prevents a weak sample from being converted directly into a strong
+    LONG/SHORT-style conclusion.
+    """
+    if not summary:
+        return {
+            "trend": "UNKNOWN",
+            "exhaustion": "UNKNOWN",
+            "immediate": "UNKNOWN",
+            "reversal_24h": "UNKNOWN",
+            "volatility": "UNKNOWN",
+        }
+
+    target = current.get("target") or {}
+    extreme = event_is_extreme(target)
+    rsi = safe(target.get("rsi"))
+    ema = safe(target.get("ema20_dist"))
+    accel = safe(target.get("acceleration"))
+
+    if current.get("event") in {"ATH BREAKOUT", "HOT / PUMP"}:
+        trend = (
+            "BULLISH" if current.get("bull", 0) >= current.get("bear", 0)
+            else "MIXED"
+        )
+    elif current.get("event") in {"ATL BREAKDOWN", "FAST DUMP"}:
+        trend = (
+            "BEARISH" if current.get("bear", 0) >= current.get("bull", 0)
+            else "MIXED"
+        )
+    else:
+        trend = "MIXED"
+
+    exhaustion_score = 0
+
+    if extreme:
+        exhaustion_score += 2
+    if np.isfinite(rsi) and rsi >= 85:
+        exhaustion_score += 2
+    elif np.isfinite(rsi) and rsi >= 75:
+        exhaustion_score += 1
+
+    if np.isfinite(ema) and abs(ema) >= 50:
+        exhaustion_score += 2
+    elif np.isfinite(ema) and abs(ema) >= 25:
+        exhaustion_score += 1
+
+    if np.isfinite(accel) and accel < -3 and trend == "BULLISH":
+        exhaustion_score += 2
+
+    exhaustion = (
+        "VERY HIGH" if exhaustion_score >= 6
+        else "HIGH" if exhaustion_score >= 4
+        else "MODERATE" if exhaustion_score >= 2
+        else "LOW"
+    )
+
+    # Immediate direction should remain unknown unless the short horizon has
+    # a meaningful historical edge.
+    h4 = summary["4H"]["end"]
+    h12 = summary["12H"]["end"]
+    h24 = summary["24H"]["end"]
+
+    if np.isfinite(h4) and abs(h4) >= 5:
+        immediate = "BULLISH" if h4 > 0 else "BEARISH"
+    else:
+        immediate = "UNKNOWN"
+
+    if summary["second_leg_pct"] >= 35:
+        reversal_24h = "HIGH"
+    elif summary["dump_pct"] >= 55 or summary["reverse_pct"] >= 55:
+        reversal_24h = "HIGH"
+    elif abs(h24) >= 8:
+        reversal_24h = "ELEVATED"
+    else:
+        reversal_24h = "UNKNOWN"
+
+    worst = abs(summary["avg_worst"]) if np.isfinite(summary["avg_worst"]) else 0
+    best = abs(summary["avg_best"]) if np.isfinite(summary["avg_best"]) else 0
+
+    volatility = (
+        "VERY HIGH" if max(best, worst) >= 30
+        else "HIGH" if max(best, worst) >= 20
+        else "MODERATE"
+    )
+
+    return {
+        "trend": trend,
+        "exhaustion": exhaustion,
+        "immediate": immediate,
+        "reversal_24h": reversal_24h,
+        "volatility": volatility,
+    }
+
+
+def simple_path_conclusion(summary, current):
+    if not summary or summary["total"] < 8:
+        return (
+            "There is not enough historical evidence to describe the likely path. "
+            "The scanner will not force a directional prediction."
+        )
+
+    risk = risk_profile(summary, current)
+
+    if summary["second_leg_pct"] >= 35:
+        return (
+            f"In {summary['second_leg_pct']:.0f}% of the comparable cases, the coin "
+            "made another meaningful move in the original direction before a "
+            "significant reversal. This means the danger may not be an immediate "
+            "dump; the larger historical risk is a delayed reversal after another leg."
+        )
+
+    if risk["exhaustion"] in {"HIGH", "VERY HIGH"} and summary["dump_pct"] >= 45:
+        return (
+            "The trend can remain bullish while the setup becomes increasingly "
+            "dangerous. Similar cases frequently experienced a large pullback, so "
+            "the historical evidence supports caution rather than chasing the move."
+        )
+
+    if summary["continue_pct"] >= 55:
+        return (
+            "Similar setups more often continued than failed. The historical path "
+            "still contained pullbacks, so continuation should not be interpreted "
+            "as a guarantee."
+        )
+
+    return (
+        "The historical paths are mixed. There is no strong enough directional "
+        "edge to treat the setup as a reliable long or short signal."
+    )
+
+
 def human_result(summary, current):
     if not summary or summary["total"]<8:
         return "🟡 NOT ENOUGH EVIDENCE", "I found too few similar historical situations. The tool should not pretend it knows what happens next."
@@ -1360,18 +1755,23 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                 )
 
                 st.markdown("#### 📈 What happened after similar setups?")
-                h1, h2, h3 = st.columns(3)
+                h1, h2, h3, h4 = st.columns(4)
                 h1.metric(
                     "After 4H",
                     f"{summary['4H']['end']:+.1f}%"
                     if np.isfinite(summary['4H']['end']) else "—"
                 )
                 h2.metric(
+                    "After 8H",
+                    f"{summary['8H']['end']:+.1f}%"
+                    if np.isfinite(summary['8H']['end']) else "—"
+                )
+                h3.metric(
                     "After 12H",
                     f"{summary['12H']['end']:+.1f}%"
                     if np.isfinite(summary['12H']['end']) else "—"
                 )
-                h3.metric(
+                h4.metric(
                     "After 24H",
                     f"{summary['24H']['end']:+.1f}%"
                     if np.isfinite(summary['24H']['end']) else "—"
@@ -1382,6 +1782,29 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                 b.metric("Sideways / Pullback", f"{summary['side_pct']:.0f}%")
                 c.metric("Dumped", f"{summary['dump_pct']:.0f}%")
                 d.metric("Strong bounce/reversal", f"{summary['reverse_pct']:.0f}%")
+
+                st.markdown("#### 🛣️ Historical price path")
+                p1, p2, p3, p4 = st.columns(4)
+                p1.metric(
+                    "Second leg → reversal",
+                    f"{summary['second_leg_pct']:.0f}%"
+                )
+                p2.metric(
+                    "Clean continuation",
+                    f"{summary['path_continuation_pct']:.0f}%"
+                )
+                p3.metric(
+                    "Early rejection",
+                    f"{summary['early_rejection_pct']:.0f}%"
+                )
+                p4.metric(
+                    "Avg reversal timing",
+                    (
+                        f"{summary['reversal_timing_hours']:.0f}H"
+                        if np.isfinite(summary['reversal_timing_hours'])
+                        else "—"
+                    )
+                )
 
                 st.markdown("#### 📊 Historical range of outcomes")
                 r1, r2, r3 = st.columns(3)
@@ -1402,27 +1825,18 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                 )
 
             st.markdown("### 📌 What this means in simple language")
+            st.write(simple_path_conclusion(summary, current))
+
             if summary and summary["total"] >= 8:
-                if summary["continue_pct"] > summary["dump_pct"]:
-                    st.write(
-                        "Historically, similar setups more often continued than completely "
-                        "failed. However, the average best and worst moves show how wide the "
-                        "range of possible outcomes was. Do not treat the historical percentage "
-                        "as a guarantee."
-                    )
-                else:
-                    st.write(
-                        "Historically, similar setups struggled more often than they continued. "
-                        "This is a warning against chasing the move; waiting for confirmation "
-                        "is safer than assuming the historical pattern will repeat."
-                    )
-            else:
-                st.write(
-                    "There is not enough historical evidence yet. The scanner searched "
-                    "multiple behavioral regimes and historical pools, but did not find "
-                    "enough sufficiently similar completed examples. Treat this as an "
-                    "observation, not a prediction."
-                )
+                risk = risk_profile(summary, current)
+
+                st.markdown("### 🎯 Trend vs. risk")
+                rr1, rr2, rr3, rr4, rr5 = st.columns(5)
+                rr1.metric("Trend", risk["trend"])
+                rr2.metric("Exhaustion", risk["exhaustion"])
+                rr3.metric("Immediate", risk["immediate"])
+                rr4.metric("24H reversal risk", risk["reversal_24h"])
+                rr5.metric("Volatility", risk["volatility"])
 
             st.markdown("### 🧠 What pattern did the engine learn?")
             if current["target"]:
@@ -1492,6 +1906,7 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                             f"{o['24H']['end']:+.1f}%"
                             if o.get("24H") else "—"
                         ),
+                        "Path":o.get("path_type","—"),
                         "Best":(
                             f"{o['24H']['best']:+.1f}%"
                             if o.get("24H") else "—"
