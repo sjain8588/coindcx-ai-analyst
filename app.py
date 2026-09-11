@@ -2190,46 +2190,132 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
         st.error(f"Analysis failed: {type(e).__name__}: {e}")
 
 # =============================================================================
-# CURRENT HOT / ATH / ATL DISCOVERY
+# CURRENT HOT / ATH / ATL DISCOVERY — V5.2
 # =============================================================================
 st.divider()
 st.header("🔥 Hot / ATH / ATL Discovery")
-st.caption("Find current movers first. Copy a coin into Analyze a Coin for the deeper V5 study.")
+st.caption("Scans the live CoinDCX Futures universe and identifies hot movers, historical-high breakouts, near-ATH coins, ATL breakdowns and near-ATL coins.")
+
+def discovery_event(pair, symbol, price_info, margin):
+    """Return a robust current discovery record for one futures contract."""
+    cur = current_price(price_info)
+    pc = safe(price_info.get("pc", 0), 0)
+    if cur <= 0:
+        return None
+
+    # Use completed 4H candles for the primary discovery window. This catches
+    # intraday ATH/ATL events that a 1D-only scan can miss.
+    d4 = get_tf(pair, "4H", 260)
+    dc4 = completed(d4)
+    if dc4 is None or len(dc4) < 60:
+        return None
+
+    # Use the longest practical daily history as a second, broader reference.
+    d1 = get_tf(pair, "1D", 700)
+    dc1 = completed(d1)
+
+    hist4 = dc4
+    hist1 = dc1 if dc1 is not None and len(dc1) >= 30 else dc4
+
+    ath4 = safe(hist4.high.max())
+    atl4 = safe(hist4.low.min())
+    ath1 = safe(hist1.high.max())
+    atl1 = safe(hist1.low.min())
+
+    # Treat the broader daily record as the primary ATH/ATL reference, while
+    # retaining the 4H reference so recent intraday extremes are visible.
+    ath = max(v for v in (ath4, ath1) if np.isfinite(v) and v > 0)
+    atl = min(v for v in (atl4, atl1) if np.isfinite(v) and v > 0)
+    ath_dist = (cur / ath - 1) * 100 if ath > 0 else np.nan
+    atl_dist = (cur / atl - 1) * 100 if atl > 0 else np.nan
+
+    # 4H momentum gives a more useful "hot" signal than relying only on the
+    # exchange 24h field when that field is missing or stale.
+    ret24_4h = np.nan
+    if len(dc4) >= 7:
+        base = safe(dc4.iloc[-7].close)
+        if base > 0:
+            ret24_4h = (cur / base - 1) * 100
+    momentum24 = pc if np.isfinite(pc) else ret24_4h
+
+    ind4 = indicators(dc4)
+    last = ind4.iloc[-1]
+
+    # Priority: true historical breakout/breakdown > near extreme > hot/dump.
+    # A 4H intraday breakout is included when live price has crossed the
+    # historical daily/4H extreme.
+    if cur > ath:
+        tag = "🔥 ATH BREAKOUT"
+    elif ath_dist >= -3:
+        tag = "🟢 NEAR ATH"
+    elif cur < atl:
+        tag = "🩸 ATL BREAKDOWN"
+    elif atl_dist <= 3:
+        tag = "🟠 NEAR ATL"
+    elif np.isfinite(momentum24) and momentum24 >= 15:
+        tag = "🚀 HOT"
+    elif np.isfinite(momentum24) and momentum24 <= -15:
+        tag = "🔻 FAST DUMP"
+    else:
+        return None
+
+    return {
+        "Coin": symbol,
+        "Pair": pair,
+        "Price": fmt(cur),
+        "24h": f"{momentum24:+.2f}%" if np.isfinite(momentum24) else "—",
+        "ATH distance": f"{ath_dist:+.2f}%" if np.isfinite(ath_dist) else "—",
+        "ATL distance": f"{atl_dist:+.2f}%" if np.isfinite(atl_dist) else "—",
+        "RSI": f"{safe(last.rsi):.1f}" if pd.notna(last.rsi) else "—",
+        "Volume": f"{safe(last.vol_ratio):.1f}x" if pd.notna(last.vol_ratio) else "—",
+        "Event": tag,
+    }
+
 if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
     try:
-        with st.spinner("Reading current CoinDCX Futures prices..."):
-            prices=futures_prices(); rows=[]; active=active_instruments(margin)
+        with st.spinner("Scanning live CoinDCX Futures + historical extremes..."):
+            prices = futures_prices()
+            active = active_instruments(margin)
+            candidates = []
+            failures = []
+
             for pair in active:
-                p=prices.get(pair)
-                if not p: continue
-                symbol=str(p.get("mkt",pair)).upper(); cur=current_price(p); pc=safe(p.get("pc",0),0)
-                if cur<=0: continue
-                if meme_only and not any(w in symbol or w in pair.upper() for w in MEME_WORDS): continue
-                rows.append((pair,p,symbol,pc,cur))
-            rows.sort(key=lambda z:abs(z[3]),reverse=True)
-            out=[]; failures=[]
-            for pair,p,symbol,pc,cur in rows[:min(peer_limit,80)]:
                 try:
-                    d=get_tf(pair,"1D",700); dc=completed(d)
-                    if len(dc)<30: continue
-                    prior_ath=safe(dc.iloc[:-1].high.max()); prior_atl=safe(dc.iloc[:-1].low.min())
-                    ath_dist=(cur/prior_ath-1)*100 if prior_ath>0 else np.nan
-                    atl_dist=(cur/prior_atl-1)*100 if prior_atl>0 else np.nan
-                    ind=indicators(dc); last=ind.iloc[-1]; tag=None
-                    if ath_dist>0: tag="🔥 ATH BREAKOUT"
-                    elif ath_dist>=-5: tag="🟢 NEAR ATH"
-                    elif atl_dist<0: tag="🩸 ATL BREAKDOWN"
-                    elif atl_dist<=5: tag="🟠 NEAR ATL"
-                    elif pc>=15: tag="🚀 HOT"
-                    elif pc<=-15: tag="🔻 FAST DUMP"
-                    if tag:
-                        out.append({"Coin":symbol,"Price":fmt(cur),"24h":f"{pc:+.2f}%","ATH distance":f"{ath_dist:+.2f}%","ATL distance":f"{atl_dist:+.2f}%","RSI":f"{safe(last.rsi):.1f}" if pd.notna(last.rsi) else "—","Volume":f"{safe(last.vol_ratio):.1f}x" if pd.notna(last.vol_ratio) else "—","Event":tag})
+                    p = prices.get(pair)
+                    if not p:
+                        # Be tolerant of API key/casing differences.
+                        p = prices.get(str(pair).upper()) or prices.get(str(pair).lower())
+                    if not p:
+                        continue
+
+                    symbol = str(p.get("mkt", pair)).upper()
+                    if meme_only and not any(w in symbol or w in pair.upper() for w in MEME_WORDS):
+                        continue
+
+                    rec = discovery_event(pair, symbol, p, margin)
+                    if rec:
+                        candidates.append(rec)
                 except Exception as exc:
-                    failures.append(f"{symbol}: {type(exc).__name__}: {exc}")
-            if out: st.dataframe(pd.DataFrame(out),use_container_width=True,hide_index=True)
-            else: st.warning("No current hot/ATH/ATL candidates were found in the scanned universe.")
+                    failures.append(f"{pair}: {type(exc).__name__}: {exc}")
+
+            # Put actionable extremes first, then strongest movers.
+            rank = {
+                "🔥 ATH BREAKOUT": 0, "🩸 ATL BREAKDOWN": 0,
+                "🟢 NEAR ATH": 1, "🟠 NEAR ATL": 1,
+                "🚀 HOT": 2, "🔻 FAST DUMP": 2,
+            }
+            candidates.sort(key=lambda r: (rank.get(r["Event"], 9), -abs(safe(r["24h"].replace("%", ""), 0))))
+            out = candidates[:min(max(peer_limit, 50), 150)]
+
+            if out:
+                st.success(f"Found {len(candidates)} current discovery candidates across {len(active)} active {margin} Futures contracts.")
+                st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
+            else:
+                st.warning("No current hot/ATH/ATL candidates were found. Open Scan diagnostics below to check CoinDCX history/API coverage.")
+
             if failures:
-                with st.expander("Scan diagnostics"): st.code("\n".join(failures[:50]))
+                with st.expander(f"Scan diagnostics ({len(failures)} contracts with errors)"):
+                    st.code("\n".join(failures[:100]))
     except Exception as e:
         st.error(f"Discovery scan failed: {type(e).__name__}: {e}")
 
