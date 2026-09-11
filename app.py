@@ -1850,20 +1850,29 @@ outcome_summary = v5_outcome_summary
 def short_term_state(current):
     d=current.get("tf_data",{}).get("15m")
     if d is None or len(d)<30:
-        return {"state":"NO DATA","score":0,"reversal_confirmed":False,"reasons":[]}
+        return {"state":"NO DATA","score":0,"reversal_confirmed":False,
+                "reversal_score":0,"reversal_stage":"UNKNOWN","reasons":[],"reversal_reasons":[]}
     x=indicators(completed(d))
     if len(x)<25:
-        return {"state":"NO DATA","score":0,"reversal_confirmed":False,"reasons":[]}
+        return {"state":"NO DATA","score":0,"reversal_confirmed":False,
+                "reversal_score":0,"reversal_stage":"UNKNOWN","reasons":[],"reversal_reasons":[]}
+
     r=x.iloc[-1]
     close=safe(r.close); ema20=safe(r.ema20); ema50=safe(r.ema50); ema100=safe(r.ema100)
     adx=safe(r.adx); macd=safe(r.macd); sig=safe(r.macd_signal); vol=safe(r.vol_ratio); rsi=safe(r.rsi)
     slope20=((safe(x.iloc[-1].ema20)/safe(x.iloc[-5].ema20))-1)*100 if safe(x.iloc[-5].ema20)>0 else np.nan
+
     recent=x.tail(8); prior=x.iloc[-16:-8]
     hh=recent.high.max()>prior.high.max() if not prior.empty else False
     hl=recent.low.min()>prior.low.min() if not prior.empty else False
+    lower_high=(recent.high.max()<prior.high.max()) if not prior.empty else False
+    lower_low=(recent.low.min()<prior.low.min()) if not prior.empty else False
     recent_high=safe(x.tail(24).high.max())
     pullback=(close/recent_high-1)*100 if recent_high>0 else np.nan
 
+    # -------------------------------------------------------------------------
+    # CONTINUATION SCORE (0-100)
+    # -------------------------------------------------------------------------
     score=0; reasons=[]
     if close>ema20: score+=20; reasons.append("15m price is above EMA20")
     if ema20>ema50: score+=15; reasons.append("15m EMA20 is above EMA50")
@@ -1874,32 +1883,77 @@ def short_term_state(current):
     if hh and hl: score+=15; reasons.append("recent candles are making higher highs/higher lows")
     if np.isfinite(vol) and vol>=1: score+=5; reasons.append("volume is supporting the move")
 
-    # Do not call an overbought coin a reversal until the short-term structure
-    # actually breaks. This is deliberately conservative.
-    below20=close<ema20
-    below50=close<ema50
+    # -------------------------------------------------------------------------
+    # REVERSAL SCORE (0-100)
+    # A single EMA break is NOT enough. We require several independent pieces
+    # of evidence before using the strong "REVERSAL CONFIRMED" label.
+    # -------------------------------------------------------------------------
+    below20=np.isfinite(close) and np.isfinite(ema20) and close<ema20
+    below50=np.isfinite(close) and np.isfinite(ema50) and close<ema50
+    ema_bear_stack=np.isfinite(ema20) and np.isfinite(ema50) and ema20<ema50
     slope_down=np.isfinite(slope20) and slope20<-0.10
-    lower_structure=(not hh) and (recent.low.min()<prior.low.min() if not prior.empty else False)
+    macd_bearish=np.isfinite(macd) and np.isfinite(sig) and macd<sig
+    volume_confirmation=np.isfinite(vol) and vol>=1.30
     four_h=current.get("4h")
-    four_h_break=(safe(four_h.close)<safe(four_h.ema20)) if four_h is not None else False
-    reversal_confirmed = (below20 and slope_down and lower_structure) or (below50 and four_h_break)
+    four_h_below20=(safe(four_h.close)<safe(four_h.ema20)) if four_h is not None else False
+
+    reversal_score=0; reversal_reasons=[]
+    if below20:
+        reversal_score+=15; reversal_reasons.append("15m price is below EMA20")
+    if below50:
+        reversal_score+=20; reversal_reasons.append("15m price is below EMA50")
+    if ema_bear_stack:
+        reversal_score+=10; reversal_reasons.append("15m EMA20 is below EMA50")
+    if slope_down:
+        reversal_score+=10; reversal_reasons.append(f"EMA20 slope is falling ({slope20:+.2f}%)")
+    if lower_high:
+        reversal_score+=15; reversal_reasons.append("15m has formed a lower high")
+    if lower_low:
+        reversal_score+=15; reversal_reasons.append("15m has formed a lower low")
+    if macd_bearish:
+        reversal_score+=5; reversal_reasons.append("MACD is bearish")
+    if volume_confirmation:
+        reversal_score+=5; reversal_reasons.append(f"volume confirms weakness ({vol:.1f}x average)")
+    if four_h_below20:
+        reversal_score+=5; reversal_reasons.append("4H price is below EMA20")
+
+    # Strong confirmation requires a genuine price-structure break plus
+    # supporting momentum/EMA evidence.  This prevents a single 4H EMA break
+    # from overriding a still-bullish 15m market.
+    structure_break = lower_high and lower_low
+    momentum_confirmation = (slope_down and (below50 or ema_bear_stack)) or (macd_bearish and below20)
+    reversal_confirmed = (
+        reversal_score>=65
+        and structure_break
+        and momentum_confirmation
+    )
 
     if reversal_confirmed:
+        reversal_stage="CONFIRMED"
         state="REVERSAL CONFIRMED"
+    elif reversal_score>=45:
+        reversal_stage="DEVELOPING"
+        state="REVERSAL DEVELOPING"
     elif score>=70:
+        reversal_stage="NONE"
         state="STRONG CONTINUATION"
     elif score>=50:
+        reversal_stage="NONE"
         state="BULLISH / CONTINUATION"
     else:
+        reversal_stage="WATCH"
         state="WEAK / WAIT"
 
     return {
         "state":state,"score":score,"reversal_confirmed":reversal_confirmed,
+        "reversal_score":reversal_score,"reversal_stage":reversal_stage,
         "close":close,"ema20":ema20,"ema50":ema50,"ema100":ema100,
         "adx":adx,"macd":macd,"signal":sig,"volume":vol,"rsi":rsi,
         "ema20_slope":slope20,"pullback":pullback,"higher_highs":hh,"higher_lows":hl,
-        "reasons":reasons,
-        "break_ema20":below20,"break_ema50":below50,"lower_structure":lower_structure,
+        "lower_high":lower_high,"lower_low":lower_low,
+        "reasons":reasons,"reversal_reasons":reversal_reasons,
+        "break_ema20":below20,"break_ema50":below50,
+        "ema_bear_stack":ema_bear_stack,"four_h_below20":four_h_below20,
     }
 
 
@@ -1911,14 +1965,25 @@ def v5_decision(summary,current):
     enough=bool(summary and summary.get("total",0)>=8)
     quality=(summary.get("median_similarity",0)>=48) if summary else False
 
+    # A confirmed reversal always requires the dedicated multi-confirmation gate.
+    if st15["reversal_confirmed"]:
+        if down:
+            return "🔴 DOWN MOVE CONFIRMED", "The short-term bearish structure is confirmed by multiple independent signals and has not shown a strong reversal."
+        return "🔴 REVERSAL CONFIRMED", "The short-term structure has broken with multiple confirmations: lower-high/lower-low price action plus bearish EMA/momentum evidence."
+
+    # Reversal is developing, but not yet strong enough to call confirmed.
+    if st15["reversal_stage"]=="DEVELOPING":
+        return "🟠 REVERSAL DEVELOPING", (
+            f"The short-term structure is weakening (reversal score {st15['reversal_score']}/100), "
+            "but the confirmation threshold has not been reached. Avoid treating an EMA break alone as a confirmed reversal."
+        )
+
     if down:
-        if st15["reversal_confirmed"]:
-            return "🔴 DOWN MOVE CONFIRMED", "The short-term structure is still bearish and has not shown a strong reversal."
         return "🟡 DOWN TREND / WAIT", "The coin is weak, but the short-term structure is not strong enough to claim the next move with confidence."
 
-    # Most important v5 rule: extreme + bullish structure + no break = continuation
-    # mode, even if RSI/extension is very high.
-    if extreme and not st15["reversal_confirmed"] and st15["score"]>=65:
+    # Most important V5 rule: extreme + intact short-term structure =
+    # continuation mode, even when the coin is extended.
+    if extreme and st15["reversal_score"]<45 and st15["score"]>=65:
         if summary and summary.get("second_leg_pct",0)>=30:
             return "🚀 CONTINUATION MODE — DELAYED REVERSAL RISK", (
                 "The coin is extremely extended, but its short-term trend is still intact. "
@@ -1926,12 +1991,7 @@ def v5_decision(summary,current):
             )
         return "🚀 CONTINUATION MODE — REVERSAL NOT CONFIRMED", (
             "The coin is very extended, but the short-term bullish structure is still intact. "
-            "High RSI alone is not treated as a reversal signal."
-        )
-
-    if st15["reversal_confirmed"]:
-        return "🔴 REVERSAL CONFIRMED", (
-            "The short-term structure has actually broken: price/EMA structure and price action now support a reversal."
+            "High RSI or an EMA displacement alone is not treated as a reversal signal."
         )
 
     if enough and quality and summary.get("continue_pct",0)>=58 and summary.get("continue_pct",0)-summary.get("dump_pct",0)>=15:
@@ -1946,31 +2006,41 @@ def v5_simple_language(summary,current,decision_title):
     rsi=safe(target.get("rsi")); ema=safe(target.get("ema20_dist"))
     lines=[]
     if decision_title.startswith("🚀"):
-        lines.append("The important point: this coin is still pumping because the trend has not broken.")
-        lines.append("Being overbought or far above EMA20 does NOT automatically mean the next candle must dump.")
+        lines.append("The important point: this coin is still pumping because the short-term trend has not broken enough to confirm a reversal.")
+        lines.append("Being overbought or far from EMA20 does NOT automatically mean the next move must dump.")
         if summary and summary.get("second_leg_pct",0)>=30:
-            lines.append(f"Historical matches show a delayed pattern in about {summary['second_leg_pct']:.0f}% of cases: another leg up first, reversal later.")
-        lines.append("Watch for a real 15m structure break before treating this as a reversal.")
+            lines.append(f"Historical matches show a delayed pattern in about {summary['second_leg_pct']:.0f}% of cases: another leg first, reversal later.")
+        lines.append("Watch for lower highs + lower lows and bearish momentum before treating this as a confirmed reversal.")
     elif decision_title.startswith("🔴"):
-        lines.append("This is different from simply being overbought: the short-term structure has actually started breaking.")
-        lines.append("A reversal signal becomes more meaningful when price loses EMA20/EMA50 and starts making lower highs/lows.")
+        lines.append("This is different from simply being overbought: multiple short-term reversal conditions have now aligned.")
+        lines.append("The strongest confirmation is a lower high + lower low together with bearish EMA/momentum evidence.")
+    elif decision_title.startswith("🟠"):
+        lines.append("The short-term trend is weakening, but the reversal is still developing rather than fully confirmed.")
+        lines.append("A single EMA break is not enough; wait for lower-high/lower-low structure and supporting momentum.")
     else:
         lines.append("The trend is not enough by itself to predict the next candle. Wait for confirmation rather than guessing.")
     if np.isfinite(rsi): lines.append(f"Current RSI: {rsi:.1f}.")
     if np.isfinite(ema): lines.append(f"Price vs EMA20: {ema:+.1f}%.")
     lines.append(f"15m state: {s15['state']} ({s15['score']}/100).")
+    lines.append(f"Reversal score: {s15['reversal_score']}/100 ({s15['reversal_stage']}).")
     return lines
 
 
 def confirmation_text_v5(current):
     s=short_term_state(current); out=[]
-    out.extend(s.get("reasons",[])[:6])
+    out.extend(s.get("reasons",[])[:4])
+    out.extend(s.get("reversal_reasons",[])[:6])
     if s["reversal_confirmed"]:
-        out.append("⚠️ Reversal confirmation is active on the short-term structure.")
+        out.append("🔴 Reversal confirmation is active: the multi-confirmation gate has been passed.")
+    elif s["reversal_stage"]=="DEVELOPING":
+        out.append("🟠 Reversal is developing, but confirmation is not complete yet.")
+        out.append("⚠️ Wait for lower high + lower low and bearish momentum/EMA confirmation.")
     else:
         out.append("🟢 No confirmed short-term reversal yet.")
-        out.append("⚠️ If price breaks 15m EMA20/EMA50 and starts making lower highs/lows, reassess the pump.")
+        out.append("⚠️ Reassess if price breaks EMA20/EMA50 and begins making lower highs/lower lows.")
     return out
+
+confirmation_text=confirmation_text_v5
 
 confirmation_text=confirmation_text_v5
 
@@ -1983,7 +2053,7 @@ st.caption("Learns from historical CoinDCX Futures behavior and separates active
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
 meme_only=st.checkbox("Use meme-focused learning universe",value=False)
 peer_limit=st.slider("Historical comparison universe",20,150,100,10,help="More contracts provide more historical examples but require more CoinDCX API calls.")
-st.info("V5 rule: an extreme pump is NOT treated as an immediate short. The scanner checks whether the short-term trend is still intact and whether a real reversal has been confirmed.")
+st.info("V5 rule: an extreme pump is NOT treated as an immediate short. Reversal now requires multiple confirmations; EMA weakness alone moves the setup to REVERSAL DEVELOPING, not REVERSAL CONFIRMED.")
 
 st.divider()
 st.header("🔎 Analyze a Coin")
@@ -2036,18 +2106,19 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
 
             s15=short_term_state(current)
             st.markdown("### 📱 What is happening RIGHT NOW? (15-minute)")
-            q1,q2,q3,q4,q5=st.columns(5)
+            q1,q2,q3,q4,q5,q6=st.columns(6)
             q1.metric("15m state",s15["state"])
             q2.metric("Trend score",f"{s15['score']}/100")
-            q3.metric("ADX",f"{s15['adx']:.1f}" if np.isfinite(s15['adx']) else "—")
-            q4.metric("EMA20 slope",f"{s15['ema20_slope']:+.2f}%" if np.isfinite(s15['ema20_slope']) else "—")
-            q5.metric("Pullback from 24-bar high",f"{s15['pullback']:+.1f}%" if np.isfinite(s15['pullback']) else "—")
+            q3.metric("Reversal score",f"{s15['reversal_score']}/100")
+            q4.metric("ADX",f"{s15['adx']:.1f}" if np.isfinite(s15['adx']) else "—")
+            q5.metric("EMA20 slope",f"{s15['ema20_slope']:+.2f}%" if np.isfinite(s15['ema20_slope']) else "—")
+            q6.metric("Pullback from 24-bar high",f"{s15['pullback']:+.1f}%" if np.isfinite(s15['pullback']) else "—")
 
             st.markdown("### 🧭 Trend vs. reversal")
             t1,t2,t3,t4=st.columns(4)
             t1.metric("Current trend", "BULLISH" if current["bull"]>=current["bear"] else "MIXED")
             t2.metric("Momentum", "EXTREME" if event_is_extreme(current["target"]) else "NORMAL")
-            t3.metric("Reversal confirmed", "YES" if s15["reversal_confirmed"] else "NO")
+            t3.metric("Reversal stage",s15["reversal_stage"])
             t4.metric("15m structure",current.get("structure15","Mixed"))
 
             if summary:
@@ -2109,7 +2180,7 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
 
             with st.expander("Advanced details"):
                 st.write(f"**4H structure:** {current['structure4']} | **1D:** {current['structure1']} | **15m:** {current['structure15']}")
-                st.write(f"**15m:** ADX {s15['adx']:.1f} | MACD {'Bullish' if s15['macd']>s15['signal'] else 'Bearish'} | EMA20 slope {s15['ema20_slope']:+.2f}%" if np.isfinite(s15['adx']) else "15m indicators unavailable")
+                st.write(f"**15m:** ADX {s15['adx']:.1f} | MACD {'Bullish' if s15['macd']>s15['signal'] else 'Bearish'} | EMA20 slope {s15['ema20_slope']:+.2f}% | Trend score {s15['score']}/100 | Reversal score {s15['reversal_score']}/100" if np.isfinite(s15['adx']) else "15m indicators unavailable")
                 st.write(f"**Learning pool:** {len(pool)} events from {len(pairs_sig)} comparison contracts + {len(same_coin_pool)} same-coin events + {len(extreme_pool)} extreme events.")
                 st.write("V5 learns both the historical outcome and the sequence: continuation first, delayed reversal, early rejection or mixed behavior. Current 15m structure is used to decide whether a reversal is actually confirmed.")
                 if failures: st.code("\n".join(failures[:50]))
