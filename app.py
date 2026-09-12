@@ -26,15 +26,66 @@ MEME_WORDS = {
 # =============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def active_instruments(margin="USDT"):
-    r = requests.get(
-        f"{API}/exchange/v1/derivatives/futures/data/active_instruments",
-        params=[("margin_currency_short_name[]", margin)], timeout=20
-    )
-    r.raise_for_status()
-    x = r.json()
-    if not isinstance(x, list):
-        raise RuntimeError(f"Unexpected instruments response: {x}")
-    return x
+    """Return active Futures instruments with several API-response fallbacks.
+
+    CoinDCX has changed/returned slightly different payload shapes over time.
+    The scanner must never silently treat an empty response as a healthy 0-coin
+    market, so we try the documented parameter form, a scalar form, a no-filter
+    form, and finally derive active Futures pairs from the real-time Futures
+    price feed.
+    """
+    url = f"{API}/exchange/v1/derivatives/futures/data/active_instruments"
+    attempts = [
+        [("margin_currency_short_name[]", margin)],
+        {"margin_currency_short_name": margin},
+        {},
+    ]
+    errors = []
+
+    def normalize(payload):
+        if isinstance(payload, list):
+            return payload
+        if isinstance(payload, dict):
+            for key in ("data", "instruments", "active_instruments", "result", "markets"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    return value
+        return []
+
+    for params in attempts:
+        try:
+            r = requests.get(url, params=params, timeout=20)
+            r.raise_for_status()
+            rows = normalize(r.json())
+            if rows:
+                return rows
+            errors.append(f"empty response for params={params}")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {exc}")
+
+    # Last-resort discovery: the public Futures RT feed contains the currently
+    # quoted contracts. This keeps a temporary API-schema change from reducing
+    # the whole scanner/trainer to zero contracts.
+    try:
+        prices = futures_prices()
+        derived = []
+        if isinstance(prices, dict):
+            for key, value in prices.items():
+                pair = None
+                if isinstance(value, dict):
+                    pair = value.get("mkt") or value.get("pair") or value.get("symbol") or key
+                else:
+                    pair = key
+                if isinstance(pair, str) and pair.strip():
+                    derived.append({"pair": pair.strip(), "symbol": str(pair).strip()})
+        if derived:
+            return derived
+    except Exception:
+        pass
+
+    # Keep the failure visible to callers instead of returning a misleading
+    # successful empty universe. The UI catches this and shows diagnostics.
+    raise RuntimeError("CoinDCX returned 0 active Futures contracts. " + " | ".join(errors[-3:]))
 
 @st.cache_data(ttl=5, show_spinner=False)
 def futures_prices():
@@ -3737,7 +3788,7 @@ if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
         bar.progress(pct, text=f"Scanning Futures: {done}/{total}")
     with st.spinner("Fetching multi-timeframe data and calculating signals…"):
         scan, total = v61_scan_all(_progress, max_workers=v61_workers)
-    bar.progress(100, text=f"Scan complete: {total} active contracts checked")
+    bar.progress(100, text=f"Scan complete: {total} active contracts discovered")
     # If the historical learner has been populated, blend its evidence into
     # the current market scan. The deterministic V5/V6.1 logic remains intact.
     if v62_db_stats()["samples"] >= 100:
@@ -3833,15 +3884,22 @@ if st.button("🧠 TRAIN / REFRESH ALL COINDCX CHART PATTERNS", type="secondary"
         bar2.progress(pct, text=status)
         if result[3] != "ok":
             errors.append(result)
-    with st.spinner(f"Reading {v62_days} days of 15m charts for every active Futures contract…"):
-        results, learned_total = v62_train_all(_learn_progress, days=v62_days, workers=v62_workers)
+    try:
+        with st.spinner(f"Reading {v62_days} days of 15m charts for every active Futures contract…"):
+            results, learned_total = v62_train_all(_learn_progress, days=v62_days, workers=v62_workers)
+    except Exception as exc:
+        bar2.progress(100, text="Learning stopped — CoinDCX market discovery failed")
+        st.error(f"Historical learning could not start: {type(exc).__name__}: {exc}")
+        results, learned_total = [], 0
     final_stats = v62_db_stats()
     bar2.progress(100, text=f"Learning complete: {final_stats['coins']:,} coins / {final_stats['samples']:,} samples")
     st.session_state["v62_train_stats"] = final_stats
-    if errors:
+    if learned_total == 0:
+        st.error("Training found 0 active Futures contracts. CoinDCX instrument discovery failed; no learning was performed.")
+    elif errors:
         st.warning(f"{len(errors)} contracts could not be learned. The scanner will continue using the contracts that succeeded.")
     else:
-        st.success("All returned active contracts were processed successfully.")
+        st.success(f"Training processed {learned_total:,} active Futures contracts successfully.")
 
 if v62_db_stats()["samples"] >= 100:
     st.info("🧠 Learning is active. Current signals can now be compared with historical patterns from the entire trained Futures universe. Re-run training periodically to add newer market behaviour.")
