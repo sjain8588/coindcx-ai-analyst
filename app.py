@@ -3374,110 +3374,6 @@ def v61_signal_card(t):
     st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
 
 
-# ----------------------------- MARKET SIGNAL UI ------------------------------
-st.divider()
-st.header("🎯 V6.1 — Market-Wide Long / Short Signals")
-st.caption("Scans all active CoinDCX USDT Futures using the existing public market-data API. Existing V5 remains above. No live orders are placed.")
-
-with st.expander("How the signal works", expanded=False):
-    st.markdown("""
-**Your screen should answer one question: where is the trade?**
-
-- 🟢 **LONG NOW** = price has reached/confirmed a qualifying long trigger.
-- 🔴 **SHORT NOW** = price has reached/confirmed a qualifying short trigger.
-- 🟢/🔴 **SETUP** = level is identified, but the trigger is not confirmed yet.
-- 🟦 **RANGE** = repeated support/resistance behaviour; buy support / short resistance only with confirmation.
-- 🚀 **PUMP WATCH** and 🔻 **DUMP WATCH** are momentum warnings, **not automatic trade signals**.
-- A strong breakout/breakdown invalidates the range logic rather than blindly fading it.
-""")
-
-c1, c2, c3 = st.columns(3)
-with c1:
-    v61_min_score = st.slider("Minimum signal score", 70, 95, 78, 1, key="v61_min_score")
-with c2:
-    v61_workers = st.slider("Concurrent API workers", 2, 10, 6, 1, key="v61_workers")
-with c3:
-    v61_auto = st.checkbox("Auto-refresh after scan", value=False, key="v61_auto")
-
-if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
-    V61_DEFAULTS["min_score"] = v61_min_score
-    bar = st.progress(0, text="Starting whole-market scan…")
-    def _progress(done, total):
-        pct = int(done/max(total,1)*100)
-        bar.progress(pct, text=f"Scanning Futures: {done}/{total}")
-    with st.spinner("Fetching multi-timeframe data and calculating signals…"):
-        scan, total = v61_scan_all(_progress, max_workers=v61_workers)
-    bar.progress(100, text=f"Scan complete: {total} active contracts checked")
-    # If the historical learner has been populated, blend its evidence into
-    # the current market scan. The deterministic V5/V6.1 logic remains intact.
-    if v62_db_stats()["samples"] >= 100:
-        with st.spinner("Comparing current setups with learned historical patterns…"):
-            scan = v62_enhance_scan(scan)
-    st.session_state["v61_scan"] = scan
-    st.session_state["v61_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-scan = st.session_state.get("v61_scan", [])
-if scan:
-    trades = []
-    watches = []
-    ranges = []
-    for a in scan:
-        for t in a.get("candidates", []):
-            if t.get("score",0) >= v61_min_score:
-                trades.append(t)
-        watches.extend(a.get("watches", []))
-        r = a.get("range", {})
-        if r.get("is_range"):
-            ranges.append({"pair":a.get("candidates", [{}])[0].get("symbol") if a.get("candidates") else "", "price":a.get("price"), **r})
-
-    longs = sorted([x for x in trades if x.get("side")=="LONG"], key=lambda x:x.get("score",0), reverse=True)
-    shorts = sorted([x for x in trades if x.get("side")=="SHORT"], key=lambda x:x.get("score",0), reverse=True)
-    pumps = sorted([x for x in watches if x.get("watch")=="PUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
-    dumps = sorted([x for x in watches if x.get("watch")=="DUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
-
-    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {total if 'total' in locals() else 'all loaded'}")
-    a,b,c,d = st.columns(4)
-    a.metric("LONG signals", len(longs))
-    b.metric("SHORT signals", len(shorts))
-    c.metric("Pump watch", len(pumps))
-    d.metric("Dump watch", len(dumps))
-
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 LONG", "🔴 SHORT", "🚀 PUMP", "🔻 DUMP", "🟦 RANGES"])
-    with tab1:
-        if longs:
-            for t in longs[:10]: v61_signal_card(t)
-        else: st.info("No qualifying LONG signal. No trade is the correct result.")
-    with tab2:
-        if shorts:
-            for t in shorts[:10]: v61_signal_card(t)
-        else: st.info("No qualifying SHORT signal. No trade is the correct result.")
-    with tab3:
-        if pumps:
-            st.dataframe(pd.DataFrame(pumps[:15])[['symbol','score','price','return_5h_pct','vol_ratio','rsi','regime']], use_container_width=True, hide_index=True)
-        else: st.info("No unusual pump behaviour detected.")
-    with tab4:
-        if dumps:
-            st.dataframe(pd.DataFrame(dumps[:15])[['symbol','score','price','return_5h_pct','vol_ratio','rsi','regime']], use_container_width=True, hide_index=True)
-        else: st.info("No unusual dump behaviour detected.")
-    with tab5:
-        # Reconstruct range rows from analysis objects for a compact view.
-        range_rows=[]
-        for a in scan:
-            r=a.get("range",{})
-            if r.get("is_range") and a.get("support") and a.get("resistance"):
-                range_rows.append({
-                    "symbol": next((x.get("symbol") for x in a.get("candidates",[]) if x.get("symbol")), ""),
-                    "price":a.get("price"), "support":a["support"]["level"], "resistance":a["resistance"]["level"],
-                    "range_score":r.get("score"), "width_pct":r.get("width_pct"), "support_touches":r.get("touch_s"),
-                    "resistance_touches":r.get("touch_r"), "regime":a.get("regime")})
-        if range_rows:
-            st.dataframe(pd.DataFrame(range_rows).sort_values("range_score", ascending=False).head(20), use_container_width=True, hide_index=True)
-        else: st.info("No clean ranges detected.")
-else:
-    st.info("Click **SCAN ALL COINDCX FUTURES**. The scanner will do the market-wide analysis for you and show only actionable candidates.")
-
-st.caption(f"V{V61_VERSION} + V{V62_VERSION}: V5 retained + market-wide signals + historical pattern learning. Signals are analytical, not guarantees. Live order execution remains disabled.")
-
 # =============================================================================
 # V6.2 AUTONOMOUS HISTORICAL PATTERN LEARNING ENGINE
 # =============================================================================
@@ -3807,6 +3703,110 @@ def v62_enhance_scan(scan):
             enhanced.append(a)
     return enhanced
 
+
+# ----------------------------- MARKET SIGNAL UI ------------------------------
+st.divider()
+st.header("🎯 V6.1 — Market-Wide Long / Short Signals")
+st.caption("Scans all active CoinDCX USDT Futures using the existing public market-data API. Existing V5 remains above. No live orders are placed.")
+
+with st.expander("How the signal works", expanded=False):
+    st.markdown("""
+**Your screen should answer one question: where is the trade?**
+
+- 🟢 **LONG NOW** = price has reached/confirmed a qualifying long trigger.
+- 🔴 **SHORT NOW** = price has reached/confirmed a qualifying short trigger.
+- 🟢/🔴 **SETUP** = level is identified, but the trigger is not confirmed yet.
+- 🟦 **RANGE** = repeated support/resistance behaviour; buy support / short resistance only with confirmation.
+- 🚀 **PUMP WATCH** and 🔻 **DUMP WATCH** are momentum warnings, **not automatic trade signals**.
+- A strong breakout/breakdown invalidates the range logic rather than blindly fading it.
+""")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    v61_min_score = st.slider("Minimum signal score", 70, 95, 78, 1, key="v61_min_score")
+with c2:
+    v61_workers = st.slider("Concurrent API workers", 2, 10, 6, 1, key="v61_workers")
+with c3:
+    v61_auto = st.checkbox("Auto-refresh after scan", value=False, key="v61_auto")
+
+if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
+    V61_DEFAULTS["min_score"] = v61_min_score
+    bar = st.progress(0, text="Starting whole-market scan…")
+    def _progress(done, total):
+        pct = int(done/max(total,1)*100)
+        bar.progress(pct, text=f"Scanning Futures: {done}/{total}")
+    with st.spinner("Fetching multi-timeframe data and calculating signals…"):
+        scan, total = v61_scan_all(_progress, max_workers=v61_workers)
+    bar.progress(100, text=f"Scan complete: {total} active contracts checked")
+    # If the historical learner has been populated, blend its evidence into
+    # the current market scan. The deterministic V5/V6.1 logic remains intact.
+    if v62_db_stats()["samples"] >= 100:
+        with st.spinner("Comparing current setups with learned historical patterns…"):
+            scan = v62_enhance_scan(scan)
+    st.session_state["v61_scan"] = scan
+    st.session_state["v61_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+scan = st.session_state.get("v61_scan", [])
+if scan:
+    trades = []
+    watches = []
+    ranges = []
+    for a in scan:
+        for t in a.get("candidates", []):
+            if t.get("score",0) >= v61_min_score:
+                trades.append(t)
+        watches.extend(a.get("watches", []))
+        r = a.get("range", {})
+        if r.get("is_range"):
+            ranges.append({"pair":a.get("candidates", [{}])[0].get("symbol") if a.get("candidates") else "", "price":a.get("price"), **r})
+
+    longs = sorted([x for x in trades if x.get("side")=="LONG"], key=lambda x:x.get("score",0), reverse=True)
+    shorts = sorted([x for x in trades if x.get("side")=="SHORT"], key=lambda x:x.get("score",0), reverse=True)
+    pumps = sorted([x for x in watches if x.get("watch")=="PUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
+    dumps = sorted([x for x in watches if x.get("watch")=="DUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
+
+    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {total if 'total' in locals() else 'all loaded'}")
+    a,b,c,d = st.columns(4)
+    a.metric("LONG signals", len(longs))
+    b.metric("SHORT signals", len(shorts))
+    c.metric("Pump watch", len(pumps))
+    d.metric("Dump watch", len(dumps))
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 LONG", "🔴 SHORT", "🚀 PUMP", "🔻 DUMP", "🟦 RANGES"])
+    with tab1:
+        if longs:
+            for t in longs[:10]: v61_signal_card(t)
+        else: st.info("No qualifying LONG signal. No trade is the correct result.")
+    with tab2:
+        if shorts:
+            for t in shorts[:10]: v61_signal_card(t)
+        else: st.info("No qualifying SHORT signal. No trade is the correct result.")
+    with tab3:
+        if pumps:
+            st.dataframe(pd.DataFrame(pumps[:15])[['symbol','score','price','return_5h_pct','vol_ratio','rsi','regime']], use_container_width=True, hide_index=True)
+        else: st.info("No unusual pump behaviour detected.")
+    with tab4:
+        if dumps:
+            st.dataframe(pd.DataFrame(dumps[:15])[['symbol','score','price','return_5h_pct','vol_ratio','rsi','regime']], use_container_width=True, hide_index=True)
+        else: st.info("No unusual dump behaviour detected.")
+    with tab5:
+        # Reconstruct range rows from analysis objects for a compact view.
+        range_rows=[]
+        for a in scan:
+            r=a.get("range",{})
+            if r.get("is_range") and a.get("support") and a.get("resistance"):
+                range_rows.append({
+                    "symbol": next((x.get("symbol") for x in a.get("candidates",[]) if x.get("symbol")), ""),
+                    "price":a.get("price"), "support":a["support"]["level"], "resistance":a["resistance"]["level"],
+                    "range_score":r.get("score"), "width_pct":r.get("width_pct"), "support_touches":r.get("touch_s"),
+                    "resistance_touches":r.get("touch_r"), "regime":a.get("regime")})
+        if range_rows:
+            st.dataframe(pd.DataFrame(range_rows).sort_values("range_score", ascending=False).head(20), use_container_width=True, hide_index=True)
+        else: st.info("No clean ranges detected.")
+else:
+    st.info("Click **SCAN ALL COINDCX FUTURES**. The scanner will do the market-wide analysis for you and show only actionable candidates.")
+
+st.caption(f"V{V61_VERSION} + V{V62_VERSION}: V5 retained + market-wide signals + historical pattern learning. Signals are analytical, not guarantees. Live order execution remains disabled.")
 
 # ------------------------- LEARNING CONTROL PANEL ----------------------------
 st.divider()
