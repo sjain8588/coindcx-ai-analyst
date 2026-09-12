@@ -26,73 +26,143 @@ MEME_WORDS = {
 # =============================================================================
 @st.cache_data(ttl=30, show_spinner=False)
 def active_instruments(margin="USDT"):
-    """Return active Futures instruments with several API-response fallbacks.
+    """Discover the complete active CoinDCX Futures universe robustly.
 
-    CoinDCX has changed/returned slightly different payload shapes over time.
-    The scanner must never silently treat an empty response as a healthy 0-coin
-    market, so we try the documented parameter form, a scalar form, a no-filter
-    form, and finally derive active Futures pairs from the real-time Futures
-    price feed.
+    CoinDCX responses have appeared in several shapes (plain list, nested data,
+    keyed dictionaries and price-feed objects).  This function normalizes all
+    of them.  It never converts an API failure into a fake empty market.
     """
     url = f"{API}/exchange/v1/derivatives/futures/data/active_instruments"
-    attempts = [
-        [("margin_currency_short_name[]", margin)],
-        {"margin_currency_short_name": margin},
-        {},
-    ]
     errors = []
 
-    def normalize(payload):
-        if isinstance(payload, list):
-            return payload
-        if isinstance(payload, dict):
-            for key in ("data", "instruments", "active_instruments", "result", "markets"):
-                value = payload.get(key)
-                if isinstance(value, list):
-                    return value
-        return []
+    def flatten_records(obj):
+        out = []
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    out.append(item)
+                elif isinstance(item, str):
+                    out.append({"pair": item, "symbol": item})
+        elif isinstance(obj, dict):
+            # Normal documented/nested response containers.
+            for key in ("data", "instruments", "active_instruments", "result", "markets", "items"):
+                if key in obj:
+                    out.extend(flatten_records(obj[key]))
+            # Also support keyed dictionaries such as {"B-BTC_USDT": {...}}.
+            for key, value in obj.items():
+                if isinstance(value, dict):
+                    rec = dict(value)
+                    if not any(rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name")):
+                        if isinstance(key, str) and ("_USDT" in key.upper() or "USDT" in key.upper()):
+                            rec["pair"] = key
+                    if any(rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name")):
+                        out.append(rec)
+        return out
 
+    attempts = [
+        {"margin_currency_short_name[]": margin},
+        {"margin_currency_short_name": margin},
+        {"margin_currency_short_name[]": [margin]},
+        {},
+    ]
     for params in attempts:
         try:
-            r = requests.get(url, params=params, timeout=20)
+            r = requests.get(url, params=params, timeout=25)
             r.raise_for_status()
-            rows = normalize(r.json())
+            payload = r.json()
+            rows = flatten_records(payload)
             if rows:
                 return rows
-            errors.append(f"empty response for params={params}")
+            errors.append(f"empty response params={params}; payload_type={type(payload).__name__}")
         except Exception as exc:
-            errors.append(f"{type(exc).__name__}: {exc}")
+            errors.append(f"instrument endpoint {type(exc).__name__}: {exc}")
 
-    # Last-resort discovery: the public Futures RT feed contains the currently
-    # quoted contracts. This keeps a temporary API-schema change from reducing
-    # the whole scanner/trainer to zero contracts.
+    # Robust fallback: the public real-time Futures feed itself is a live market
+    # universe. This is especially useful if the active_instruments schema changes.
     try:
-        prices = futures_prices()
+        raw = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
+        raw.raise_for_status()
+        payload = raw.json()
+        feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
         derived = []
-        if isinstance(prices, dict):
-            for key, value in prices.items():
-                pair = None
-                if isinstance(value, dict):
-                    pair = value.get("mkt") or value.get("pair") or value.get("symbol") or key
-                else:
-                    pair = key
-                if isinstance(pair, str) and pair.strip():
-                    derived.append({"pair": pair.strip(), "symbol": str(pair).strip()})
+        if isinstance(feed, dict):
+            iterator = feed.items()
+        elif isinstance(feed, list):
+            iterator = []
+            for item in feed:
+                if isinstance(item, dict):
+                    key = item.get("pair") or item.get("symbol") or item.get("mkt") or item.get("market")
+                    if key:
+                        iterator.append((key, item))
+        else:
+            iterator = []
+        seen = set()
+        for key, value in iterator:
+            pair = None
+            if isinstance(value, dict):
+                pair = value.get("pair") or value.get("symbol") or value.get("mkt") or value.get("market") or key
+            else:
+                pair = key
+            if isinstance(pair, str):
+                pair = pair.strip()
+                up = pair.upper()
+                if pair and ("USDT" in up or margin.upper() in up) and pair not in seen:
+                    seen.add(pair)
+                    derived.append({"pair": pair, "symbol": pair, "margin_currency_short_name": margin})
         if derived:
             return derived
-    except Exception:
-        pass
+        errors.append(f"price-feed fallback returned no {margin} Futures pairs; payload_type={type(feed).__name__}")
+    except Exception as exc:
+        errors.append(f"price-feed fallback {type(exc).__name__}: {exc}")
 
-    # Keep the failure visible to callers instead of returning a misleading
-    # successful empty universe. The UI catches this and shows diagnostics.
-    raise RuntimeError("CoinDCX returned 0 active Futures contracts. " + " | ".join(errors[-3:]))
+    raise RuntimeError("CoinDCX Futures universe discovery failed. " + " | ".join(errors[-5:]))
+
 
 @st.cache_data(ttl=5, show_spinner=False)
 def futures_prices():
-    r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=20)
+    """Return current Futures prices normalized to {pair: price-record}."""
+    r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
     r.raise_for_status()
-    x = r.json()
-    return x.get("prices", {}) if isinstance(x, dict) else {}
+    payload = r.json()
+    feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
+    out = {}
+
+    def add(pair, value):
+        if not isinstance(pair, str) or not pair.strip():
+            return
+        pair = pair.strip()
+        if isinstance(value, dict):
+            rec = dict(value)
+            rec.setdefault("pair", pair)
+            # Some variants expose the last price under different names.
+            if not any(k in rec for k in ("price", "last_price", "last", "close")):
+                for k in ("p", "lp", "mark_price", "mp"):
+                    if k in rec:
+                        rec["price"] = rec[k]
+                        break
+            out[pair] = rec
+        else:
+            num = v6_num(value)
+            if np.isfinite(num):
+                out[pair] = {"pair": pair, "price": num}
+
+    if isinstance(feed, dict):
+        for key, value in feed.items():
+            pair = None
+            if isinstance(value, dict):
+                pair = value.get("pair") or value.get("symbol") or value.get("mkt") or value.get("market") or key
+            else:
+                pair = key
+            add(pair, value)
+    elif isinstance(feed, list):
+        for item in feed:
+            if isinstance(item, dict):
+                pair = item.get("pair") or item.get("symbol") or item.get("mkt") or item.get("market")
+                if pair:
+                    add(pair, item)
+    if not out:
+        raise RuntimeError(f"CoinDCX Futures price feed returned no usable prices (payload_type={type(feed).__name__})")
+    return out
 
 @st.cache_data(ttl=60, show_spinner=False)
 def candles(pair, resolution, start_ts, end_ts):
@@ -2965,9 +3035,11 @@ V61_DEFAULTS = {
 
 
 def v61_instrument_pair(x):
+    if isinstance(x, str) and x.strip():
+        return x.strip()
     if not isinstance(x, dict):
         return None
-    for k in ("pair", "symbol", "market", "instrument", "coindcx_name"):
+    for k in ("pair", "symbol", "market", "instrument", "coindcx_name", "id"):
         v = x.get(k)
         if isinstance(v, str) and v.strip():
             return v.strip()
@@ -2986,23 +3058,26 @@ def v61_symbol(x, pair):
 def v61_price_for_pair(prices, pair):
     if not isinstance(prices, dict):
         return np.nan
-    candidates = [pair, pair.upper(), pair.lower()]
-    for k in candidates:
+    target = str(pair).upper()
+    for k in (pair, pair.upper(), pair.lower()):
         if k in prices:
             v = prices[k]
             if isinstance(v, dict):
-                for kk in ("price", "last_price", "last", "close"):
+                for kk in ("price", "last_price", "last", "close", "p", "lp", "mark_price", "mp"):
                     if kk in v:
-                        return v6_num(v[kk])
-            return v6_num(v)
-    # Some API payloads use a nested market object.
+                        q = v6_num(v[kk])
+                        if np.isfinite(q): return q
+            else:
+                q = v6_num(v)
+                if np.isfinite(q): return q
     for k, v in prices.items():
-        if str(k).upper() == str(pair).upper():
-            if isinstance(v, dict):
-                for kk in ("price", "last_price", "last", "close"):
+        if isinstance(v, dict):
+            ident = str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k).upper()
+            if ident == target:
+                for kk in ("price", "last_price", "last", "close", "p", "lp", "mark_price", "mp"):
                     if kk in v:
-                        return v6_num(v[kk])
-            return v6_num(v)
+                        q = v6_num(v[kk])
+                        if np.isfinite(q): return q
     return np.nan
 
 
