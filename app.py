@@ -2321,3 +2321,1529 @@ if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
 
 st.divider()
 st.caption("Analysis only. No orders, balances, API keys or withdrawals are used. Historical behavior is evidence, not a guarantee or financial advice.")
+# =============================================================================
+# V6 PROFESSIONAL INTRADAY FUTURES AGENT — ADD-ON
+# =============================================================================
+# V6 keeps the complete V5 historical-learning engine above and adds a separate
+# intraday decision/risk/paper-trading layer. It intentionally does NOT invent
+# private CoinDCX order endpoints. Live execution should be connected only after
+# the strategy has been backtested and paper-traded successfully.
+
+import json
+import os
+from pathlib import Path
+
+V6_VERSION = "6.0-INTRADAY"
+PAPER_FILE = Path("paper_trades.json")
+
+# ----------------------------- V6 CONFIG -------------------------------------
+V6_DEFAULTS = {
+    "risk_per_trade_pct": 0.50,
+    "max_daily_loss_pct": 2.0,
+    "max_open_positions": 3,
+    "min_setup_score": 72,
+    "min_rr": 2.0,
+    "atr_stop_mult": 1.20,
+    "max_leverage": 5,
+}
+
+
+def v6_num(v, default=np.nan):
+    try:
+        z = float(v)
+        return z if np.isfinite(z) else default
+    except Exception:
+        return default
+
+
+def v6_pct(a, b):
+    a, b = v6_num(a), v6_num(b)
+    return (a / b - 1.0) * 100 if np.isfinite(a) and np.isfinite(b) and b else np.nan
+
+
+def v6_last_closed(tf_data, tf):
+    d = tf_data.get(tf)
+    if d is None or d.empty:
+        return None
+    x = indicators(completed(d))
+    return x.iloc[-1] if not x.empty else None
+
+
+def v6_swing_levels(d, lookback=80):
+    """Recent support/resistance levels from completed candles."""
+    if d is None or d.empty:
+        return {}
+    x = completed(d).tail(lookback)
+    if len(x) < 10:
+        return {}
+    highs = x.high.astype(float)
+    lows = x.low.astype(float)
+    return {
+        "recent_high": float(highs.max()),
+        "recent_low": float(lows.min()),
+        "last_close": float(x.close.iloc[-1]),
+        "last_high": float(x.high.iloc[-1]),
+        "last_low": float(x.low.iloc[-1]),
+    }
+
+
+def v6_pivot_levels(d):
+    """Previous completed daily OHLC, useful as intraday reference levels."""
+    if d is None or len(d) < 3:
+        return {}
+    x = completed(d)
+    if len(x) < 2:
+        return {}
+    p = x.iloc[-2]
+    h, l, c = v6_num(p.high), v6_num(p.low), v6_num(p.close)
+    if not all(np.isfinite(v) for v in (h, l, c)):
+        return {}
+    pivot = (h + l + c) / 3.0
+    return {
+        "prev_day_high": h,
+        "prev_day_low": l,
+        "prev_day_close": c,
+        "pivot": pivot,
+        "r1": 2 * pivot - l,
+        "s1": 2 * pivot - h,
+        "r2": pivot + (h - l),
+        "s2": pivot - (h - l),
+    }
+
+
+def v6_market_regime(tf_data):
+    """Determine broad regime before allowing an intraday setup."""
+    rows = {}
+    bull = bear = 0
+    for tf in ("1D", "4H", "1H"):
+        r = v6_last_closed(tf_data, tf)
+        if r is None:
+            rows[tf] = "NO DATA"
+            continue
+        close = v6_num(r.close)
+        e20, e50, e100 = v6_num(r.ema20), v6_num(r.ema50), v6_num(r.ema100)
+        macd, sig = v6_num(r.macd), v6_num(r.macd_signal)
+        if close > e20 > e50 and e50 > e100 and macd > sig:
+            rows[tf] = "BULLISH"
+            bull += 1
+        elif close < e20 < e50 and e50 < e100 and macd < sig:
+            rows[tf] = "BEARISH"
+            bear += 1
+        else:
+            rows[tf] = "MIXED"
+    if bull >= 2 and bear == 0:
+        regime = "BULL TREND"
+    elif bear >= 2 and bull == 0:
+        regime = "BEAR TREND"
+    elif bull >= 1 and bear == 0:
+        regime = "BULLISH / MIXED"
+    elif bear >= 1 and bull == 0:
+        regime = "BEARISH / MIXED"
+    else:
+        regime = "RANGE / MIXED"
+    return {"regime": regime, "rows": rows, "bull": bull, "bear": bear}
+
+
+def v6_relative_strength(tf_data):
+    """Coin-only momentum quality; BTC/ETH cross-asset feed can be added later."""
+    out = {}
+    for tf in ("5m", "15m", "1H", "4H"):
+        d = completed(tf_data.get(tf, pd.DataFrame()))
+        if d is None or len(d) < 5:
+            out[tf] = np.nan
+            continue
+        n = {"5m": 12, "15m": 8, "1H": 6, "4H": 6}[tf]
+        if len(d) <= n:
+            out[tf] = np.nan
+        else:
+            out[tf] = v6_pct(d.close.iloc[-1], d.close.iloc[-1-n])
+    return out
+
+
+def v6_volume_quality(d):
+    if d is None or len(d) < 25:
+        return {"ratio": np.nan, "state": "NO DATA"}
+    x = indicators(completed(d))
+    if x.empty:
+        return {"ratio": np.nan, "state": "NO DATA"}
+    r = v6_num(x.iloc[-1].vol_ratio)
+    state = "SURGE" if r >= 2 else "STRONG" if r >= 1.3 else "NORMAL" if r >= 0.8 else "THIN"
+    return {"ratio": r, "state": state}
+
+
+def v6_structure_signal(d):
+    """More intraday-specific structure classification."""
+    if d is None or len(d) < 30:
+        return "UNKNOWN"
+    x = completed(d).tail(24)
+    a = x.iloc[:12]
+    b = x.iloc[12:]
+    ah, al = a.high.max(), a.low.min()
+    bh, bl = b.high.max(), b.low.min()
+    if bh > ah and bl > al:
+        return "HH/HL"
+    if bh < ah and bl < al:
+        return "LH/LL"
+    return "RANGE"
+
+
+def v6_squeeze_breakout(d):
+    """Detect compression followed by a range/volume expansion."""
+    if d is None or len(d) < 35:
+        return {"state": "UNKNOWN", "score": 0}
+    x = indicators(completed(d))
+    if len(x) < 30:
+        return {"state": "UNKNOWN", "score": 0}
+    now = x.iloc[-1]
+    prior = x.iloc[-8:-1]
+    width_now = v6_num(now.bbup - now.bblow)
+    width_prior = v6_num((prior.bbup - prior.bblow).median())
+    vol = v6_num(now.vol_ratio)
+    rng = v6_num(now.high - now.low)
+    atr = v6_num(now.atr)
+    score = 0
+    if np.isfinite(width_now) and np.isfinite(width_prior) and width_prior > 0 and width_now > width_prior * 1.15:
+        score += 35
+    if np.isfinite(vol) and vol >= 1.5:
+        score += 35
+    if np.isfinite(rng) and np.isfinite(atr) and atr > 0 and rng >= atr * 1.2:
+        score += 30
+    return {"state": "EXPANSION" if score >= 60 else "NO CLEAR EXPANSION", "score": score}
+
+
+def v6_trade_levels(tf_data, direction, price, cfg):
+    """ATR/structure-based entry, invalidation and multi-target levels."""
+    d = completed(tf_data.get("15m", pd.DataFrame()))
+    x = indicators(d) if d is not None and not d.empty else pd.DataFrame()
+    if x.empty:
+        return None
+    r = x.iloc[-1]
+    atr = v6_num(r.atr)
+    if not np.isfinite(atr) or atr <= 0 or price <= 0:
+        return None
+    swing = v6_swing_levels(d, 32)
+    pad = atr * float(cfg["atr_stop_mult"])
+    if direction == "LONG":
+        structural = min(v6_num(swing.get("recent_low"), price - pad), price - pad)
+        stop = structural - 0.10 * atr
+        risk = price - stop
+        if risk <= 0:
+            return None
+        tp1, tp2, tp3 = price + 1.5*risk, price + 2.5*risk, price + 4.0*risk
+    else:
+        structural = max(v6_num(swing.get("recent_high"), price + pad), price + pad)
+        stop = structural + 0.10 * atr
+        risk = stop - price
+        if risk <= 0:
+            return None
+        tp1, tp2, tp3 = price - 1.5*risk, price - 2.5*risk, price - 4.0*risk
+    return {
+        "entry": price, "stop": stop, "risk_per_unit": risk,
+        "tp1": tp1, "tp2": tp2, "tp3": tp3,
+        "rr_tp1": 1.5, "rr_tp2": 2.5, "rr_tp3": 4.0,
+        "atr": atr,
+    }
+
+
+def v6_setup_engine(current, direction, cfg):
+    """Professional-style deterministic LONG/SHORT scoring; V5 remains a vote."""
+    tf = current.get("tf_data", {})
+    r5 = v6_last_closed(tf, "5m")
+    r15 = v6_last_closed(tf, "15m")
+    r1 = v6_last_closed(tf, "1H")
+    r4 = v6_last_closed(tf, "4H")
+    if any(r is None for r in (r15, r1, r4)):
+        return None
+
+    price = v6_num(current.get("current"))
+    if price <= 0:
+        return None
+    regime = v6_market_regime(tf)
+    s15 = short_term_state(current)
+    struct15 = v6_structure_signal(tf.get("15m"))
+    volq = v6_volume_quality(tf.get("15m"))
+    expansion = v6_squeeze_breakout(tf.get("15m"))
+    rs = v6_relative_strength(tf)
+    piv = v6_pivot_levels(tf.get("1D"))
+
+    score = 0
+    reasons = []
+    blockers = []
+
+    # Directional higher-timeframe agreement: 25 points.
+    if direction == "LONG":
+        if regime["regime"].startswith("BULL"):
+            score += 15; reasons.append("higher-timeframe regime supports LONG")
+        if v6_num(r4.close) > v6_num(r4.ema20) and v6_num(r1.close) > v6_num(r1.ema20):
+            score += 10; reasons.append("1H and 4H are above EMA20")
+        if struct15 == "HH/HL":
+            score += 15; reasons.append("15m structure is HH/HL")
+        if v6_num(r15.macd) > v6_num(r15.macd_signal):
+            score += 8; reasons.append("15m MACD bullish")
+        if v6_num(r15.ema20) > v6_num(r15.ema50):
+            score += 8; reasons.append("15m EMA20 > EMA50")
+        if v6_num(r15.rsi) >= 50:
+            score += 5; reasons.append("15m RSI has bullish momentum")
+        if volq["ratio"] >= 1.2:
+            score += 8; reasons.append("15m volume confirms participation")
+        if expansion["score"] >= 60:
+            score += 6; reasons.append("range/volume expansion detected")
+        if s15.get("reversal_confirmed"):
+            blockers.append("15m reversal is confirmed")
+        if regime["bear"] >= 2:
+            blockers.append("higher-timeframe regime is bearish")
+    else:
+        if regime["regime"].startswith("BEAR"):
+            score += 15; reasons.append("higher-timeframe regime supports SHORT")
+        if v6_num(r4.close) < v6_num(r4.ema20) and v6_num(r1.close) < v6_num(r1.ema20):
+            score += 10; reasons.append("1H and 4H are below EMA20")
+        if struct15 == "LH/LL":
+            score += 15; reasons.append("15m structure is LH/LL")
+        if v6_num(r15.macd) < v6_num(r15.macd_signal):
+            score += 8; reasons.append("15m MACD bearish")
+        if v6_num(r15.ema20) < v6_num(r15.ema50):
+            score += 8; reasons.append("15m EMA20 < EMA50")
+        if v6_num(r15.rsi) <= 50:
+            score += 5; reasons.append("15m RSI has bearish momentum")
+        if volq["ratio"] >= 1.2:
+            score += 8; reasons.append("15m volume confirms participation")
+        if expansion["score"] >= 60:
+            score += 6; reasons.append("range/volume expansion detected")
+        if s15.get("reversal_confirmed"):
+            score += 12; reasons.append("V5 short-term reversal confirmation supports SHORT")
+        if regime["bull"] >= 2:
+            blockers.append("higher-timeframe regime is bullish")
+
+    # V5 historical evidence: 15 points maximum.
+    last_summary = st.session_state.get("last_analysis", {}).get("summary")
+    if last_summary:
+        c = v6_num(last_summary.get("continue_pct"), 0)
+        d = v6_num(last_summary.get("dump_pct"), 0)
+        if direction == "LONG" and c >= 58 and c - d >= 15:
+            score += 15; reasons.append(f"V5 historical continuation edge ({c:.0f}% continue)")
+        elif direction == "SHORT" and c >= 58 and c - last_summary.get("reverse_pct", 0) >= 15:
+            score += 15; reasons.append(f"V5 historical downside continuation evidence ({c:.0f}%)")
+        elif direction == "SHORT" and last_summary.get("reverse_pct", 0) >= 55:
+            blockers.append("V5 history shows elevated bounce risk")
+
+    # Avoid chasing extremely extended candles.
+    rsi15 = v6_num(r15.rsi)
+    dist20 = v6_pct(r15.close, r15.ema20)
+    if direction == "LONG" and np.isfinite(rsi15) and rsi15 >= 82:
+        blockers.append("LONG is too extended (15m RSI >= 82)")
+    if direction == "SHORT" and np.isfinite(rsi15) and rsi15 <= 18:
+        blockers.append("SHORT is too extended (15m RSI <= 18)")
+    if direction == "LONG" and np.isfinite(dist20) and dist20 >= 15:
+        blockers.append("LONG is stretched far above EMA20")
+    if direction == "SHORT" and np.isfinite(dist20) and dist20 <= -15:
+        blockers.append("SHORT is stretched far below EMA20")
+
+    levels = v6_trade_levels(tf, direction, price, cfg)
+    if not levels:
+        return None
+    valid = score >= int(cfg["min_setup_score"]) and not blockers and levels["rr_tp2"] >= float(cfg["min_rr"])
+    return {
+        "direction": direction, "score": int(min(score, 100)), "valid": bool(valid),
+        "regime": regime["regime"], "regime_rows": regime["rows"],
+        "structure15": struct15, "volume": volq, "expansion": expansion,
+        "relative_strength": rs, "pivot_levels": piv,
+        "entry": levels["entry"], "stop": levels["stop"],
+        "tp1": levels["tp1"], "tp2": levels["tp2"], "tp3": levels["tp3"],
+        "risk_per_unit": levels["risk_per_unit"], "atr": levels["atr"],
+        "reasons": reasons, "blockers": blockers,
+    }
+
+
+def v6_position_size(balance, entry, stop, risk_pct, leverage=5):
+    """Risk-based position sizing; leverage caps exposure but does not define risk."""
+    balance = v6_num(balance, 0)
+    entry, stop = v6_num(entry), v6_num(stop)
+    if balance <= 0 or entry <= 0 or stop <= 0 or entry == stop:
+        return 0.0
+    risk_cash = balance * float(risk_pct) / 100.0
+    per_unit = abs(entry - stop)
+    qty = risk_cash / per_unit
+    max_notional_qty = (balance * float(leverage)) / entry
+    return max(0.0, min(qty, max_notional_qty))
+
+
+def v6_load_paper():
+    try:
+        if PAPER_FILE.exists():
+            data = json.loads(PAPER_FILE.read_text())
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def v6_save_paper(rows):
+    try:
+        PAPER_FILE.write_text(json.dumps(rows, indent=2, default=str))
+    except Exception:
+        pass
+
+
+def v6_paper_open(setup, balance, risk_pct, leverage):
+    rows = v6_load_paper()
+    qty = v6_position_size(balance, setup["entry"], setup["stop"], risk_pct, leverage)
+    if qty <= 0:
+        return None
+    trade = {
+        "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f"),
+        "time": datetime.now(timezone.utc).isoformat(),
+        "pair": st.session_state.get("last_analysis", {}).get("pair", ""),
+        "direction": setup["direction"],
+        "score": setup["score"],
+        "entry": setup["entry"], "stop": setup["stop"],
+        "tp1": setup["tp1"], "tp2": setup["tp2"], "tp3": setup["tp3"],
+        "qty": qty, "status": "OPEN", "pnl": 0.0,
+    }
+    rows.append(trade)
+    v6_save_paper(rows)
+    return trade
+
+
+def v6_paper_update(pair, price):
+    rows = v6_load_paper()
+    changed = False
+    for t in rows:
+        if t.get("status") != "OPEN" or t.get("pair") != pair:
+            continue
+        p = v6_num(price)
+        entry = v6_num(t.get("entry")); qty = v6_num(t.get("qty"), 0)
+        stop = v6_num(t.get("stop")); tp3 = v6_num(t.get("tp3"))
+        direction = t.get("direction")
+        hit_stop = p <= stop if direction == "LONG" else p >= stop
+        hit_tp3 = p >= tp3 if direction == "LONG" else p <= tp3
+        if hit_stop or hit_tp3:
+            raw = (p-entry) * qty if direction == "LONG" else (entry-p) * qty
+            t["exit"] = p; t["pnl"] = raw
+            t["status"] = "STOP" if hit_stop else "TP3"
+            t["closed_at"] = datetime.now(timezone.utc).isoformat()
+            changed = True
+    if changed:
+        v6_save_paper(rows)
+    return rows
+
+
+def v6_daily_guard(balance, starting_balance, rows, cfg):
+    """Kill switch based on closed paper PnL and configured daily loss limit."""
+    if starting_balance <= 0:
+        return True, "No valid starting balance"
+    closed = [r for r in rows if r.get("status") != "OPEN"]
+    pnl = sum(v6_num(r.get("pnl"), 0) for r in closed)
+    loss_pct = max(0.0, -pnl / starting_balance * 100)
+    if loss_pct >= float(cfg["max_daily_loss_pct"]):
+        return False, f"DAILY KILL SWITCH: closed loss {loss_pct:.2f}% >= {cfg['max_daily_loss_pct']:.2f}%"
+    return True, f"Daily risk OK: closed PnL {pnl:+.2f}"
+
+
+# =============================================================================
+# V6 UI — runs after the original V5 UI, so the original functionality remains.
+# =============================================================================
+st.divider()
+st.header("🤖 V6 Professional Intraday Futures Agent")
+st.caption("V5 historical learning + multi-timeframe regime + LONG/SHORT scoring + ATR risk engine + paper execution.")
+
+with st.expander("⚙️ V6 Risk Controls", expanded=False):
+    vc1, vc2, vc3, vc4 = st.columns(4)
+    v6_balance = vc1.number_input("Paper balance", min_value=100.0, value=1000.0, step=100.0)
+    v6_risk = vc2.number_input("Risk / trade %", min_value=0.05, max_value=5.0, value=V6_DEFAULTS["risk_per_trade_pct"], step=0.05)
+    v6_daily = vc3.number_input("Max daily loss %", min_value=0.25, max_value=20.0, value=V6_DEFAULTS["max_daily_loss_pct"], step=0.25)
+    v6_lev = vc4.number_input("Max leverage", min_value=1, max_value=20, value=V6_DEFAULTS["max_leverage"], step=1)
+    v6_cfg = dict(V6_DEFAULTS)
+    v6_cfg.update({"risk_per_trade_pct": v6_risk, "max_daily_loss_pct": v6_daily, "max_leverage": v6_lev})
+    st.warning("V6 is PAPER-TRADING ONLY. No live order is submitted by this add-on.")
+
+v6_col1, v6_col2 = st.columns([1, 1])
+with v6_col1:
+    v6_scan_limit = st.slider("Intraday scan contracts", 10, 60, 25, 5)
+with v6_col2:
+    v6_min_score = st.slider("Minimum setup score", 60, 90, V6_DEFAULTS["min_setup_score"], 1)
+v6_cfg["min_setup_score"] = v6_min_score
+
+if st.button("🚦 Run Professional LONG / SHORT Scan", type="primary"):
+    try:
+        with st.spinner("Scanning CoinDCX Futures with V6 intraday filters..."):
+            prices = futures_prices()
+            active = active_instruments(margin)
+            universe = []
+            for pair in active:
+                p = prices.get(pair) or prices.get(str(pair).upper()) or prices.get(str(pair).lower())
+                if not p:
+                    continue
+                symbol = str(p.get("mkt", pair)).upper()
+                if meme_only and not any(w in symbol or w in pair.upper() for w in MEME_WORDS):
+                    continue
+                cur = current_price(p)
+                pc = v6_num(p.get("pc"), 0)
+                if cur > 0:
+                    universe.append((pair, symbol, p, cur, abs(pc)))
+            universe.sort(key=lambda z: z[4], reverse=True)
+            universe = universe[:v6_scan_limit]
+
+            records = []
+            failures = []
+            for pair, symbol, p, cur, _ in universe:
+                try:
+                    # Reuse the same public candle functions already used by V5.
+                    tf_data = {tf: get_tf(pair, tf, days) for tf, days in {
+                        "5m": 5, "15m": 12, "1H": 30, "4H": 120, "1D": 180
+                    }.items()}
+                    dummy = {"tf_data": tf_data, "current": cur}
+                    long_setup = v6_setup_engine(dummy, "LONG", v6_cfg)
+                    short_setup = v6_setup_engine(dummy, "SHORT", v6_cfg)
+                    for setup in (long_setup, short_setup):
+                        if not setup:
+                            continue
+                        records.append({
+                            "Coin": symbol, "Pair": pair,
+                            "Direction": setup["direction"],
+                            "Score": setup["score"],
+                            "Valid": "✅ TRADE CANDIDATE" if setup["valid"] else "WAIT",
+                            "Regime": setup["regime"],
+                            "15m Structure": setup["structure15"],
+                            "Volume": f"{setup['volume']['ratio']:.1f}x" if np.isfinite(setup['volume']['ratio']) else "—",
+                            "Entry": fmt(setup["entry"]),
+                            "Stop": fmt(setup["stop"]),
+                            "TP1": fmt(setup["tp1"]),
+                            "TP2": fmt(setup["tp2"]),
+                            "TP3": fmt(setup["tp3"]),
+                            "Blockers": "; ".join(setup["blockers"]) if setup["blockers"] else "—",
+                            "Reasons": " | ".join(setup["reasons"][:4]),
+                            "setup": setup,
+                        })
+                except Exception as exc:
+                    failures.append(f"{pair}: {type(exc).__name__}: {exc}")
+
+            records.sort(key=lambda r: (r["Valid"] != "✅ TRADE CANDIDATE", -r["Score"]))
+            st.session_state["v6_scan"] = records
+            st.session_state["v6_scan_failures"] = failures
+
+    except Exception as exc:
+        st.error(f"V6 scan failed: {type(exc).__name__}: {exc}")
+
+v6_records = st.session_state.get("v6_scan", [])
+if v6_records:
+    st.subheader("📋 Ranked Intraday Opportunities")
+    display_cols = ["Coin","Pair","Direction","Score","Valid","Regime","15m Structure","Volume","Entry","Stop","TP1","TP2","TP3","Blockers"]
+    st.dataframe(pd.DataFrame([{k:r[k] for k in display_cols} for r in v6_records]), use_container_width=True, hide_index=True)
+
+    valid = [r for r in v6_records if r["Valid"] == "✅ TRADE CANDIDATE"]
+    if valid:
+        st.success(f"{len(valid)} setup(s) passed the V6 deterministic gate. Review the trade card before paper execution.")
+        pick = st.selectbox("Select setup", range(len(valid)), format_func=lambda i: f"{valid[i]['Coin']} — {valid[i]['Direction']} — {valid[i]['Score']}/100")
+        chosen = valid[pick]
+        setup = chosen["setup"]
+        st.markdown("### 🎯 Professional Trade Card")
+        c1,c2,c3,c4,c5 = st.columns(5)
+        c1.metric("Direction", setup["direction"])
+        c2.metric("Score", f"{setup['score']}/100")
+        c3.metric("Entry", fmt(setup["entry"]))
+        c4.metric("Stop", fmt(setup["stop"]))
+        c5.metric("TP2", fmt(setup["tp2"]))
+        q1,q2,q3,q4 = st.columns(4)
+        q1.metric("Risk / unit", fmt(setup["risk_per_unit"]))
+        q2.metric("TP1 R", "1.5R")
+        q3.metric("TP2 R", "2.5R")
+        q4.metric("TP3 R", "4.0R")
+        qty = v6_position_size(v6_balance, setup["entry"], setup["stop"], v6_risk, v6_lev)
+        st.write(f"**Paper quantity:** {qty:.6f} | **Cash risk:** ~{v6_balance*v6_risk/100:.2f} | **Max leverage:** {v6_lev}x")
+        st.write("**Why:** " + "; ".join(setup["reasons"]))
+        if setup["blockers"]:
+            st.error("BLOCKED: " + "; ".join(setup["blockers"]))
+        else:
+            if st.button("🧪 Open PAPER Trade", type="secondary"):
+                rows = v6_load_paper()
+                open_count = sum(r.get("status") == "OPEN" for r in rows)
+                if open_count >= int(v6_cfg["max_open_positions"]):
+                    st.error(f"Max open positions reached ({v6_cfg['max_open_positions']}).")
+                else:
+                    ok, guard = v6_daily_guard(v6_balance, v6_balance, rows, v6_cfg)
+                    if not ok:
+                        st.error(guard)
+                    else:
+                        trade = v6_paper_open(setup, v6_balance, v6_risk, v6_lev)
+                        if trade:
+                            st.success(f"Paper trade opened: {trade['direction']} {trade['pair']} qty {trade['qty']:.6f}")
+
+if st.session_state.get("v6_scan_failures"):
+    with st.expander(f"V6 scan diagnostics ({len(st.session_state['v6_scan_failures'])})"):
+        st.code("\n".join(st.session_state["v6_scan_failures"][:100]))
+
+st.markdown("### 🧪 Paper Position Manager")
+paper_rows = v6_load_paper()
+if paper_rows:
+    pactive = [r for r in paper_rows if r.get("status") == "OPEN"]
+    st.write(f"Open paper positions: **{len(pactive)}**")
+    st.dataframe(pd.DataFrame(paper_rows), use_container_width=True, hide_index=True)
+    if st.button("🔄 Refresh / Update Current Paper Prices"):
+        prices = futures_prices()
+        for t in paper_rows:
+            if t.get("status") != "OPEN":
+                continue
+            p = prices.get(t.get("pair"))
+            if p:
+                v6_paper_update(t.get("pair"), current_price(p))
+        st.rerun()
+else:
+    st.info("No paper trades yet. Run the V6 scan first.")
+
+st.caption(f"V{V6_VERSION}: existing V5 engine retained above; V6 adds deterministic intraday analysis, risk sizing and paper trade management. Live execution is intentionally disabled until exchange order integration is explicitly implemented and verified.")
+
+# =============================================================================
+# V6.1 MARKET-WIDE SIGNAL ENGINE — RANGE + BREAKOUT + PUMP/DUMP
+# =============================================================================
+# Purpose: turn the existing V5/V6 analysis into a "tell me when to trade"
+# scanner.  It keeps the original V5 code intact and adds a market-wide layer.
+# It is deliberately analysis/paper-only; it does not place live orders.
+
+V61_VERSION = "6.1-MARKET-SIGNAL"
+V61_DEFAULTS = {
+    "lookback_15m": 160,
+    "lookback_1h": 120,
+    "lookback_4h": 100,
+    "range_min_touches": 2,
+    "range_max_width_pct": 8.0,
+    "entry_zone_pct": 0.45,
+    "min_rr": 2.0,
+    "min_score": 78,
+    "max_scan_workers": 6,
+}
+
+
+def v61_instrument_pair(x):
+    if not isinstance(x, dict):
+        return None
+    for k in ("pair", "symbol", "market", "instrument", "coindcx_name"):
+        v = x.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def v61_symbol(x, pair):
+    if isinstance(x, dict):
+        for k in ("symbol", "pair", "display_name", "market"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return pair
+
+
+def v61_price_for_pair(prices, pair):
+    if not isinstance(prices, dict):
+        return np.nan
+    candidates = [pair, pair.upper(), pair.lower()]
+    for k in candidates:
+        if k in prices:
+            v = prices[k]
+            if isinstance(v, dict):
+                for kk in ("price", "last_price", "last", "close"):
+                    if kk in v:
+                        return v6_num(v[kk])
+            return v6_num(v)
+    # Some API payloads use a nested market object.
+    for k, v in prices.items():
+        if str(k).upper() == str(pair).upper():
+            if isinstance(v, dict):
+                for kk in ("price", "last_price", "last", "close"):
+                    if kk in v:
+                        return v6_num(v[kk])
+            return v6_num(v)
+    return np.nan
+
+
+def v61_fetch_candidate(pair):
+    """Fetch only the timeframes needed by the fast market-wide signal engine."""
+    try:
+        d15 = get_tf(pair, "15m", 3)
+        d1h = get_tf(pair, "1H", 7)
+        d4h = get_tf(pair, "4H", 25)
+        if any(d is None or d.empty for d in (d15, d1h, d4h)):
+            return None
+        return pair, d15, d1h, d4h
+    except Exception:
+        return None
+
+
+def v61_atr(x):
+    if x is None or len(x) < 20:
+        return np.nan
+    z = indicators(completed(x))
+    return v6_num(z.iloc[-1].get("atr")) if not z.empty else np.nan
+
+
+def v61_cluster_levels(d, lookback=120, tolerance_pct=0.45):
+    """Cluster swing highs/lows into practical zones rather than exact prices."""
+    if d is None or d.empty:
+        return [], []
+    x = completed(d).tail(lookback).reset_index(drop=True)
+    if len(x) < 30:
+        return [], []
+    highs = x.high.astype(float).to_numpy()
+    lows = x.low.astype(float).to_numpy()
+    close = x.close.astype(float).to_numpy()
+    last = float(close[-1])
+    if not np.isfinite(last) or last <= 0:
+        return [], []
+    # Local extrema, then cluster nearby extrema.
+    hi_pts, lo_pts = [], []
+    for i in range(2, len(x)-2):
+        if highs[i] >= highs[i-1] and highs[i] >= highs[i-2] and highs[i] >= highs[i+1] and highs[i] >= highs[i+2]:
+            hi_pts.append(float(highs[i]))
+        if lows[i] <= lows[i-1] and lows[i] <= lows[i-2] and lows[i] <= lows[i+1] and lows[i] <= lows[i+2]:
+            lo_pts.append(float(lows[i]))
+
+    def cluster(points):
+        if not points:
+            return []
+        pts = sorted(points)
+        clusters = []
+        for p in pts:
+            if not clusters:
+                clusters.append([p])
+                continue
+            center = float(np.mean(clusters[-1]))
+            if abs(p-center)/center*100 <= tolerance_pct:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+        out = []
+        for c in clusters:
+            center = float(np.mean(c))
+            touches = len(c)
+            out.append({"level": center, "touches": touches, "strength": min(1.0, 0.35 + 0.18*touches)})
+        return out
+
+    return cluster(hi_pts), cluster(lo_pts)
+
+
+def v61_nearest_levels(d15, d1h, d4h, price):
+    """Build support/resistance from 15m, 1H and 4H swing clusters."""
+    levels_hi, levels_lo = [], []
+    for d, weight in ((d15, 1.0), (d1h, 1.35), (d4h, 1.7)):
+        hi, lo = v61_cluster_levels(d)
+        for q in hi:
+            q = dict(q); q["strength"] *= weight; levels_hi.append(q)
+        for q in lo:
+            q = dict(q); q["strength"] *= weight; levels_lo.append(q)
+
+    def merge(levels):
+        if not levels:
+            return []
+        levels = sorted(levels, key=lambda z: z["level"])
+        merged = []
+        for z in levels:
+            if not merged or abs(z["level"]-merged[-1]["level"])/merged[-1]["level"]*100 > 0.55:
+                merged.append({"level": z["level"], "strength": z["strength"], "touches": z["touches"]})
+            else:
+                old = merged[-1]
+                w1, w2 = old["strength"], z["strength"]
+                old["level"] = (old["level"]*w1 + z["level"]*w2)/(w1+w2)
+                old["strength"] += z["strength"]
+                old["touches"] += z["touches"]
+        return merged
+
+    hi, lo = merge(levels_hi), merge(levels_lo)
+    supports = sorted([z for z in lo if z["level"] < price], key=lambda z: price-z["level"])
+    resistances = sorted([z for z in hi if z["level"] > price], key=lambda z: z["level"]-price)
+    return supports, resistances
+
+
+def v61_range_state(d15, d1h, d4h, price):
+    """Detect a range and return its practical support/resistance zones."""
+    if any(d is None or d.empty for d in (d15, d1h, d4h)) or not np.isfinite(price) or price <= 0:
+        return {"is_range": False, "score": 0}
+    x15 = indicators(completed(d15)).tail(100)
+    x1h = indicators(completed(d1h)).tail(80)
+    x4h = indicators(completed(d4h)).tail(60)
+    if min(len(x15), len(x1h), len(x4h)) < 30:
+        return {"is_range": False, "score": 0}
+
+    # Trend strength: ranges are strongest when ADX is modest and EMA spread is small.
+    adx = v6_num(x15.iloc[-1].get("adx"), 0)
+    ema20, ema50 = v6_num(x15.iloc[-1].get("ema20")), v6_num(x15.iloc[-1].get("ema50"))
+    ema_spread = abs(ema20-ema50)/price*100 if np.isfinite(ema20) and np.isfinite(ema50) else 99
+
+    supports, resistances = v61_nearest_levels(d15, d1h, d4h, price)
+    s = supports[0] if supports else None
+    r = resistances[0] if resistances else None
+    if not s or not r or r["level"] <= s["level"]:
+        return {"is_range": False, "score": 0, "support": s, "resistance": r}
+
+    width_pct = (r["level"]-s["level"])/price*100
+    position = (price-s["level"])/(r["level"]-s["level"])
+    # Repeated boundary tests on the 1H chart are strong evidence of a tradable range.
+    h = x1h.high.to_numpy(dtype=float)
+    l = x1h.low.to_numpy(dtype=float)
+    touch_r = int(np.sum(np.abs(h-r["level"])/r["level"]*100 <= 0.65))
+    touch_s = int(np.sum(np.abs(l-s["level"])/s["level"]*100 <= 0.65))
+
+    score = 0
+    if width_pct <= V61_DEFAULTS["range_max_width_pct"]: score += 25
+    if adx < 25: score += 20
+    elif adx < 30: score += 10
+    if ema_spread < 1.2: score += 15
+    elif ema_spread < 2.0: score += 8
+    if touch_r >= 2: score += 15
+    if touch_s >= 2: score += 15
+    if 0.12 <= position <= 0.88: score += 10
+
+    return {
+        "is_range": score >= 55 and width_pct <= V61_DEFAULTS["range_max_width_pct"] and touch_r >= 2 and touch_s >= 2,
+        "score": int(min(100, score)),
+        "support": s,
+        "resistance": r,
+        "width_pct": width_pct,
+        "position": position,
+        "touch_r": touch_r,
+        "touch_s": touch_s,
+        "adx": adx,
+        "ema_spread": ema_spread,
+    }
+
+
+def v61_regime(d1h, d4h):
+    x1 = indicators(completed(d1h))
+    x4 = indicators(completed(d4h))
+    if x1.empty or x4.empty:
+        return "UNKNOWN", 0
+    a, b = x1.iloc[-1], x4.iloc[-1]
+    bull = sum([
+        v6_num(a.close) > v6_num(a.ema20),
+        v6_num(a.ema20) > v6_num(a.ema50),
+        v6_num(a.macd) > v6_num(a.macd_signal),
+        v6_num(b.close) > v6_num(b.ema20),
+        v6_num(b.ema20) > v6_num(b.ema50),
+    ])
+    bear = sum([
+        v6_num(a.close) < v6_num(a.ema20),
+        v6_num(a.ema20) < v6_num(a.ema50),
+        v6_num(a.macd) < v6_num(a.macd_signal),
+        v6_num(b.close) < v6_num(b.ema20),
+        v6_num(b.ema20) < v6_num(b.ema50),
+    ])
+    if bull >= 4: return "BULL TREND", bull*20
+    if bear >= 4: return "BEAR TREND", bear*20
+    return "MIXED", 50
+
+
+def v61_momentum(d15):
+    x = indicators(completed(d15))
+    if len(x) < 30:
+        return {}
+    a = x.iloc[-1]
+    prev20 = x.iloc[-21].close if len(x) >= 21 else np.nan
+    close = v6_num(a.close)
+    return {
+        "close": close,
+        "rsi": v6_num(a.rsi),
+        "macd": v6_num(a.macd),
+        "macd_signal": v6_num(a.macd_signal),
+        "atr": v6_num(a.atr),
+        "atr_pct": v6_num(a.atr_pct),
+        "vol_ratio": v6_num(a.vol_ratio, 1),
+        "ema20": v6_num(a.ema20),
+        "ema50": v6_num(a.ema50),
+        "return_5h_pct": v6_pct(close, prev20),
+        "close_open": v6_pct(close, x.iloc[-1].open),
+    }
+
+
+def v61_breakout_status(d15, support, resistance):
+    x = completed(d15).tail(12)
+    if x.empty or not support or not resistance:
+        return "NONE"
+    close = float(x.close.iloc[-1]); prev = float(x.close.iloc[-2]) if len(x) > 1 else close
+    r = resistance["level"]; s = support["level"]
+    atr = v61_atr(d15)
+    buf = max(atr*0.35 if np.isfinite(atr) else 0, close*0.0015)
+    if prev <= r and close > r + buf: return "BREAKOUT_UP"
+    if prev >= s and close < s - buf: return "BREAKDOWN_DOWN"
+    return "NONE"
+
+
+def v61_trade_from_setup(pair, side, price, support, resistance, atr, score, reason):
+    """Return entry/SL/TP levels.  Entry is a zone; trade is valid only after trigger."""
+    if not np.isfinite(price) or price <= 0 or not np.isfinite(atr) or atr <= 0:
+        return None
+    s = support["level"] if support else np.nan
+    r = resistance["level"] if resistance else np.nan
+    if side == "LONG":
+        if not np.isfinite(s): return None
+        entry = s * 1.0015
+        stop = min(s - 0.85*atr, entry - 1.15*atr)
+        target1 = r * 0.997 if np.isfinite(r) else entry + 2*atr
+        risk = entry-stop
+        if risk <= 0: return None
+        target2 = entry + max(2.8*risk, (target1-entry)*1.55)
+        rr1 = (target1-entry)/risk
+        rr2 = (target2-entry)/risk
+    else:
+        if not np.isfinite(r): return None
+        entry = r * 0.9985
+        stop = max(r + 0.85*atr, entry + 1.15*atr)
+        target1 = s * 1.003 if np.isfinite(s) else entry - 2*atr
+        risk = stop-entry
+        if risk <= 0: return None
+        target2 = entry - max(2.8*risk, (entry-target1)*1.55)
+        rr1 = (entry-target1)/risk
+        rr2 = (entry-target2)/risk
+    if rr1 < V61_DEFAULTS["min_rr"]:
+        return None
+    return {
+        "pair": pair, "side": side, "entry": entry, "stop": stop,
+        "tp1": target1, "tp2": target2, "rr1": rr1, "rr2": rr2,
+        "score": score, "reason": reason,
+    }
+
+
+def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
+    m = v61_momentum(d15)
+    if not m or not np.isfinite(price):
+        return None
+    regime, regime_score = v61_regime(d1h, d4h)
+    supports, resistances = v61_nearest_levels(d15, d1h, d4h, price)
+    support = supports[0] if supports else None
+    resistance = resistances[0] if resistances else None
+    rng = v61_range_state(d15, d1h, d4h, price)
+    brk = v61_breakout_status(d15, support, resistance)
+    atr = m.get("atr", np.nan)
+    candidates = []
+
+    # ---------------- RANGE LONG ----------------
+    if rng.get("is_range") and support:
+        dist_s = abs(price-support["level"])/price*100
+        near_s = dist_s <= max(V61_DEFAULTS["entry_zone_pct"], m.get("atr_pct", 0)*1.25)
+        rejection = m.get("rsi", 50) < 48 and m.get("macd", 0) >= m.get("macd_signal", 0)
+        score = 55 + int(rng["score"]*0.25)
+        if near_s: score += 15
+        if rejection: score += 10
+        if m.get("vol_ratio", 1) >= 1.25: score += 5
+        if regime == "BEAR TREND": score -= 15
+        score = max(0, min(100, score))
+        if score >= V61_DEFAULTS["min_score"]:
+            t = v61_trade_from_setup(pair, "LONG", price, support, resistance, atr, score, "RANGE SUPPORT REJECTION")
+            if t:
+                t.update({"symbol": symbol, "type": "RANGE LONG", "status": "LONG NOW" if near_s and rejection else "LONG SETUP",
+                          "support": support["level"], "resistance": resistance["level"] if resistance else np.nan,
+                          "range_score": rng["score"], "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- RANGE SHORT ----------------
+    if rng.get("is_range") and resistance:
+        dist_r = abs(resistance["level"]-price)/price*100
+        near_r = dist_r <= max(V61_DEFAULTS["entry_zone_pct"], m.get("atr_pct", 0)*1.25)
+        rejection = m.get("rsi", 50) > 52 and m.get("macd", 0) <= m.get("macd_signal", 0)
+        score = 55 + int(rng["score"]*0.25)
+        if near_r: score += 15
+        if rejection: score += 10
+        if m.get("vol_ratio", 1) >= 1.25: score += 5
+        if regime == "BULL TREND": score -= 15
+        score = max(0, min(100, score))
+        if score >= V61_DEFAULTS["min_score"]:
+            t = v61_trade_from_setup(pair, "SHORT", price, support, resistance, atr, score, "RANGE RESISTANCE REJECTION")
+            if t:
+                t.update({"symbol": symbol, "type": "RANGE SHORT", "status": "SHORT NOW" if near_r and rejection else "SHORT SETUP",
+                          "support": support["level"] if support else np.nan, "resistance": resistance["level"],
+                          "range_score": rng["score"], "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- BREAKOUT LONG ----------------
+    if brk == "BREAKOUT_UP":
+        score = 72
+        if m.get("vol_ratio", 1) >= 1.5: score += 10
+        if m.get("rsi", 50) < 78: score += 7
+        if regime == "BULL TREND": score += 8
+        if regime == "BEAR TREND": score -= 20
+        if score >= V61_DEFAULTS["min_score"]:
+            # For breakout, use old resistance as entry and the next ATR-based stop.
+            fake_support = {"level": resistance["level"] - max(atr, price*0.006)} if resistance else None
+            t = v61_trade_from_setup(pair, "LONG", price, fake_support, {"level": price+2.8*atr}, atr, score, "15M BREAKOUT + CONFIRMATION")
+            if t:
+                t.update({"symbol": symbol, "type": "BREAKOUT LONG", "status": "LONG NOW",
+                          "support": fake_support["level"], "resistance": resistance["level"] if resistance else np.nan,
+                          "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- BREAKDOWN SHORT ----------------
+    if brk == "BREAKDOWN_DOWN":
+        score = 72
+        if m.get("vol_ratio", 1) >= 1.5: score += 10
+        if m.get("rsi", 50) > 22: score += 7
+        if regime == "BEAR TREND": score += 8
+        if regime == "BULL TREND": score -= 20
+        if score >= V61_DEFAULTS["min_score"]:
+            fake_res = {"level": support["level"] + max(atr, price*0.006)} if support else None
+            t = v61_trade_from_setup(pair, "SHORT", price, {"level": price-2.8*atr}, fake_res, atr, score, "15M BREAKDOWN + CONFIRMATION")
+            if t:
+                t.update({"symbol": symbol, "type": "BREAKDOWN SHORT", "status": "SHORT NOW",
+                          "support": support["level"] if support else np.nan, "resistance": fake_res["level"],
+                          "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- PUMP / DUMP WATCH ----------------
+    ret = m.get("return_5h_pct", 0)
+    vol = m.get("vol_ratio", 1)
+    rsi = m.get("rsi", 50)
+    pump_score = 0
+    dump_score = 0
+    if ret >= 3: pump_score += 25
+    if ret >= 6: pump_score += 15
+    if vol >= 1.5: pump_score += 20
+    if vol >= 2.5: pump_score += 10
+    if rsi >= 60: pump_score += 10
+    if m.get("macd", 0) > m.get("macd_signal", 0): pump_score += 10
+    if regime == "BULL TREND": pump_score += 10
+    if ret <= -3: dump_score += 25
+    if ret <= -6: dump_score += 15
+    if vol >= 1.5: dump_score += 20
+    if vol >= 2.5: dump_score += 10
+    if rsi <= 40: dump_score += 10
+    if m.get("macd", 0) < m.get("macd_signal", 0): dump_score += 10
+    if regime == "BEAR TREND": dump_score += 10
+
+    watches = []
+    if pump_score >= 55:
+        watches.append({"pair":pair,"symbol":symbol,"watch":"PUMP WATCH","score":min(100,pump_score),"price":price,
+                        "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
+    if dump_score >= 55:
+        watches.append({"pair":pair,"symbol":symbol,"watch":"DUMP WATCH","score":min(100,dump_score),"price":price,
+                        "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
+
+    return {"candidates": candidates, "watches": watches, "range": rng, "regime": regime,
+            "momentum": m, "support": support, "resistance": resistance}
+
+
+def v61_scan_all(progress=None, max_workers=6):
+    """Scan all active USDT Futures. Current-price data is fetched once; candle data is cached."""
+    instruments = active_instruments("USDT")
+    prices = futures_prices()
+    items = []
+    seen = set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        price = v61_price_for_pair(prices, pair)
+        if np.isfinite(price) and price > 0:
+            items.append((pair, v61_symbol(inst, pair), price))
+
+    # Concurrent network reads make a whole-market scan practical without changing
+    # the existing API functions or inventing private CoinDCX endpoints.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(v61_fetch_candidate, p[0]): p for p in items}
+        for fut in as_completed(futs):
+            base = futs[fut]; fetched = fut.result(); done += 1
+            if progress:
+                progress(done, len(items))
+            if not fetched:
+                continue
+            pair, d15, d1h, d4h = fetched
+            try:
+                a = v61_analyze_candidate(pair, base[1], base[2], d15, d1h, d4h)
+                if a:
+                    a["price"] = base[2]
+                    results.append(a)
+            except Exception:
+                continue
+    return results, len(items)
+
+
+def v61_fmt_price(v):
+    v = v6_num(v)
+    if not np.isfinite(v): return "—"
+    if abs(v) >= 1000: return f"{v:,.2f}"
+    if abs(v) >= 1: return f"{v:,.4f}"
+    if abs(v) >= .01: return f"{v:,.6f}"
+    return f"{v:,.8f}"
+
+
+def v61_signal_card(t):
+    side = t.get("side", "")
+    emoji = "🟢" if side == "LONG" else "🔴"
+    st.write(f"### {emoji} {t.get('status','SIGNAL')} — {t.get('symbol', t.get('pair'))}")
+    st.write(f"**Type:** {t.get('type','')}  |  **Score:** {t.get('score',0)}/100  |  **Regime:** {t.get('regime','')}  ")
+    st.write(f"**Entry:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
+    st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
+
+
+# ----------------------------- MARKET SIGNAL UI ------------------------------
+st.divider()
+st.header("🎯 V6.1 — Market-Wide Long / Short Signals")
+st.caption("Scans all active CoinDCX USDT Futures using the existing public market-data API. Existing V5 remains above. No live orders are placed.")
+
+with st.expander("How the signal works", expanded=False):
+    st.markdown("""
+**Your screen should answer one question: where is the trade?**
+
+- 🟢 **LONG NOW** = price has reached/confirmed a qualifying long trigger.
+- 🔴 **SHORT NOW** = price has reached/confirmed a qualifying short trigger.
+- 🟢/🔴 **SETUP** = level is identified, but the trigger is not confirmed yet.
+- 🟦 **RANGE** = repeated support/resistance behaviour; buy support / short resistance only with confirmation.
+- 🚀 **PUMP WATCH** and 🔻 **DUMP WATCH** are momentum warnings, **not automatic trade signals**.
+- A strong breakout/breakdown invalidates the range logic rather than blindly fading it.
+""")
+
+c1, c2, c3 = st.columns(3)
+with c1:
+    v61_min_score = st.slider("Minimum signal score", 70, 95, 78, 1, key="v61_min_score")
+with c2:
+    v61_workers = st.slider("Concurrent API workers", 2, 10, 6, 1, key="v61_workers")
+with c3:
+    v61_auto = st.checkbox("Auto-refresh after scan", value=False, key="v61_auto")
+
+if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
+    V61_DEFAULTS["min_score"] = v61_min_score
+    bar = st.progress(0, text="Starting whole-market scan…")
+    def _progress(done, total):
+        pct = int(done/max(total,1)*100)
+        bar.progress(pct, text=f"Scanning Futures: {done}/{total}")
+    with st.spinner("Fetching multi-timeframe data and calculating signals…"):
+        scan, total = v61_scan_all(_progress, max_workers=v61_workers)
+    bar.progress(100, text=f"Scan complete: {total} active contracts checked")
+    # If the historical learner has been populated, blend its evidence into
+    # the current market scan. The deterministic V5/V6.1 logic remains intact.
+    if v62_db_stats()["samples"] >= 100:
+        with st.spinner("Comparing current setups with learned historical patterns…"):
+            scan = v62_enhance_scan(scan)
+    st.session_state["v61_scan"] = scan
+    st.session_state["v61_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+scan = st.session_state.get("v61_scan", [])
+if scan:
+    trades = []
+    watches = []
+    ranges = []
+    for a in scan:
+        for t in a.get("candidates", []):
+            if t.get("score",0) >= v61_min_score:
+                trades.append(t)
+        watches.extend(a.get("watches", []))
+        r = a.get("range", {})
+        if r.get("is_range"):
+            ranges.append({"pair":a.get("candidates", [{}])[0].get("symbol") if a.get("candidates") else "", "price":a.get("price"), **r})
+
+    longs = sorted([x for x in trades if x.get("side")=="LONG"], key=lambda x:x.get("score",0), reverse=True)
+    shorts = sorted([x for x in trades if x.get("side")=="SHORT"], key=lambda x:x.get("score",0), reverse=True)
+    pumps = sorted([x for x in watches if x.get("watch")=="PUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
+    dumps = sorted([x for x in watches if x.get("watch")=="DUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
+
+    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {total if 'total' in locals() else 'all loaded'}")
+    a,b,c,d = st.columns(4)
+    a.metric("LONG signals", len(longs))
+    b.metric("SHORT signals", len(shorts))
+    c.metric("Pump watch", len(pumps))
+    d.metric("Dump watch", len(dumps))
+
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 LONG", "🔴 SHORT", "🚀 PUMP", "🔻 DUMP", "🟦 RANGES"])
+    with tab1:
+        if longs:
+            for t in longs[:10]: v61_signal_card(t)
+        else: st.info("No qualifying LONG signal. No trade is the correct result.")
+    with tab2:
+        if shorts:
+            for t in shorts[:10]: v61_signal_card(t)
+        else: st.info("No qualifying SHORT signal. No trade is the correct result.")
+    with tab3:
+        if pumps:
+            st.dataframe(pd.DataFrame(pumps[:15])[['symbol','score','price','return_5h_pct','vol_ratio','rsi','regime']], use_container_width=True, hide_index=True)
+        else: st.info("No unusual pump behaviour detected.")
+    with tab4:
+        if dumps:
+            st.dataframe(pd.DataFrame(dumps[:15])[['symbol','score','price','return_5h_pct','vol_ratio','rsi','regime']], use_container_width=True, hide_index=True)
+        else: st.info("No unusual dump behaviour detected.")
+    with tab5:
+        # Reconstruct range rows from analysis objects for a compact view.
+        range_rows=[]
+        for a in scan:
+            r=a.get("range",{})
+            if r.get("is_range") and a.get("support") and a.get("resistance"):
+                range_rows.append({
+                    "symbol": next((x.get("symbol") for x in a.get("candidates",[]) if x.get("symbol")), ""),
+                    "price":a.get("price"), "support":a["support"]["level"], "resistance":a["resistance"]["level"],
+                    "range_score":r.get("score"), "width_pct":r.get("width_pct"), "support_touches":r.get("touch_s"),
+                    "resistance_touches":r.get("touch_r"), "regime":a.get("regime")})
+        if range_rows:
+            st.dataframe(pd.DataFrame(range_rows).sort_values("range_score", ascending=False).head(20), use_container_width=True, hide_index=True)
+        else: st.info("No clean ranges detected.")
+else:
+    st.info("Click **SCAN ALL COINDCX FUTURES**. The scanner will do the market-wide analysis for you and show only actionable candidates.")
+
+st.caption(f"V{V61_VERSION} + V{V62_VERSION}: V5 retained + market-wide signals + historical pattern learning. Signals are analytical, not guarantees. Live order execution remains disabled.")
+
+# =============================================================================
+# V6.2 AUTONOMOUS HISTORICAL PATTERN LEARNING ENGINE
+# =============================================================================
+# This layer turns the scanner into a market-wide pattern learner.
+# It does NOT train an LLM. It stores historical CoinDCX Futures candles,
+# converts recurring market states into feature vectors, records what happened
+# next, and uses similar historical states to improve the current signal score.
+# The learner is deliberately local (SQLite) and does not place orders.
+
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+V62_VERSION = "6.2-LEARNING"
+V62_DB = str(Path(__file__).with_name("coindcx_pattern_learning.db")) if "Path" in globals() else "coindcx_pattern_learning.db"
+V62_LOCK = threading.Lock()
+V62_FEATURES = [
+    "ret_1h", "ret_4h", "ret_12h", "ret_24h",
+    "rsi", "macd_atr", "ema20_gap", "ema50_gap", "ema200_gap",
+    "atr_pct", "vol_ratio", "adx", "bb_pos", "range_pos",
+    "body_pct", "upper_wick", "lower_wick", "trend_score"
+]
+
+
+def v62_db():
+    con = sqlite3.connect(V62_DB, timeout=30, check_same_thread=False)
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS pattern_samples (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            pair TEXT NOT NULL,
+            ts TEXT NOT NULL,
+            side_bias TEXT NOT NULL,
+            ret_1h REAL, ret_4h REAL, ret_12h REAL, ret_24h REAL,
+            rsi REAL, macd_atr REAL, ema20_gap REAL, ema50_gap REAL, ema200_gap REAL,
+            atr_pct REAL, vol_ratio REAL, adx REAL, bb_pos REAL, range_pos REAL,
+            body_pct REAL, upper_wick REAL, lower_wick REAL, trend_score REAL,
+            long_max_4h REAL, long_min_4h REAL, short_max_4h REAL, short_min_4h REAL,
+            long_win INTEGER, short_win INTEGER,
+            UNIQUE(pair, ts)
+        )
+    """)
+    con.execute("CREATE INDEX IF NOT EXISTS idx_pattern_ts ON pattern_samples(ts)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_pattern_pair_ts ON pattern_samples(pair, ts)")
+    con.commit()
+    return con
+
+
+def v62_pct_raw(a, b):
+    try:
+        a, b = float(a), float(b)
+        if not np.isfinite(a) or not np.isfinite(b) or b == 0:
+            return np.nan
+        return (a / b - 1.0) * 100.0
+    except Exception:
+        return np.nan
+
+
+def v62_resample_ohlcv(d, rule):
+    if d is None or d.empty:
+        return pd.DataFrame()
+    x = d.copy().set_index("time")
+    y = x.resample(rule).agg({
+        "open":"first", "high":"max", "low":"min", "close":"last", "volume":"sum"
+    }).dropna().reset_index()
+    return y
+
+
+def v62_feature_row(x, i):
+    """Build a normalized market-state vector from a completed 15m candle."""
+    if x is None or len(x) < 220 or i < 205 or i >= len(x):
+        return None
+    z = x.iloc[:i+1]
+    a = indicators(z).iloc[-1]
+    close = v6_num(a.close)
+    atr = v6_num(a.atr)
+    if not np.isfinite(close) or close <= 0 or not np.isfinite(atr) or atr <= 0:
+        return None
+
+    def ret(n):
+        if len(z) <= n:
+            return np.nan
+        return v62_pct_raw(close, z.iloc[-n-1].close)
+
+    hi = float(z.high.tail(96).max())
+    lo = float(z.low.tail(96).min())
+    bb_up = v6_num(a.bbup)
+    bb_lo = v6_num(a.bblow)
+    bb_pos = (close-bb_lo)/(bb_up-bb_lo) if np.isfinite(bb_up) and np.isfinite(bb_lo) and bb_up > bb_lo else 0.5
+    range_pos = (close-lo)/(hi-lo) if hi > lo else 0.5
+    op = v6_num(a.open)
+    high = v6_num(a.high)
+    low = v6_num(a.low)
+    body_pct = abs(close-op)/close*100 if np.isfinite(op) else 0
+    upper_wick = max(0, high-max(op, close))/close*100 if np.isfinite(high) and np.isfinite(op) else 0
+    lower_wick = max(0, min(op, close)-low)/close*100 if np.isfinite(low) and np.isfinite(op) else 0
+
+    bull_flags = [
+        close > v6_num(a.ema20),
+        v6_num(a.ema20) > v6_num(a.ema50),
+        v6_num(a.ema50) > v6_num(a.ema200),
+        v6_num(a.macd) > v6_num(a.macd_signal),
+        v6_num(a.pdi) > v6_num(a.mdi),
+    ]
+    trend_score = (sum(bull_flags) - (len(bull_flags)-sum(bull_flags))) / len(bull_flags)
+    side_bias = "LONG" if trend_score >= 0.2 else ("SHORT" if trend_score <= -0.2 else "NEUTRAL")
+
+    vals = {
+        "ret_1h": ret(4), "ret_4h": ret(16), "ret_12h": ret(48), "ret_24h": ret(96),
+        "rsi": (v6_num(a.rsi, 50)-50)/50,
+        "macd_atr": v6_num(a.macd)/atr,
+        "ema20_gap": (close-v6_num(a.ema20))/close*100,
+        "ema50_gap": (close-v6_num(a.ema50))/close*100,
+        "ema200_gap": (close-v6_num(a.ema200))/close*100,
+        "atr_pct": v6_num(a.atr_pct, 0),
+        "vol_ratio": min(v6_num(a.vol_ratio, 1), 8),
+        "adx": min(v6_num(a.adx, 0), 80),
+        "bb_pos": float(np.clip(bb_pos, -1, 2)),
+        "range_pos": float(np.clip(range_pos, -1, 2)),
+        "body_pct": min(body_pct, 20),
+        "upper_wick": min(upper_wick, 20),
+        "lower_wick": min(lower_wick, 20),
+        "trend_score": trend_score,
+    }
+    if any(not np.isfinite(v) for v in vals.values()):
+        return None
+    return vals, side_bias
+
+
+def v62_label_sample(x, i, feat, atr):
+    """Label what happened after the pattern using ATR-normalized movement.
+    A trade is considered a historical winner when price moved at least 1.8 ATR
+    in the expected direction before making a 1.0 ATR adverse move over 4h.
+    This is a learning label, not a guarantee for future trades.
+    """
+    if i + 16 >= len(x) or not np.isfinite(atr) or atr <= 0:
+        return None
+    entry = float(x.iloc[i].close)
+    future = x.iloc[i+1:i+17]
+    if future.empty:
+        return None
+    max_up = (float(future.high.max())/entry-1)*100
+    min_down = (float(future.low.min())/entry-1)*100
+    atr_pct = atr/entry*100
+    long_win = int(max_up >= 1.8*atr_pct and min_down > -1.0*atr_pct)
+    short_win = int(min_down <= -1.8*atr_pct and max_up < 1.0*atr_pct)
+    return {
+        "long_max_4h": max_up, "long_min_4h": min_down,
+        "short_max_4h": max_up, "short_min_4h": min_down,
+        "long_win": long_win, "short_win": short_win,
+    }
+
+
+def v62_train_one(pair, days=45, sample_every=4):
+    """Download historical 15m candles for one active Futures contract and learn.
+    sample_every=4 means one training observation per hour, reducing duplicate states.
+    """
+    try:
+        d = get_tf(pair, "15m", days)
+        d = completed(d)
+        if d is None or len(d) < 260:
+            return pair, 0, 0, "insufficient history"
+        x = d.reset_index(drop=True)
+        con = v62_db()
+        inserted = 0
+        skipped = 0
+        # Recalculate indicators once for labeling efficiency.
+        ind = indicators(x)
+        with V62_LOCK:
+            for i in range(205, len(x)-16, sample_every):
+                feat_bias = v62_feature_row(x, i)
+                if feat_bias is None:
+                    skipped += 1
+                    continue
+                feat, side_bias = feat_bias
+                atr = v6_num(ind.iloc[i].atr)
+                label = v62_label_sample(x, i, feat, atr)
+                if label is None:
+                    skipped += 1
+                    continue
+                ts = pd.to_datetime(x.iloc[i].time, utc=True).isoformat()
+                cols = [
+                    pair, ts, side_bias,
+                    *[feat[k] for k in V62_FEATURES],
+                    label["long_max_4h"], label["long_min_4h"],
+                    label["short_max_4h"], label["short_min_4h"],
+                    label["long_win"], label["short_win"]
+                ]
+                con.execute("""
+                    INSERT OR REPLACE INTO pattern_samples
+                    (pair,ts,side_bias,ret_1h,ret_4h,ret_12h,ret_24h,rsi,macd_atr,
+                     ema20_gap,ema50_gap,ema200_gap,atr_pct,vol_ratio,adx,bb_pos,range_pos,
+                     body_pct,upper_wick,lower_wick,trend_score,long_max_4h,long_min_4h,
+                     short_max_4h,short_min_4h,long_win,short_win)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, cols)
+                inserted += 1
+            con.commit()
+            count = con.execute("SELECT COUNT(*) FROM pattern_samples WHERE pair=?", (pair,)).fetchone()[0]
+        con.close()
+        return pair, inserted, int(count), "ok"
+    except Exception as e:
+        return pair, 0, 0, str(e)[:160]
+
+
+def v62_train_all(progress=None, days=45, workers=4):
+    instruments = active_instruments("USDT")
+    pairs = []
+    seen = set()
+    for inst in instruments:
+        p = v61_instrument_pair(inst)
+        if p and p not in seen:
+            seen.add(p); pairs.append(p)
+    results = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(v62_train_one, p, days, 4): p for p in pairs}
+        for fut in as_completed(futs):
+            res = fut.result(); results.append(res); done += 1
+            if progress:
+                progress(done, len(pairs), res)
+    return results, len(pairs)
+
+
+def v62_db_stats():
+    try:
+        con = v62_db()
+        row = con.execute("SELECT COUNT(*), COUNT(DISTINCT pair), MIN(ts), MAX(ts) FROM pattern_samples").fetchone()
+        con.close()
+        return {"samples": row[0] or 0, "coins": row[1] or 0, "first": row[2], "last": row[3]}
+    except Exception:
+        return {"samples":0,"coins":0,"first":None,"last":None}
+
+
+def v62_nearest_patterns(current_features, side, pair=None, limit=2500):
+    """Find historically similar states across ALL trained CoinDCX Futures.
+    Same-coin observations receive a modest preference, but cross-coin patterns
+    are included so the learner can recognize market-wide setups.
+    """
+    try:
+        con = v62_db()
+        cols = ",".join(V62_FEATURES) + ",pair,side_bias,long_win,short_win,long_max_4h,long_min_4h,short_max_4h,short_min_4h"
+        df = pd.read_sql_query(f"SELECT {cols} FROM pattern_samples ORDER BY id DESC LIMIT ?", con, params=(limit,))
+        con.close()
+        if df.empty:
+            return pd.DataFrame()
+        arr = df[V62_FEATURES].to_numpy(dtype=float)
+        cur = np.array([current_features[k] for k in V62_FEATURES], dtype=float)
+        mu = np.nanmedian(arr, axis=0)
+        mad = np.nanmedian(np.abs(arr-mu), axis=0)
+        scale = np.where(mad > 1e-8, mad*1.4826, np.nanstd(arr, axis=0))
+        scale = np.where(scale > 1e-8, scale, 1.0)
+        dist = np.sqrt(np.nanmean(((arr-cur)/scale)**2, axis=1))
+        df["distance"] = dist
+        df["same_pair"] = (df["pair"].astype(str) == str(pair)).astype(int)
+        # Side-specific historical outcome.
+        df["win"] = df["long_win"] if side == "LONG" else df["short_win"]
+        df = df.sort_values(["distance","same_pair"], ascending=[True,False]).head(100)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def v62_learning_score(pair, d15):
+    """Return a learned probability/evidence score for the current pattern."""
+    feat_bias = v62_feature_row(completed(d15).reset_index(drop=True), len(completed(d15))-1)
+    if feat_bias is None:
+        return {"long_prob":50,"short_prob":50,"long_n":0,"short_n":0,"evidence":"NONE"}
+    feat, _ = feat_bias
+    out = {}
+    for side in ("LONG","SHORT"):
+        near = v62_nearest_patterns(feat, side, pair=pair, limit=3000)
+        if near.empty:
+            out[side.lower()+"_prob"] = 50
+            out[side.lower()+"_n"] = 0
+            continue
+        # Distance-weighted historical hit rate.
+        w = 1/(0.25 + near.distance.to_numpy(dtype=float))
+        same = near.same_pair.to_numpy(dtype=float)
+        w *= (1 + 0.15*same)
+        win = near.win.to_numpy(dtype=float)
+        prob = float(np.sum(w*win)/np.sum(w)*100)
+        out[side.lower()+"_prob"] = round(float(np.clip(prob,0,100)),1)
+        out[side.lower()+"_n"] = int(len(near))
+    evidence_n = max(out.get("long_n",0), out.get("short_n",0))
+    out["evidence"] = "STRONG" if evidence_n >= 50 else ("MEDIUM" if evidence_n >= 15 else ("WEAK" if evidence_n > 0 else "NONE"))
+    return out
+
+
+def v62_enhance_scan(scan):
+    """Add learned probabilities to current V6.1 candidates without changing V5."""
+    stats = v62_db_stats()
+    if stats["samples"] < 100:
+        return scan
+    enhanced = []
+    for a in scan:
+        try:
+            pair = a.get("pair") or next((t.get("pair") for t in a.get("candidates",[])), None)
+            d15 = a.get("d15")
+            if d15 is None:
+                # Current V6.1 objects do not retain candles; fetch one short history.
+                d15 = get_tf(pair, "15m", 3) if pair else pd.DataFrame()
+            learn = v62_learning_score(pair, d15) if pair else {}
+            a = dict(a)
+            a["learning"] = learn
+            new_candidates = []
+            for t in a.get("candidates", []):
+                t = dict(t)
+                side = t.get("side","").lower()
+                lp = learn.get(side+"_prob",50)
+                # Blend deterministic score with historical pattern probability.
+                old = float(t.get("score",0))
+                t["raw_score"] = old
+                t["learned_probability"] = lp
+                t["score"] = round(0.70*old + 0.30*lp, 1)
+                t["learning_evidence"] = learn.get("evidence","NONE")
+                # Historical disagreement downgrades a setup; strong agreement upgrades it.
+                if lp < 40:
+                    t["status"] = "WAIT — HISTORY CONFLICT"
+                elif lp >= 65 and t.get("status") in ("LONG NOW","SHORT NOW"):
+                    t["status"] = t.get("status") + " + LEARNED CONFIRMATION"
+                new_candidates.append(t)
+            a["candidates"] = new_candidates
+            enhanced.append(a)
+        except Exception:
+            enhanced.append(a)
+    return enhanced
+
+
+# ------------------------- LEARNING CONTROL PANEL ----------------------------
+st.divider()
+st.header("🧠 V6.2 — Autonomous Historical Pattern Learning")
+st.caption("The agent learns from completed CoinDCX Futures 15-minute chart states across the whole active market. It records what happened after similar patterns and uses that evidence in future signals.")
+
+ls1, ls2, ls3 = st.columns(3)
+with ls1:
+    v62_days = st.selectbox("Training history", [15, 30, 45, 60], index=2, key="v62_days")
+with ls2:
+    v62_workers = st.slider("Training API workers", 2, 8, 4, 1, key="v62_workers")
+with ls3:
+    v62_stats = v62_db_stats()
+    st.metric("Learned samples", f"{v62_stats['samples']:,}")
+
+st.write(f"**Coins learned:** {v62_stats['coins']:,}  |  **History:** {v62_stats['first'] or '—'} → {v62_stats['last'] or '—'}")
+
+if st.button("🧠 TRAIN / REFRESH ALL COINDCX CHART PATTERNS", type="secondary", key="v62_train"):
+    bar2 = st.progress(0, text="Starting historical learning…")
+    errors = []
+    def _learn_progress(done, total, result):
+        pct = int(done/max(total,1)*100)
+        status = f"Learning {done}/{total}: {result[0]} (+{result[1]} samples)"
+        bar2.progress(pct, text=status)
+        if result[3] != "ok":
+            errors.append(result)
+    with st.spinner(f"Reading {v62_days} days of 15m charts for every active Futures contract…"):
+        results, learned_total = v62_train_all(_learn_progress, days=v62_days, workers=v62_workers)
+    final_stats = v62_db_stats()
+    bar2.progress(100, text=f"Learning complete: {final_stats['coins']:,} coins / {final_stats['samples']:,} samples")
+    st.session_state["v62_train_stats"] = final_stats
+    if errors:
+        st.warning(f"{len(errors)} contracts could not be learned. The scanner will continue using the contracts that succeeded.")
+    else:
+        st.success("All returned active contracts were processed successfully.")
+
+if v62_db_stats()["samples"] >= 100:
+    st.info("🧠 Learning is active. Current signals can now be compared with historical patterns from the entire trained Futures universe. Re-run training periodically to add newer market behaviour.")
+else:
+    st.warning("The learning database is not populated yet. Run the training button once before relying on historical pattern confirmation.")
