@@ -4225,10 +4225,11 @@ if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
     if v62_db_stats()["samples"] >= 100:
         with st.spinner("Comparing current setups with learned historical patterns…"):
             scan = v62_enhance_scan(scan)
-    st.session_state["v61_scan"] = scan
+    st.session_state["v61_scan_results"] = scan
+    st.session_state["v61_scan_total"] = total
     st.session_state["v61_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-scan = st.session_state.get("v61_scan", [])
+scan = st.session_state.get("v61_scan_results", [])
 if scan:
     trades = []
     watches = []
@@ -4249,7 +4250,7 @@ if scan:
     ema_bears = sorted([x for x in watches if x.get("watch")=="EMA20/100 BEAR CROSS"], key=lambda x:x.get("score",0), reverse=True)
     ema_bulls = sorted([x for x in watches if x.get("watch")=="EMA20/100 BULL CROSS"], key=lambda x:x.get("score",0), reverse=True)
 
-    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {total if 'total' in locals() else 'all loaded'}")
+    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {st.session_state.get('v61_scan_total','—')}")
     a,b,c,d = st.columns(4)
     a.metric("LONG signals", len(longs))
     b.metric("SHORT signals", len(shorts))
