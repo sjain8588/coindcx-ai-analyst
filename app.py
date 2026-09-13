@@ -2193,7 +2193,7 @@ confirmation_text=confirmation_text_v5
 # scanner.  It keeps the original V5 code intact and adds a market-wide layer.
 # It is deliberately analysis/paper-only; it does not place live orders.
 
-V61_VERSION = "6.1-MARKET-SIGNAL"
+V61_VERSION = "6.3-STRUCTURE-SIGNAL"
 V61_DEFAULTS = {
     "lookback_15m": 160,
     "lookback_1h": 120,
@@ -2509,8 +2509,19 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
     resistance = resistances[0] if resistances else None
     rng = v61_range_state(d15, d1h, d4h, price)
     brk = v61_breakout_status(d15, support, resistance)
+    structure = v63_structure_engine(d15, d1h, price)
+    ema_cross = v63_ema_cross_context({"15m": d15, "4H": d4h})
     atr = m.get("atr", np.nan)
     candidates = []
+
+    # ---------------- TRUE HH/HL / LH/LL STRUCTURE ----------------
+    # Only strong two-sided swing sequences become actionable structure alerts.
+    if structure.get("side") in ("LONG", "SHORT") and structure.get("score", 0) >= 55:
+        st = v63_structure_trade(pair, symbol, price, structure, structure["side"])
+        if st:
+            st.update({"regime": regime, "rsi": m.get("rsi", np.nan), "vol_ratio": m.get("vol_ratio", np.nan),
+                       "structure_state": structure.get("state")})
+            candidates.append(st)
 
     # ---------------- RANGE LONG ----------------
     if rng.get("is_range") and support:
@@ -2583,7 +2594,29 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
                           "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
                 candidates.append(t)
 
-    # ---------------- PUMP / DUMP WATCH ----------------
+    # ---------------- EMA20 / EMA100 CROSS CONFIRMATION ----------------
+    # A fresh bearish cross is treated as a downside confirmation, not as a
+    # standalone short trigger.  A fresh bullish cross is the mirror image.
+    for t in candidates:
+        side=t.get("side")
+        cross_score=ema_cross["bear_score"] if side == "SHORT" else ema_cross["bull_score"] if side == "LONG" else 0
+        if cross_score:
+            bonus=min(25, int(round(cross_score*0.35)))
+            t["score"]=min(100, int(t.get("score",0))+bonus)
+            matched=[]
+            c15=ema_cross["15m"]; c4=ema_cross["4H"]
+            if side == "SHORT":
+                if c15.get("fresh_bearish"): matched.append("15m EMA20/100 bearish cross")
+                if c4.get("fresh_bearish"): matched.append("4H EMA20/100 bearish cross")
+            else:
+                if c15.get("fresh_bullish"): matched.append("15m EMA20/100 bullish cross")
+                if c4.get("fresh_bullish"): matched.append("4H EMA20/100 bullish cross")
+            if matched:
+                t["reason"]=str(t.get("reason", ""))+" | "+", ".join(matched)
+        t["ema_cross"] = ema_cross
+
+    # Dedicated EMA-cross watch: useful when the crossover has just happened
+    # but the full entry trigger is not confirmed yet.
     ret = m.get("return_5h_pct", 0)
     vol = m.get("vol_ratio", 1)
     rsi = m.get("rsi", 50)
@@ -2612,8 +2645,20 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
         watches.append({"pair":pair,"symbol":symbol,"watch":"DUMP WATCH","score":min(100,dump_score),"price":price,
                         "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
 
+    if ema_cross["bear_score"] >= 28:
+        watches.append({"pair":pair,"symbol":symbol,"watch":"EMA20/100 BEAR CROSS",
+                        "score":ema_cross["bear_score"],"price":price,"return_5h_pct":ret,
+                        "vol_ratio":vol,"rsi":rsi,"regime":regime,
+                        "ema15":ema_cross["15m"]["state"],"ema4h":ema_cross["4H"]["state"]})
+    if ema_cross["bull_score"] >= 28:
+        watches.append({"pair":pair,"symbol":symbol,"watch":"EMA20/100 BULL CROSS",
+                        "score":ema_cross["bull_score"],"price":price,"return_5h_pct":ret,
+                        "vol_ratio":vol,"rsi":rsi,"regime":regime,
+                        "ema15":ema_cross["15m"]["state"],"ema4h":ema_cross["4H"]["state"]})
+
     return {"candidates": candidates, "watches": watches, "range": rng, "regime": regime,
-            "momentum": m, "support": support, "resistance": resistance}
+            "momentum": m, "support": support, "resistance": resistance, "structure": structure,
+            "ema_cross": ema_cross}
 
 
 def v61_scan_all(progress=None, max_workers=6):
@@ -3199,6 +3244,211 @@ def v6_structure_signal(d):
     if bh < ah and bl < al:
         return "LH/LL"
     return "RANGE"
+
+
+def v63_structure_engine(d15, d1h, price):
+    """True swing-sequence detector for HH/HL and LH/LL structures.
+
+    Unlike the older two-half comparison, this uses confirmed pivot swings and
+    requires the latest two swing highs/lows to progress in the same direction.
+    It is intentionally conservative: structure is a setup condition, not an
+    automatic market order.
+    """
+    def pivots(d, left=2, right=2, lookback=140):
+        if d is None or d.empty:
+            return [], []
+        x = completed(d).tail(lookback).reset_index(drop=True)
+        if len(x) < left + right + 8:
+            return [], []
+        highs, lows = [], []
+        h = pd.to_numeric(x["high"], errors="coerce").to_numpy(float)
+        l = pd.to_numeric(x["low"], errors="coerce").to_numpy(float)
+        for i in range(left, len(x)-right):
+            if np.isfinite(h[i]) and h[i] >= np.nanmax(h[i-left:i+right+1]) and h[i] > h[i-1] and h[i] >= h[i+1]:
+                highs.append({"idx": i, "price": float(h[i])})
+            if np.isfinite(l[i]) and l[i] <= np.nanmin(l[i-left:i+right+1]) and l[i] < l[i-1] and l[i] <= l[i+1]:
+                lows.append({"idx": i, "price": float(l[i])})
+        return highs, lows
+
+    h15, l15 = pivots(d15)
+    h1, l1 = pivots(d1h, left=2, right=2, lookback=100)
+    if len(h15) < 2 or len(l15) < 2 or not np.isfinite(price) or price <= 0:
+        return {"state":"INSUFFICIENT STRUCTURE", "score":0, "side":None,
+                "hh":False,"hl":False,"lh":False,"ll":False}
+
+    ph0, ph1 = h15[-2], h15[-1]
+    pl0, pl1 = l15[-2], l15[-1]
+    atr = v61_atr(d15)
+    atr_pct = (atr/price*100) if np.isfinite(atr) and price > 0 else 0.0
+    min_move = max(0.10, atr_pct * 0.18)
+    high_change = (ph1["price"]-ph0["price"])/ph0["price"]*100
+    low_change = (pl1["price"]-pl0["price"])/pl0["price"]*100
+    hh = high_change >= min_move
+    hl = low_change >= min_move
+    lh = high_change <= -min_move
+    ll = low_change <= -min_move
+
+    # Higher timeframe alignment strengthens, but does not create, the 15m structure.
+    h1hh=h1hl=h1lh=h1ll=False
+    if len(h1) >= 2 and len(l1) >= 2:
+        h1hh = h1[-1]["price"] > h1[-2]["price"]
+        h1hl = l1[-1]["price"] > l1[-2]["price"]
+        h1lh = h1[-1]["price"] < h1[-2]["price"]
+        h1ll = l1[-1]["price"] < l1[-2]["price"]
+
+    bullish = hh and hl
+    bearish = lh and ll
+    bull_score = 0
+    bear_score = 0
+    if bullish:
+        bull_score = 55
+        if h1hh and h1hl: bull_score += 25
+        elif h1hh or h1hl: bull_score += 12
+        if price >= ph1["price"]: bull_score += 10
+        elif price >= pl1["price"]: bull_score += 5
+        if high_change >= max(min_move*2, 0.30): bull_score += 5
+        if low_change >= max(min_move*2, 0.30): bull_score += 5
+    elif bearish:
+        bear_score = 55
+        if h1lh and h1ll: bear_score += 25
+        elif h1lh or h1ll: bear_score += 12
+        if price <= pl1["price"]: bear_score += 10
+        elif price <= ph1["price"]: bear_score += 5
+        if abs(high_change) >= max(min_move*2, 0.30): bear_score += 5
+        if abs(low_change) >= max(min_move*2, 0.30): bear_score += 5
+
+    if bullish and bull_score >= 75:
+        state, side, score = "CONFIRMED HH/HL", "LONG", min(100,bull_score)
+    elif bullish:
+        state, side, score = "DEVELOPING HH/HL", "LONG", min(100,bull_score)
+    elif bearish and bear_score >= 75:
+        state, side, score = "CONFIRMED LH/LL", "SHORT", min(100,bear_score)
+    elif bearish:
+        state, side, score = "DEVELOPING LH/LL", "SHORT", min(100,bear_score)
+    else:
+        # One-sided progression is useful as an early warning, but not a trade signal.
+        if hh or hl:
+            state, side, score = "EARLY BULLISH STRUCTURE", "LONG", 40
+        elif lh or ll:
+            state, side, score = "EARLY BEARISH STRUCTURE", "SHORT", 40
+        else:
+            state, side, score = "MIXED STRUCTURE", None, 0
+
+    return {
+        "state": state, "side": side, "score": int(score),
+        "hh": bool(hh), "hl": bool(hl), "lh": bool(lh), "ll": bool(ll),
+        "h1_hh": bool(h1hh), "h1_hl": bool(h1hl), "h1_lh": bool(h1lh), "h1_ll": bool(h1ll),
+        "last_high": ph1["price"], "previous_high": ph0["price"],
+        "last_low": pl1["price"], "previous_low": pl0["price"],
+        "high_change_pct": high_change, "low_change_pct": low_change,
+        "atr": atr, "min_move_pct": min_move,
+    }
+
+
+
+def v63_ema20100_cross(d, recent_bars=6):
+    """Detect fresh EMA20/EMA100 crossovers on completed candles.
+
+    A bearish cross is fast EMA moving from >= slow EMA to < slow EMA.
+    A bullish cross is the mirror image.  The function also reports whether
+    the cross is still fresh and the current EMA spread.  A crossover alone
+    is NOT a trade signal; structure, momentum and risk filters must agree.
+    """
+    if d is None or d.empty or len(d) < 110:
+        return {"state":"NO DATA", "bearish":False, "bullish":False,
+                "fresh_bearish":False, "fresh_bullish":False, "age_bars":None,
+                "spread_pct":np.nan}
+    x = indicators(completed(d)).dropna(subset=["ema20","ema100"]).reset_index(drop=True)
+    if len(x) < 3:
+        return {"state":"NO DATA", "bearish":False, "bullish":False,
+                "fresh_bearish":False, "fresh_bullish":False, "age_bars":None,
+                "spread_pct":np.nan}
+    fast=x["ema20"].astype(float).to_numpy()
+    slow=x["ema100"].astype(float).to_numpy()
+    diff=fast-slow
+    current_bear=bool(diff[-1] < 0)
+    current_bull=bool(diff[-1] > 0)
+    fresh_bear=fresh_bull=False
+    age=None
+    look=min(int(recent_bars), len(diff)-1)
+    for j in range(1, look+1):
+        prev=diff[-j-1]; cur=diff[-j]
+        if not (np.isfinite(prev) and np.isfinite(cur)):
+            continue
+        if prev >= 0 and cur < 0 and not fresh_bear:
+            fresh_bear=True; age=j-1
+        if prev <= 0 and cur > 0 and not fresh_bull:
+            fresh_bull=True; age=j-1
+    price=v6_num(x.iloc[-1].close)
+    spread=(diff[-1]/price*100) if np.isfinite(price) and price>0 else np.nan
+    if fresh_bear:
+        state="FRESH BEARISH EMA20/100 CROSS"
+    elif fresh_bull:
+        state="FRESH BULLISH EMA20/100 CROSS"
+    elif current_bear:
+        state="EMA20 BELOW EMA100"
+    elif current_bull:
+        state="EMA20 ABOVE EMA100"
+    else:
+        state="EMA20/100 FLAT"
+    return {"state":state, "bearish":current_bear, "bullish":current_bull,
+            "fresh_bearish":fresh_bear, "fresh_bullish":fresh_bull,
+            "age_bars":age, "spread_pct":spread}
+
+
+def v63_ema_cross_context(tf_data):
+    """Combine the 15m and 4H EMA20/100 states, weighting 4H more heavily."""
+    c15=v63_ema20100_cross(tf_data.get("15m"), recent_bars=6)
+    c4=v63_ema20100_cross(tf_data.get("4H"), recent_bars=4)
+    bear_points=0; bull_points=0; reasons=[]
+    if c15.get("fresh_bearish"): bear_points += 18; reasons.append("fresh 15m EMA20 crossed below EMA100")
+    elif c15.get("bearish"): bear_points += 5
+    if c4.get("fresh_bearish"): bear_points += 28; reasons.append("fresh 4H EMA20 crossed below EMA100")
+    elif c4.get("bearish"): bear_points += 8
+    if c15.get("fresh_bullish"): bull_points += 18; reasons.append("fresh 15m EMA20 crossed above EMA100")
+    elif c15.get("bullish"): bull_points += 5
+    if c4.get("fresh_bullish"): bull_points += 28; reasons.append("fresh 4H EMA20 crossed above EMA100")
+    elif c4.get("bullish"): bull_points += 8
+    if c15.get("fresh_bearish") and c4.get("fresh_bearish"):
+        bear_points += 10; reasons.append("15m + 4H bearish EMA20/100 alignment")
+    if c15.get("fresh_bullish") and c4.get("fresh_bullish"):
+        bull_points += 10; reasons.append("15m + 4H bullish EMA20/100 alignment")
+    return {"15m":c15,"4H":c4,"bear_score":min(100,bear_points),
+            "bull_score":min(100,bull_points),"reasons":reasons}
+
+def v63_structure_trade(pair, symbol, price, structure, direction):
+    """Create a structure-based alert with breakout/pullback trigger levels."""
+    atr = v6_num(structure.get("atr"))
+    if not np.isfinite(atr) or atr <= 0 or price <= 0:
+        return None
+    if direction == "LONG":
+        hl = v6_num(structure.get("last_low"))
+        hh = v6_num(structure.get("last_high"))
+        trigger = hh + 0.12*atr
+        stop = hl - 0.25*atr
+        risk = trigger-stop
+        if risk <= 0: return None
+        tp1, tp2 = trigger + 2*risk, trigger + 3*risk
+        near_pullback = abs(price-hl) <= max(0.75*atr, price*0.004)
+        triggered = price >= trigger
+        status = "LONG NOW" if triggered else ("LONG PULLBACK ZONE" if near_pullback else "WAIT FOR HH BREAK")
+        return {"pair":pair,"symbol":symbol,"side":"LONG","direction":"LONG","type":"HH/HL STRUCTURE",
+                "status":status,"score":structure["score"],"entry":trigger,"stop":stop,"tp1":tp1,"tp2":tp2,
+                "rr1":2.0,"rr2":3.0,"support":hl,"resistance":hh,
+                "reason":f"15m {structure['state']} | HH +{structure['high_change_pct']:.2f}% | HL +{structure['low_change_pct']:.2f}%"}
+    lh = v6_num(structure.get("last_high")); ll = v6_num(structure.get("last_low"))
+    trigger = ll - 0.12*atr
+    stop = lh + 0.25*atr
+    risk = stop-trigger
+    if risk <= 0: return None
+    tp1, tp2 = trigger - 2*risk, trigger - 3*risk
+    near_pullback = abs(price-lh) <= max(0.75*atr, price*0.004)
+    triggered = price <= trigger
+    status = "SHORT NOW" if triggered else ("SHORT PULLBACK ZONE" if near_pullback else "WAIT FOR LL BREAK")
+    return {"pair":pair,"symbol":symbol,"side":"SHORT","direction":"SHORT","type":"LH/LL STRUCTURE",
+            "status":status,"score":structure["score"],"entry":trigger,"stop":stop,"tp1":tp1,"tp2":tp2,
+            "rr1":2.0,"rr2":3.0,"support":ll,"resistance":lh,
+            "reason":f"15m {structure['state']} | LH {structure['high_change_pct']:.2f}% | LL {structure['low_change_pct']:.2f}%"}
 
 
 def v6_squeeze_breakout(d):
@@ -3996,6 +4246,8 @@ if scan:
     shorts = sorted([x for x in trades if x.get("side")=="SHORT"], key=lambda x:x.get("score",0), reverse=True)
     pumps = sorted([x for x in watches if x.get("watch")=="PUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
     dumps = sorted([x for x in watches if x.get("watch")=="DUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
+    ema_bears = sorted([x for x in watches if x.get("watch")=="EMA20/100 BEAR CROSS"], key=lambda x:x.get("score",0), reverse=True)
+    ema_bulls = sorted([x for x in watches if x.get("watch")=="EMA20/100 BULL CROSS"], key=lambda x:x.get("score",0), reverse=True)
 
     st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {total if 'total' in locals() else 'all loaded'}")
     a,b,c,d = st.columns(4)
@@ -4004,7 +4256,7 @@ if scan:
     c.metric("Pump watch", len(pumps))
     d.metric("Dump watch", len(dumps))
 
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["🟢 LONG", "🔴 SHORT", "🚀 PUMP", "🔻 DUMP", "🟦 RANGES"])
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs(["🟢 LONG", "🔴 SHORT", "🚀 PUMP", "🔻 DUMP", "🟦 RANGES", "📈 HH/HL • LH/LL", "📉 EMA20/100 CROSS"])
     with tab1:
         if longs:
             for t in longs[:10]: v61_signal_card(t)
@@ -4035,6 +4287,34 @@ if scan:
         if range_rows:
             st.dataframe(pd.DataFrame(range_rows).sort_values("range_score", ascending=False).head(20), use_container_width=True, hide_index=True)
         else: st.info("No clean ranges detected.")
+    with tab6:
+        structure_rows=[]
+        for a in scan:
+            z=a.get("structure", {})
+            if z.get("side") in ("LONG", "SHORT") and z.get("score",0) >= 40:
+                structure_rows.append({
+                    "symbol": next((x.get("symbol") for x in a.get("candidates",[]) if x.get("symbol")), ""),
+                    "structure": z.get("state"), "side": z.get("side"), "score": z.get("score"),
+                    "HH %": z.get("high_change_pct"), "HL/LL %": z.get("low_change_pct"),
+                    "last swing high": z.get("last_high"), "last swing low": z.get("last_low"),
+                    "1H aligned": (z.get("h1_hh") and z.get("h1_hl")) if z.get("side")=="LONG" else (z.get("h1_lh") and z.get("h1_ll")),
+                    "price": a.get("price")
+                })
+        if structure_rows:
+            df_struct=pd.DataFrame(structure_rows).sort_values(["score","1H aligned"], ascending=[False,False])
+            st.dataframe(df_struct.head(30), use_container_width=True, hide_index=True)
+            st.caption("HH/HL = higher highs + higher lows. LH/LL = lower highs + lower lows. These are structure alerts; the entry trigger is shown in the LONG/SHORT cards.")
+        else: st.info("No strong HH/HL or LH/LL sequence detected right now.")
+    with tab7:
+        st.caption("Fresh EMA20/EMA100 crosses are confirmation signals. A bearish cross can support SHORT/DUMP analysis; it is not, by itself, an entry trigger.")
+        if ema_bears or ema_bulls:
+            rows=[]
+            for x in ema_bears + ema_bulls:
+                rows.append({"symbol":x.get("symbol"),"signal":x.get("watch"),"score":x.get("score"),
+                             "15m":x.get("ema15"),"4H":x.get("ema4h"),"price":x.get("price"),"regime":x.get("regime")})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No fresh EMA20/EMA100 crossover detected in the scanned market.")
 else:
     st.info("Click **SCAN ALL COINDCX FUTURES**. The scanner will do the market-wide analysis for you and show only actionable candidates.")
 
