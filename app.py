@@ -4227,7 +4227,7 @@ if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
             scan = v62_enhance_scan(scan)
     st.session_state["v61_scan_results"] = scan
     st.session_state["v61_scan_total"] = total
-    st.session_state["v61_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["v61_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
 scan = st.session_state.get("v61_scan_results", [])
 if scan:
