@@ -2187,6 +2187,495 @@ confirmation_text=confirmation_text_v5
 confirmation_text=confirmation_text_v5
 
 # =============================================================================
+# V6.1 MARKET-WIDE SIGNAL ENGINE — RANGE + BREAKOUT + PUMP/DUMP
+# =============================================================================
+# Purpose: turn the existing V5/V6 analysis into a "tell me when to trade"
+# scanner.  It keeps the original V5 code intact and adds a market-wide layer.
+# It is deliberately analysis/paper-only; it does not place live orders.
+
+V61_VERSION = "6.1-MARKET-SIGNAL"
+V61_DEFAULTS = {
+    "lookback_15m": 160,
+    "lookback_1h": 120,
+    "lookback_4h": 100,
+    "range_min_touches": 2,
+    "range_max_width_pct": 8.0,
+    "entry_zone_pct": 0.45,
+    "min_rr": 2.0,
+    "min_score": 78,
+    "max_scan_workers": 6,
+}
+
+
+def v61_instrument_pair(x):
+    if isinstance(x, str) and x.strip():
+        return x.strip()
+    if not isinstance(x, dict):
+        return None
+    for k in ("pair", "symbol", "market", "instrument", "coindcx_name", "id"):
+        v = x.get(k)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    return None
+
+
+def v61_symbol(x, pair):
+    if isinstance(x, dict):
+        for k in ("symbol", "pair", "display_name", "market"):
+            v = x.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+    return pair
+
+
+def v61_price_for_pair(prices, pair):
+    if not isinstance(prices, dict):
+        return np.nan
+    target = str(pair).upper()
+    for k in (pair, pair.upper(), pair.lower()):
+        if k in prices:
+            v = prices[k]
+            if isinstance(v, dict):
+                for kk in ("price", "last_price", "last", "close", "p", "lp", "mark_price", "mp"):
+                    if kk in v:
+                        q = v6_num(v[kk])
+                        if np.isfinite(q): return q
+            else:
+                q = v6_num(v)
+                if np.isfinite(q): return q
+    for k, v in prices.items():
+        if isinstance(v, dict):
+            ident = str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k).upper()
+            if ident == target:
+                for kk in ("price", "last_price", "last", "close", "p", "lp", "mark_price", "mp"):
+                    if kk in v:
+                        q = v6_num(v[kk])
+                        if np.isfinite(q): return q
+    return np.nan
+
+
+def v61_fetch_candidate(pair):
+    """Fetch only the timeframes needed by the fast market-wide signal engine."""
+    try:
+        d15 = get_tf(pair, "15m", 3)
+        d1h = get_tf(pair, "1H", 7)
+        d4h = get_tf(pair, "4H", 25)
+        if any(d is None or d.empty for d in (d15, d1h, d4h)):
+            return None
+        return pair, d15, d1h, d4h
+    except Exception:
+        return None
+
+
+def v61_atr(x):
+    if x is None or len(x) < 20:
+        return np.nan
+    z = indicators(completed(x))
+    return v6_num(z.iloc[-1].get("atr")) if not z.empty else np.nan
+
+
+def v61_cluster_levels(d, lookback=120, tolerance_pct=0.45):
+    """Cluster swing highs/lows into practical zones rather than exact prices."""
+    if d is None or d.empty:
+        return [], []
+    x = completed(d).tail(lookback).reset_index(drop=True)
+    if len(x) < 30:
+        return [], []
+    highs = x.high.astype(float).to_numpy()
+    lows = x.low.astype(float).to_numpy()
+    close = x.close.astype(float).to_numpy()
+    last = float(close[-1])
+    if not np.isfinite(last) or last <= 0:
+        return [], []
+    # Local extrema, then cluster nearby extrema.
+    hi_pts, lo_pts = [], []
+    for i in range(2, len(x)-2):
+        if highs[i] >= highs[i-1] and highs[i] >= highs[i-2] and highs[i] >= highs[i+1] and highs[i] >= highs[i+2]:
+            hi_pts.append(float(highs[i]))
+        if lows[i] <= lows[i-1] and lows[i] <= lows[i-2] and lows[i] <= lows[i+1] and lows[i] <= lows[i+2]:
+            lo_pts.append(float(lows[i]))
+
+    def cluster(points):
+        if not points:
+            return []
+        pts = sorted(points)
+        clusters = []
+        for p in pts:
+            if not clusters:
+                clusters.append([p])
+                continue
+            center = float(np.mean(clusters[-1]))
+            if abs(p-center)/center*100 <= tolerance_pct:
+                clusters[-1].append(p)
+            else:
+                clusters.append([p])
+        out = []
+        for c in clusters:
+            center = float(np.mean(c))
+            touches = len(c)
+            out.append({"level": center, "touches": touches, "strength": min(1.0, 0.35 + 0.18*touches)})
+        return out
+
+    return cluster(hi_pts), cluster(lo_pts)
+
+
+def v61_nearest_levels(d15, d1h, d4h, price):
+    """Build support/resistance from 15m, 1H and 4H swing clusters."""
+    levels_hi, levels_lo = [], []
+    for d, weight in ((d15, 1.0), (d1h, 1.35), (d4h, 1.7)):
+        hi, lo = v61_cluster_levels(d)
+        for q in hi:
+            q = dict(q); q["strength"] *= weight; levels_hi.append(q)
+        for q in lo:
+            q = dict(q); q["strength"] *= weight; levels_lo.append(q)
+
+    def merge(levels):
+        if not levels:
+            return []
+        levels = sorted(levels, key=lambda z: z["level"])
+        merged = []
+        for z in levels:
+            if not merged or abs(z["level"]-merged[-1]["level"])/merged[-1]["level"]*100 > 0.55:
+                merged.append({"level": z["level"], "strength": z["strength"], "touches": z["touches"]})
+            else:
+                old = merged[-1]
+                w1, w2 = old["strength"], z["strength"]
+                old["level"] = (old["level"]*w1 + z["level"]*w2)/(w1+w2)
+                old["strength"] += z["strength"]
+                old["touches"] += z["touches"]
+        return merged
+
+    hi, lo = merge(levels_hi), merge(levels_lo)
+    supports = sorted([z for z in lo if z["level"] < price], key=lambda z: price-z["level"])
+    resistances = sorted([z for z in hi if z["level"] > price], key=lambda z: z["level"]-price)
+    return supports, resistances
+
+
+def v61_range_state(d15, d1h, d4h, price):
+    """Detect a range and return its practical support/resistance zones."""
+    if any(d is None or d.empty for d in (d15, d1h, d4h)) or not np.isfinite(price) or price <= 0:
+        return {"is_range": False, "score": 0}
+    x15 = indicators(completed(d15)).tail(100)
+    x1h = indicators(completed(d1h)).tail(80)
+    x4h = indicators(completed(d4h)).tail(60)
+    if min(len(x15), len(x1h), len(x4h)) < 30:
+        return {"is_range": False, "score": 0}
+
+    # Trend strength: ranges are strongest when ADX is modest and EMA spread is small.
+    adx = v6_num(x15.iloc[-1].get("adx"), 0)
+    ema20, ema50 = v6_num(x15.iloc[-1].get("ema20")), v6_num(x15.iloc[-1].get("ema50"))
+    ema_spread = abs(ema20-ema50)/price*100 if np.isfinite(ema20) and np.isfinite(ema50) else 99
+
+    supports, resistances = v61_nearest_levels(d15, d1h, d4h, price)
+    s = supports[0] if supports else None
+    r = resistances[0] if resistances else None
+    if not s or not r or r["level"] <= s["level"]:
+        return {"is_range": False, "score": 0, "support": s, "resistance": r}
+
+    width_pct = (r["level"]-s["level"])/price*100
+    position = (price-s["level"])/(r["level"]-s["level"])
+    # Repeated boundary tests on the 1H chart are strong evidence of a tradable range.
+    h = x1h.high.to_numpy(dtype=float)
+    l = x1h.low.to_numpy(dtype=float)
+    touch_r = int(np.sum(np.abs(h-r["level"])/r["level"]*100 <= 0.65))
+    touch_s = int(np.sum(np.abs(l-s["level"])/s["level"]*100 <= 0.65))
+
+    score = 0
+    if width_pct <= V61_DEFAULTS["range_max_width_pct"]: score += 25
+    if adx < 25: score += 20
+    elif adx < 30: score += 10
+    if ema_spread < 1.2: score += 15
+    elif ema_spread < 2.0: score += 8
+    if touch_r >= 2: score += 15
+    if touch_s >= 2: score += 15
+    if 0.12 <= position <= 0.88: score += 10
+
+    return {
+        "is_range": score >= 55 and width_pct <= V61_DEFAULTS["range_max_width_pct"] and touch_r >= 2 and touch_s >= 2,
+        "score": int(min(100, score)),
+        "support": s,
+        "resistance": r,
+        "width_pct": width_pct,
+        "position": position,
+        "touch_r": touch_r,
+        "touch_s": touch_s,
+        "adx": adx,
+        "ema_spread": ema_spread,
+    }
+
+
+def v61_regime(d1h, d4h):
+    x1 = indicators(completed(d1h))
+    x4 = indicators(completed(d4h))
+    if x1.empty or x4.empty:
+        return "UNKNOWN", 0
+    a, b = x1.iloc[-1], x4.iloc[-1]
+    bull = sum([
+        v6_num(a.close) > v6_num(a.ema20),
+        v6_num(a.ema20) > v6_num(a.ema50),
+        v6_num(a.macd) > v6_num(a.macd_signal),
+        v6_num(b.close) > v6_num(b.ema20),
+        v6_num(b.ema20) > v6_num(b.ema50),
+    ])
+    bear = sum([
+        v6_num(a.close) < v6_num(a.ema20),
+        v6_num(a.ema20) < v6_num(a.ema50),
+        v6_num(a.macd) < v6_num(a.macd_signal),
+        v6_num(b.close) < v6_num(b.ema20),
+        v6_num(b.ema20) < v6_num(b.ema50),
+    ])
+    if bull >= 4: return "BULL TREND", bull*20
+    if bear >= 4: return "BEAR TREND", bear*20
+    return "MIXED", 50
+
+
+def v61_momentum(d15):
+    x = indicators(completed(d15))
+    if len(x) < 30:
+        return {}
+    a = x.iloc[-1]
+    prev20 = x.iloc[-21].close if len(x) >= 21 else np.nan
+    close = v6_num(a.close)
+    return {
+        "close": close,
+        "rsi": v6_num(a.rsi),
+        "macd": v6_num(a.macd),
+        "macd_signal": v6_num(a.macd_signal),
+        "atr": v6_num(a.atr),
+        "atr_pct": v6_num(a.atr_pct),
+        "vol_ratio": v6_num(a.vol_ratio, 1),
+        "ema20": v6_num(a.ema20),
+        "ema50": v6_num(a.ema50),
+        "return_5h_pct": v6_pct(close, prev20),
+        "close_open": v6_pct(close, x.iloc[-1].open),
+    }
+
+
+def v61_breakout_status(d15, support, resistance):
+    x = completed(d15).tail(12)
+    if x.empty or not support or not resistance:
+        return "NONE"
+    close = float(x.close.iloc[-1]); prev = float(x.close.iloc[-2]) if len(x) > 1 else close
+    r = resistance["level"]; s = support["level"]
+    atr = v61_atr(d15)
+    buf = max(atr*0.35 if np.isfinite(atr) else 0, close*0.0015)
+    if prev <= r and close > r + buf: return "BREAKOUT_UP"
+    if prev >= s and close < s - buf: return "BREAKDOWN_DOWN"
+    return "NONE"
+
+
+def v61_trade_from_setup(pair, side, price, support, resistance, atr, score, reason):
+    """Return entry/SL/TP levels.  Entry is a zone; trade is valid only after trigger."""
+    if not np.isfinite(price) or price <= 0 or not np.isfinite(atr) or atr <= 0:
+        return None
+    s = support["level"] if support else np.nan
+    r = resistance["level"] if resistance else np.nan
+    if side == "LONG":
+        if not np.isfinite(s): return None
+        entry = s * 1.0015
+        stop = min(s - 0.85*atr, entry - 1.15*atr)
+        target1 = r * 0.997 if np.isfinite(r) else entry + 2*atr
+        risk = entry-stop
+        if risk <= 0: return None
+        target2 = entry + max(2.8*risk, (target1-entry)*1.55)
+        rr1 = (target1-entry)/risk
+        rr2 = (target2-entry)/risk
+    else:
+        if not np.isfinite(r): return None
+        entry = r * 0.9985
+        stop = max(r + 0.85*atr, entry + 1.15*atr)
+        target1 = s * 1.003 if np.isfinite(s) else entry - 2*atr
+        risk = stop-entry
+        if risk <= 0: return None
+        target2 = entry - max(2.8*risk, (entry-target1)*1.55)
+        rr1 = (entry-target1)/risk
+        rr2 = (entry-target2)/risk
+    if rr1 < V61_DEFAULTS["min_rr"]:
+        return None
+    return {
+        "pair": pair, "side": side, "entry": entry, "stop": stop,
+        "tp1": target1, "tp2": target2, "rr1": rr1, "rr2": rr2,
+        "score": score, "reason": reason,
+    }
+
+
+def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
+    m = v61_momentum(d15)
+    if not m or not np.isfinite(price):
+        return None
+    regime, regime_score = v61_regime(d1h, d4h)
+    supports, resistances = v61_nearest_levels(d15, d1h, d4h, price)
+    support = supports[0] if supports else None
+    resistance = resistances[0] if resistances else None
+    rng = v61_range_state(d15, d1h, d4h, price)
+    brk = v61_breakout_status(d15, support, resistance)
+    atr = m.get("atr", np.nan)
+    candidates = []
+
+    # ---------------- RANGE LONG ----------------
+    if rng.get("is_range") and support:
+        dist_s = abs(price-support["level"])/price*100
+        near_s = dist_s <= max(V61_DEFAULTS["entry_zone_pct"], m.get("atr_pct", 0)*1.25)
+        rejection = m.get("rsi", 50) < 48 and m.get("macd", 0) >= m.get("macd_signal", 0)
+        score = 55 + int(rng["score"]*0.25)
+        if near_s: score += 15
+        if rejection: score += 10
+        if m.get("vol_ratio", 1) >= 1.25: score += 5
+        if regime == "BEAR TREND": score -= 15
+        score = max(0, min(100, score))
+        if score >= V61_DEFAULTS["min_score"]:
+            t = v61_trade_from_setup(pair, "LONG", price, support, resistance, atr, score, "RANGE SUPPORT REJECTION")
+            if t:
+                t.update({"symbol": symbol, "type": "RANGE LONG", "status": "LONG NOW" if near_s and rejection else "LONG SETUP",
+                          "support": support["level"], "resistance": resistance["level"] if resistance else np.nan,
+                          "range_score": rng["score"], "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- RANGE SHORT ----------------
+    if rng.get("is_range") and resistance:
+        dist_r = abs(resistance["level"]-price)/price*100
+        near_r = dist_r <= max(V61_DEFAULTS["entry_zone_pct"], m.get("atr_pct", 0)*1.25)
+        rejection = m.get("rsi", 50) > 52 and m.get("macd", 0) <= m.get("macd_signal", 0)
+        score = 55 + int(rng["score"]*0.25)
+        if near_r: score += 15
+        if rejection: score += 10
+        if m.get("vol_ratio", 1) >= 1.25: score += 5
+        if regime == "BULL TREND": score -= 15
+        score = max(0, min(100, score))
+        if score >= V61_DEFAULTS["min_score"]:
+            t = v61_trade_from_setup(pair, "SHORT", price, support, resistance, atr, score, "RANGE RESISTANCE REJECTION")
+            if t:
+                t.update({"symbol": symbol, "type": "RANGE SHORT", "status": "SHORT NOW" if near_r and rejection else "SHORT SETUP",
+                          "support": support["level"] if support else np.nan, "resistance": resistance["level"],
+                          "range_score": rng["score"], "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- BREAKOUT LONG ----------------
+    if brk == "BREAKOUT_UP":
+        score = 72
+        if m.get("vol_ratio", 1) >= 1.5: score += 10
+        if m.get("rsi", 50) < 78: score += 7
+        if regime == "BULL TREND": score += 8
+        if regime == "BEAR TREND": score -= 20
+        if score >= V61_DEFAULTS["min_score"]:
+            # For breakout, use old resistance as entry and the next ATR-based stop.
+            fake_support = {"level": resistance["level"] - max(atr, price*0.006)} if resistance else None
+            t = v61_trade_from_setup(pair, "LONG", price, fake_support, {"level": price+2.8*atr}, atr, score, "15M BREAKOUT + CONFIRMATION")
+            if t:
+                t.update({"symbol": symbol, "type": "BREAKOUT LONG", "status": "LONG NOW",
+                          "support": fake_support["level"], "resistance": resistance["level"] if resistance else np.nan,
+                          "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- BREAKDOWN SHORT ----------------
+    if brk == "BREAKDOWN_DOWN":
+        score = 72
+        if m.get("vol_ratio", 1) >= 1.5: score += 10
+        if m.get("rsi", 50) > 22: score += 7
+        if regime == "BEAR TREND": score += 8
+        if regime == "BULL TREND": score -= 20
+        if score >= V61_DEFAULTS["min_score"]:
+            fake_res = {"level": support["level"] + max(atr, price*0.006)} if support else None
+            t = v61_trade_from_setup(pair, "SHORT", price, {"level": price-2.8*atr}, fake_res, atr, score, "15M BREAKDOWN + CONFIRMATION")
+            if t:
+                t.update({"symbol": symbol, "type": "BREAKDOWN SHORT", "status": "SHORT NOW",
+                          "support": support["level"] if support else np.nan, "resistance": fake_res["level"],
+                          "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
+                candidates.append(t)
+
+    # ---------------- PUMP / DUMP WATCH ----------------
+    ret = m.get("return_5h_pct", 0)
+    vol = m.get("vol_ratio", 1)
+    rsi = m.get("rsi", 50)
+    pump_score = 0
+    dump_score = 0
+    if ret >= 3: pump_score += 25
+    if ret >= 6: pump_score += 15
+    if vol >= 1.5: pump_score += 20
+    if vol >= 2.5: pump_score += 10
+    if rsi >= 60: pump_score += 10
+    if m.get("macd", 0) > m.get("macd_signal", 0): pump_score += 10
+    if regime == "BULL TREND": pump_score += 10
+    if ret <= -3: dump_score += 25
+    if ret <= -6: dump_score += 15
+    if vol >= 1.5: dump_score += 20
+    if vol >= 2.5: dump_score += 10
+    if rsi <= 40: dump_score += 10
+    if m.get("macd", 0) < m.get("macd_signal", 0): dump_score += 10
+    if regime == "BEAR TREND": dump_score += 10
+
+    watches = []
+    if pump_score >= 55:
+        watches.append({"pair":pair,"symbol":symbol,"watch":"PUMP WATCH","score":min(100,pump_score),"price":price,
+                        "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
+    if dump_score >= 55:
+        watches.append({"pair":pair,"symbol":symbol,"watch":"DUMP WATCH","score":min(100,dump_score),"price":price,
+                        "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
+
+    return {"candidates": candidates, "watches": watches, "range": rng, "regime": regime,
+            "momentum": m, "support": support, "resistance": resistance}
+
+
+def v61_scan_all(progress=None, max_workers=6):
+    """Scan all active USDT Futures. Current-price data is fetched once; candle data is cached."""
+    instruments = active_instruments("USDT")
+    prices = futures_prices()
+    items = []
+    seen = set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair or pair in seen:
+            continue
+        seen.add(pair)
+        price = v61_price_for_pair(prices, pair)
+        if np.isfinite(price) and price > 0:
+            items.append((pair, v61_symbol(inst, pair), price))
+
+    # Concurrent network reads make a whole-market scan practical without changing
+    # the existing API functions or inventing private CoinDCX endpoints.
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    done = 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = {ex.submit(v61_fetch_candidate, p[0]): p for p in items}
+        for fut in as_completed(futs):
+            base = futs[fut]; fetched = fut.result(); done += 1
+            if progress:
+                progress(done, len(items))
+            if not fetched:
+                continue
+            pair, d15, d1h, d4h = fetched
+            try:
+                a = v61_analyze_candidate(pair, base[1], base[2], d15, d1h, d4h)
+                if a:
+                    a["price"] = base[2]
+                    results.append(a)
+            except Exception:
+                continue
+    return results, len(items)
+
+
+def v61_fmt_price(v):
+    v = v6_num(v)
+    if not np.isfinite(v): return "—"
+    if abs(v) >= 1000: return f"{v:,.2f}"
+    if abs(v) >= 1: return f"{v:,.4f}"
+    if abs(v) >= .01: return f"{v:,.6f}"
+    return f"{v:,.8f}"
+
+
+def v61_signal_card(t):
+    side = t.get("side", "")
+    emoji = "🟢" if side == "LONG" else "🔴"
+    st.write(f"### {emoji} {t.get('status','SIGNAL')} — {t.get('symbol', t.get('pair'))}")
+    st.write(f"**Type:** {t.get('type','')}  |  **Score:** {t.get('score',0)}/100  |  **Regime:** {t.get('regime','')}  ")
+    st.write(f"**Entry:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
+    st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
+
+
+
+
+# =============================================================================
 # V5 UI
 # =============================================================================
 st.title("🧠 CoinDCX Historical Pattern Learning Scanner V5")
@@ -3058,493 +3547,6 @@ else:
     st.info("No paper trades yet. Run the V6 scan first.")
 
 st.caption(f"V{V6_VERSION}: existing V5 engine retained above; V6 adds deterministic intraday analysis, risk sizing and paper trade management. Live execution is intentionally disabled until exchange order integration is explicitly implemented and verified.")
-
-# =============================================================================
-# V6.1 MARKET-WIDE SIGNAL ENGINE — RANGE + BREAKOUT + PUMP/DUMP
-# =============================================================================
-# Purpose: turn the existing V5/V6 analysis into a "tell me when to trade"
-# scanner.  It keeps the original V5 code intact and adds a market-wide layer.
-# It is deliberately analysis/paper-only; it does not place live orders.
-
-V61_VERSION = "6.1-MARKET-SIGNAL"
-V61_DEFAULTS = {
-    "lookback_15m": 160,
-    "lookback_1h": 120,
-    "lookback_4h": 100,
-    "range_min_touches": 2,
-    "range_max_width_pct": 8.0,
-    "entry_zone_pct": 0.45,
-    "min_rr": 2.0,
-    "min_score": 78,
-    "max_scan_workers": 6,
-}
-
-
-def v61_instrument_pair(x):
-    if isinstance(x, str) and x.strip():
-        return x.strip()
-    if not isinstance(x, dict):
-        return None
-    for k in ("pair", "symbol", "market", "instrument", "coindcx_name", "id"):
-        v = x.get(k)
-        if isinstance(v, str) and v.strip():
-            return v.strip()
-    return None
-
-
-def v61_symbol(x, pair):
-    if isinstance(x, dict):
-        for k in ("symbol", "pair", "display_name", "market"):
-            v = x.get(k)
-            if isinstance(v, str) and v.strip():
-                return v.strip()
-    return pair
-
-
-def v61_price_for_pair(prices, pair):
-    if not isinstance(prices, dict):
-        return np.nan
-    target = str(pair).upper()
-    for k in (pair, pair.upper(), pair.lower()):
-        if k in prices:
-            v = prices[k]
-            if isinstance(v, dict):
-                for kk in ("price", "last_price", "last", "close", "p", "lp", "mark_price", "mp"):
-                    if kk in v:
-                        q = v6_num(v[kk])
-                        if np.isfinite(q): return q
-            else:
-                q = v6_num(v)
-                if np.isfinite(q): return q
-    for k, v in prices.items():
-        if isinstance(v, dict):
-            ident = str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k).upper()
-            if ident == target:
-                for kk in ("price", "last_price", "last", "close", "p", "lp", "mark_price", "mp"):
-                    if kk in v:
-                        q = v6_num(v[kk])
-                        if np.isfinite(q): return q
-    return np.nan
-
-
-def v61_fetch_candidate(pair):
-    """Fetch only the timeframes needed by the fast market-wide signal engine."""
-    try:
-        d15 = get_tf(pair, "15m", 3)
-        d1h = get_tf(pair, "1H", 7)
-        d4h = get_tf(pair, "4H", 25)
-        if any(d is None or d.empty for d in (d15, d1h, d4h)):
-            return None
-        return pair, d15, d1h, d4h
-    except Exception:
-        return None
-
-
-def v61_atr(x):
-    if x is None or len(x) < 20:
-        return np.nan
-    z = indicators(completed(x))
-    return v6_num(z.iloc[-1].get("atr")) if not z.empty else np.nan
-
-
-def v61_cluster_levels(d, lookback=120, tolerance_pct=0.45):
-    """Cluster swing highs/lows into practical zones rather than exact prices."""
-    if d is None or d.empty:
-        return [], []
-    x = completed(d).tail(lookback).reset_index(drop=True)
-    if len(x) < 30:
-        return [], []
-    highs = x.high.astype(float).to_numpy()
-    lows = x.low.astype(float).to_numpy()
-    close = x.close.astype(float).to_numpy()
-    last = float(close[-1])
-    if not np.isfinite(last) or last <= 0:
-        return [], []
-    # Local extrema, then cluster nearby extrema.
-    hi_pts, lo_pts = [], []
-    for i in range(2, len(x)-2):
-        if highs[i] >= highs[i-1] and highs[i] >= highs[i-2] and highs[i] >= highs[i+1] and highs[i] >= highs[i+2]:
-            hi_pts.append(float(highs[i]))
-        if lows[i] <= lows[i-1] and lows[i] <= lows[i-2] and lows[i] <= lows[i+1] and lows[i] <= lows[i+2]:
-            lo_pts.append(float(lows[i]))
-
-    def cluster(points):
-        if not points:
-            return []
-        pts = sorted(points)
-        clusters = []
-        for p in pts:
-            if not clusters:
-                clusters.append([p])
-                continue
-            center = float(np.mean(clusters[-1]))
-            if abs(p-center)/center*100 <= tolerance_pct:
-                clusters[-1].append(p)
-            else:
-                clusters.append([p])
-        out = []
-        for c in clusters:
-            center = float(np.mean(c))
-            touches = len(c)
-            out.append({"level": center, "touches": touches, "strength": min(1.0, 0.35 + 0.18*touches)})
-        return out
-
-    return cluster(hi_pts), cluster(lo_pts)
-
-
-def v61_nearest_levels(d15, d1h, d4h, price):
-    """Build support/resistance from 15m, 1H and 4H swing clusters."""
-    levels_hi, levels_lo = [], []
-    for d, weight in ((d15, 1.0), (d1h, 1.35), (d4h, 1.7)):
-        hi, lo = v61_cluster_levels(d)
-        for q in hi:
-            q = dict(q); q["strength"] *= weight; levels_hi.append(q)
-        for q in lo:
-            q = dict(q); q["strength"] *= weight; levels_lo.append(q)
-
-    def merge(levels):
-        if not levels:
-            return []
-        levels = sorted(levels, key=lambda z: z["level"])
-        merged = []
-        for z in levels:
-            if not merged or abs(z["level"]-merged[-1]["level"])/merged[-1]["level"]*100 > 0.55:
-                merged.append({"level": z["level"], "strength": z["strength"], "touches": z["touches"]})
-            else:
-                old = merged[-1]
-                w1, w2 = old["strength"], z["strength"]
-                old["level"] = (old["level"]*w1 + z["level"]*w2)/(w1+w2)
-                old["strength"] += z["strength"]
-                old["touches"] += z["touches"]
-        return merged
-
-    hi, lo = merge(levels_hi), merge(levels_lo)
-    supports = sorted([z for z in lo if z["level"] < price], key=lambda z: price-z["level"])
-    resistances = sorted([z for z in hi if z["level"] > price], key=lambda z: z["level"]-price)
-    return supports, resistances
-
-
-def v61_range_state(d15, d1h, d4h, price):
-    """Detect a range and return its practical support/resistance zones."""
-    if any(d is None or d.empty for d in (d15, d1h, d4h)) or not np.isfinite(price) or price <= 0:
-        return {"is_range": False, "score": 0}
-    x15 = indicators(completed(d15)).tail(100)
-    x1h = indicators(completed(d1h)).tail(80)
-    x4h = indicators(completed(d4h)).tail(60)
-    if min(len(x15), len(x1h), len(x4h)) < 30:
-        return {"is_range": False, "score": 0}
-
-    # Trend strength: ranges are strongest when ADX is modest and EMA spread is small.
-    adx = v6_num(x15.iloc[-1].get("adx"), 0)
-    ema20, ema50 = v6_num(x15.iloc[-1].get("ema20")), v6_num(x15.iloc[-1].get("ema50"))
-    ema_spread = abs(ema20-ema50)/price*100 if np.isfinite(ema20) and np.isfinite(ema50) else 99
-
-    supports, resistances = v61_nearest_levels(d15, d1h, d4h, price)
-    s = supports[0] if supports else None
-    r = resistances[0] if resistances else None
-    if not s or not r or r["level"] <= s["level"]:
-        return {"is_range": False, "score": 0, "support": s, "resistance": r}
-
-    width_pct = (r["level"]-s["level"])/price*100
-    position = (price-s["level"])/(r["level"]-s["level"])
-    # Repeated boundary tests on the 1H chart are strong evidence of a tradable range.
-    h = x1h.high.to_numpy(dtype=float)
-    l = x1h.low.to_numpy(dtype=float)
-    touch_r = int(np.sum(np.abs(h-r["level"])/r["level"]*100 <= 0.65))
-    touch_s = int(np.sum(np.abs(l-s["level"])/s["level"]*100 <= 0.65))
-
-    score = 0
-    if width_pct <= V61_DEFAULTS["range_max_width_pct"]: score += 25
-    if adx < 25: score += 20
-    elif adx < 30: score += 10
-    if ema_spread < 1.2: score += 15
-    elif ema_spread < 2.0: score += 8
-    if touch_r >= 2: score += 15
-    if touch_s >= 2: score += 15
-    if 0.12 <= position <= 0.88: score += 10
-
-    return {
-        "is_range": score >= 55 and width_pct <= V61_DEFAULTS["range_max_width_pct"] and touch_r >= 2 and touch_s >= 2,
-        "score": int(min(100, score)),
-        "support": s,
-        "resistance": r,
-        "width_pct": width_pct,
-        "position": position,
-        "touch_r": touch_r,
-        "touch_s": touch_s,
-        "adx": adx,
-        "ema_spread": ema_spread,
-    }
-
-
-def v61_regime(d1h, d4h):
-    x1 = indicators(completed(d1h))
-    x4 = indicators(completed(d4h))
-    if x1.empty or x4.empty:
-        return "UNKNOWN", 0
-    a, b = x1.iloc[-1], x4.iloc[-1]
-    bull = sum([
-        v6_num(a.close) > v6_num(a.ema20),
-        v6_num(a.ema20) > v6_num(a.ema50),
-        v6_num(a.macd) > v6_num(a.macd_signal),
-        v6_num(b.close) > v6_num(b.ema20),
-        v6_num(b.ema20) > v6_num(b.ema50),
-    ])
-    bear = sum([
-        v6_num(a.close) < v6_num(a.ema20),
-        v6_num(a.ema20) < v6_num(a.ema50),
-        v6_num(a.macd) < v6_num(a.macd_signal),
-        v6_num(b.close) < v6_num(b.ema20),
-        v6_num(b.ema20) < v6_num(b.ema50),
-    ])
-    if bull >= 4: return "BULL TREND", bull*20
-    if bear >= 4: return "BEAR TREND", bear*20
-    return "MIXED", 50
-
-
-def v61_momentum(d15):
-    x = indicators(completed(d15))
-    if len(x) < 30:
-        return {}
-    a = x.iloc[-1]
-    prev20 = x.iloc[-21].close if len(x) >= 21 else np.nan
-    close = v6_num(a.close)
-    return {
-        "close": close,
-        "rsi": v6_num(a.rsi),
-        "macd": v6_num(a.macd),
-        "macd_signal": v6_num(a.macd_signal),
-        "atr": v6_num(a.atr),
-        "atr_pct": v6_num(a.atr_pct),
-        "vol_ratio": v6_num(a.vol_ratio, 1),
-        "ema20": v6_num(a.ema20),
-        "ema50": v6_num(a.ema50),
-        "return_5h_pct": v6_pct(close, prev20),
-        "close_open": v6_pct(close, x.iloc[-1].open),
-    }
-
-
-def v61_breakout_status(d15, support, resistance):
-    x = completed(d15).tail(12)
-    if x.empty or not support or not resistance:
-        return "NONE"
-    close = float(x.close.iloc[-1]); prev = float(x.close.iloc[-2]) if len(x) > 1 else close
-    r = resistance["level"]; s = support["level"]
-    atr = v61_atr(d15)
-    buf = max(atr*0.35 if np.isfinite(atr) else 0, close*0.0015)
-    if prev <= r and close > r + buf: return "BREAKOUT_UP"
-    if prev >= s and close < s - buf: return "BREAKDOWN_DOWN"
-    return "NONE"
-
-
-def v61_trade_from_setup(pair, side, price, support, resistance, atr, score, reason):
-    """Return entry/SL/TP levels.  Entry is a zone; trade is valid only after trigger."""
-    if not np.isfinite(price) or price <= 0 or not np.isfinite(atr) or atr <= 0:
-        return None
-    s = support["level"] if support else np.nan
-    r = resistance["level"] if resistance else np.nan
-    if side == "LONG":
-        if not np.isfinite(s): return None
-        entry = s * 1.0015
-        stop = min(s - 0.85*atr, entry - 1.15*atr)
-        target1 = r * 0.997 if np.isfinite(r) else entry + 2*atr
-        risk = entry-stop
-        if risk <= 0: return None
-        target2 = entry + max(2.8*risk, (target1-entry)*1.55)
-        rr1 = (target1-entry)/risk
-        rr2 = (target2-entry)/risk
-    else:
-        if not np.isfinite(r): return None
-        entry = r * 0.9985
-        stop = max(r + 0.85*atr, entry + 1.15*atr)
-        target1 = s * 1.003 if np.isfinite(s) else entry - 2*atr
-        risk = stop-entry
-        if risk <= 0: return None
-        target2 = entry - max(2.8*risk, (entry-target1)*1.55)
-        rr1 = (entry-target1)/risk
-        rr2 = (entry-target2)/risk
-    if rr1 < V61_DEFAULTS["min_rr"]:
-        return None
-    return {
-        "pair": pair, "side": side, "entry": entry, "stop": stop,
-        "tp1": target1, "tp2": target2, "rr1": rr1, "rr2": rr2,
-        "score": score, "reason": reason,
-    }
-
-
-def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
-    m = v61_momentum(d15)
-    if not m or not np.isfinite(price):
-        return None
-    regime, regime_score = v61_regime(d1h, d4h)
-    supports, resistances = v61_nearest_levels(d15, d1h, d4h, price)
-    support = supports[0] if supports else None
-    resistance = resistances[0] if resistances else None
-    rng = v61_range_state(d15, d1h, d4h, price)
-    brk = v61_breakout_status(d15, support, resistance)
-    atr = m.get("atr", np.nan)
-    candidates = []
-
-    # ---------------- RANGE LONG ----------------
-    if rng.get("is_range") and support:
-        dist_s = abs(price-support["level"])/price*100
-        near_s = dist_s <= max(V61_DEFAULTS["entry_zone_pct"], m.get("atr_pct", 0)*1.25)
-        rejection = m.get("rsi", 50) < 48 and m.get("macd", 0) >= m.get("macd_signal", 0)
-        score = 55 + int(rng["score"]*0.25)
-        if near_s: score += 15
-        if rejection: score += 10
-        if m.get("vol_ratio", 1) >= 1.25: score += 5
-        if regime == "BEAR TREND": score -= 15
-        score = max(0, min(100, score))
-        if score >= V61_DEFAULTS["min_score"]:
-            t = v61_trade_from_setup(pair, "LONG", price, support, resistance, atr, score, "RANGE SUPPORT REJECTION")
-            if t:
-                t.update({"symbol": symbol, "type": "RANGE LONG", "status": "LONG NOW" if near_s and rejection else "LONG SETUP",
-                          "support": support["level"], "resistance": resistance["level"] if resistance else np.nan,
-                          "range_score": rng["score"], "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
-                candidates.append(t)
-
-    # ---------------- RANGE SHORT ----------------
-    if rng.get("is_range") and resistance:
-        dist_r = abs(resistance["level"]-price)/price*100
-        near_r = dist_r <= max(V61_DEFAULTS["entry_zone_pct"], m.get("atr_pct", 0)*1.25)
-        rejection = m.get("rsi", 50) > 52 and m.get("macd", 0) <= m.get("macd_signal", 0)
-        score = 55 + int(rng["score"]*0.25)
-        if near_r: score += 15
-        if rejection: score += 10
-        if m.get("vol_ratio", 1) >= 1.25: score += 5
-        if regime == "BULL TREND": score -= 15
-        score = max(0, min(100, score))
-        if score >= V61_DEFAULTS["min_score"]:
-            t = v61_trade_from_setup(pair, "SHORT", price, support, resistance, atr, score, "RANGE RESISTANCE REJECTION")
-            if t:
-                t.update({"symbol": symbol, "type": "RANGE SHORT", "status": "SHORT NOW" if near_r and rejection else "SHORT SETUP",
-                          "support": support["level"] if support else np.nan, "resistance": resistance["level"],
-                          "range_score": rng["score"], "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
-                candidates.append(t)
-
-    # ---------------- BREAKOUT LONG ----------------
-    if brk == "BREAKOUT_UP":
-        score = 72
-        if m.get("vol_ratio", 1) >= 1.5: score += 10
-        if m.get("rsi", 50) < 78: score += 7
-        if regime == "BULL TREND": score += 8
-        if regime == "BEAR TREND": score -= 20
-        if score >= V61_DEFAULTS["min_score"]:
-            # For breakout, use old resistance as entry and the next ATR-based stop.
-            fake_support = {"level": resistance["level"] - max(atr, price*0.006)} if resistance else None
-            t = v61_trade_from_setup(pair, "LONG", price, fake_support, {"level": price+2.8*atr}, atr, score, "15M BREAKOUT + CONFIRMATION")
-            if t:
-                t.update({"symbol": symbol, "type": "BREAKOUT LONG", "status": "LONG NOW",
-                          "support": fake_support["level"], "resistance": resistance["level"] if resistance else np.nan,
-                          "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
-                candidates.append(t)
-
-    # ---------------- BREAKDOWN SHORT ----------------
-    if brk == "BREAKDOWN_DOWN":
-        score = 72
-        if m.get("vol_ratio", 1) >= 1.5: score += 10
-        if m.get("rsi", 50) > 22: score += 7
-        if regime == "BEAR TREND": score += 8
-        if regime == "BULL TREND": score -= 20
-        if score >= V61_DEFAULTS["min_score"]:
-            fake_res = {"level": support["level"] + max(atr, price*0.006)} if support else None
-            t = v61_trade_from_setup(pair, "SHORT", price, {"level": price-2.8*atr}, fake_res, atr, score, "15M BREAKDOWN + CONFIRMATION")
-            if t:
-                t.update({"symbol": symbol, "type": "BREAKDOWN SHORT", "status": "SHORT NOW",
-                          "support": support["level"] if support else np.nan, "resistance": fake_res["level"],
-                          "range_score": rng.get("score", 0), "regime": regime, "rsi": m["rsi"], "vol_ratio": m["vol_ratio"]})
-                candidates.append(t)
-
-    # ---------------- PUMP / DUMP WATCH ----------------
-    ret = m.get("return_5h_pct", 0)
-    vol = m.get("vol_ratio", 1)
-    rsi = m.get("rsi", 50)
-    pump_score = 0
-    dump_score = 0
-    if ret >= 3: pump_score += 25
-    if ret >= 6: pump_score += 15
-    if vol >= 1.5: pump_score += 20
-    if vol >= 2.5: pump_score += 10
-    if rsi >= 60: pump_score += 10
-    if m.get("macd", 0) > m.get("macd_signal", 0): pump_score += 10
-    if regime == "BULL TREND": pump_score += 10
-    if ret <= -3: dump_score += 25
-    if ret <= -6: dump_score += 15
-    if vol >= 1.5: dump_score += 20
-    if vol >= 2.5: dump_score += 10
-    if rsi <= 40: dump_score += 10
-    if m.get("macd", 0) < m.get("macd_signal", 0): dump_score += 10
-    if regime == "BEAR TREND": dump_score += 10
-
-    watches = []
-    if pump_score >= 55:
-        watches.append({"pair":pair,"symbol":symbol,"watch":"PUMP WATCH","score":min(100,pump_score),"price":price,
-                        "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
-    if dump_score >= 55:
-        watches.append({"pair":pair,"symbol":symbol,"watch":"DUMP WATCH","score":min(100,dump_score),"price":price,
-                        "return_5h_pct":ret,"vol_ratio":vol,"rsi":rsi,"regime":regime})
-
-    return {"candidates": candidates, "watches": watches, "range": rng, "regime": regime,
-            "momentum": m, "support": support, "resistance": resistance}
-
-
-def v61_scan_all(progress=None, max_workers=6):
-    """Scan all active USDT Futures. Current-price data is fetched once; candle data is cached."""
-    instruments = active_instruments("USDT")
-    prices = futures_prices()
-    items = []
-    seen = set()
-    for inst in instruments:
-        pair = v61_instrument_pair(inst)
-        if not pair or pair in seen:
-            continue
-        seen.add(pair)
-        price = v61_price_for_pair(prices, pair)
-        if np.isfinite(price) and price > 0:
-            items.append((pair, v61_symbol(inst, pair), price))
-
-    # Concurrent network reads make a whole-market scan practical without changing
-    # the existing API functions or inventing private CoinDCX endpoints.
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    results = []
-    done = 0
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = {ex.submit(v61_fetch_candidate, p[0]): p for p in items}
-        for fut in as_completed(futs):
-            base = futs[fut]; fetched = fut.result(); done += 1
-            if progress:
-                progress(done, len(items))
-            if not fetched:
-                continue
-            pair, d15, d1h, d4h = fetched
-            try:
-                a = v61_analyze_candidate(pair, base[1], base[2], d15, d1h, d4h)
-                if a:
-                    a["price"] = base[2]
-                    results.append(a)
-            except Exception:
-                continue
-    return results, len(items)
-
-
-def v61_fmt_price(v):
-    v = v6_num(v)
-    if not np.isfinite(v): return "—"
-    if abs(v) >= 1000: return f"{v:,.2f}"
-    if abs(v) >= 1: return f"{v:,.4f}"
-    if abs(v) >= .01: return f"{v:,.6f}"
-    return f"{v:,.8f}"
-
-
-def v61_signal_card(t):
-    side = t.get("side", "")
-    emoji = "🟢" if side == "LONG" else "🔴"
-    st.write(f"### {emoji} {t.get('status','SIGNAL')} — {t.get('symbol', t.get('pair'))}")
-    st.write(f"**Type:** {t.get('type','')}  |  **Score:** {t.get('score',0)}/100  |  **Regime:** {t.get('regime','')}  ")
-    st.write(f"**Entry:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
-    st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
-
 
 # =============================================================================
 # V6.2 AUTONOMOUS HISTORICAL PATTERN LEARNING ENGINE
