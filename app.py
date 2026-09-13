@@ -72,7 +72,22 @@ def active_instruments(margin="USDT"):
             payload = r.json()
             rows = flatten_records(payload)
             if rows:
-                return rows
+                # Keep the legacy V5 contract: callers expect a list of pair strings.
+                # V6/V6.2 also accepts strings via v61_instrument_pair().
+                pairs = []
+                seen_pairs = set()
+                for rec in rows:
+                    if isinstance(rec, str):
+                        pair = rec.strip()
+                    elif isinstance(rec, dict):
+                        pair = next((rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name", "id") if isinstance(rec.get(k), str) and rec.get(k).strip()), None)
+                    else:
+                        pair = None
+                    if pair and pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        pairs.append(pair)
+                if pairs:
+                    return pairs
             errors.append(f"empty response params={params}; payload_type={type(payload).__name__}")
         except Exception as exc:
             errors.append(f"instrument endpoint {type(exc).__name__}: {exc}")
@@ -110,7 +125,7 @@ def active_instruments(margin="USDT"):
                     seen.add(pair)
                     derived.append({"pair": pair, "symbol": pair, "margin_currency_short_name": margin})
         if derived:
-            return derived
+            return [x["pair"] for x in derived if isinstance(x, dict) and x.get("pair")]
         errors.append(f"price-feed fallback returned no {margin} Futures pairs; payload_type={type(feed).__name__}")
     except Exception as exc:
         errors.append(f"price-feed fallback {type(exc).__name__}: {exc}")
@@ -1585,10 +1600,16 @@ def merge_learning_pools(*pools):
 
     for pool in pools:
         for e in pool:
+            pair_key = e.get("pair")
+            if isinstance(pair_key, dict):
+                pair_key = pair_key.get("pair") or pair_key.get("symbol") or str(pair_key)
+            event_key = e.get("event_type")
+            if isinstance(event_key, dict):
+                event_key = event_key.get("event_type") or event_key.get("type") or str(event_key)
             key = (
-                e.get("pair"),
+                str(pair_key),
                 str(e.get("time")),
-                e.get("event_type"),
+                str(event_key),
             )
             if key in seen:
                 continue
@@ -3855,7 +3876,7 @@ with c2:
 with c3:
     v61_auto = st.checkbox("Auto-refresh after scan", value=False, key="v61_auto")
 
-if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan_button"):
+if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan"):
     V61_DEFAULTS["min_score"] = v61_min_score
     bar = st.progress(0, text="Starting whole-market scan…")
     def _progress(done, total):
@@ -3869,11 +3890,10 @@ if st.button("🔎 SCAN ALL COINDCX FUTURES", type="primary", key="v61_scan_butt
     if v62_db_stats()["samples"] >= 100:
         with st.spinner("Comparing current setups with learned historical patterns…"):
             scan = v62_enhance_scan(scan)
-    st.session_state["v61_scan_result"] = scan
-    st.session_state["v61_scan_total"] = total
-    st.session_state["v61_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["v61_scan"] = scan
+    st.session_state["v61_scan_time"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-scan = st.session_state.get("v61_scan_result", [])
+scan = st.session_state.get("v61_scan", [])
 if scan:
     trades = []
     watches = []
@@ -3892,7 +3912,7 @@ if scan:
     pumps = sorted([x for x in watches if x.get("watch")=="PUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
     dumps = sorted([x for x in watches if x.get("watch")=="DUMP WATCH"], key=lambda x:x.get("score",0), reverse=True)
 
-    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {st.session_state.get('v61_scan_total', '—')}")
+    st.caption(f"Last scan: {st.session_state.get('v61_scan_time','—')} | Active contracts: {total if 'total' in locals() else 'all loaded'}")
     a,b,c,d = st.columns(4)
     a.metric("LONG signals", len(longs))
     b.metric("SHORT signals", len(shorts))
