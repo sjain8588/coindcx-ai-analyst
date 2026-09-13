@@ -2969,14 +2969,40 @@ if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
 
             for pair in active:
                 try:
-                    p = prices.get(pair)
-                    if not p:
-                        # Be tolerant of API key/casing differences.
-                        p = prices.get(str(pair).upper()) or prices.get(str(pair).lower())
-                    if not p:
+                    # Do not require an exact dictionary-key match. CoinDCX can
+                    # expose the same Futures contract under B-XXX_USDT,
+                    # XXX_USDT, or another normalized key. Resolve the price
+                    # independently and build the legacy price_info structure.
+                    p = None
+                    if isinstance(prices, dict):
+                        raw = prices.get(pair) or prices.get(str(pair).upper()) or prices.get(str(pair).lower())
+                        if isinstance(raw, dict):
+                            p = dict(raw)
+                        elif raw is not None:
+                            p = {"price": raw, "pair": pair}
+
+                    resolved_price = v61_price_for_pair(prices, pair)
+                    if not np.isfinite(resolved_price) or resolved_price <= 0:
+                        # Last-resort historical close. This keeps discovery
+                        # useful when the real-time feed omits one symbol.
+                        try:
+                            d15_probe = get_tf(pair, "15m", 2)
+                            dc_probe = completed(d15_probe)
+                            if dc_probe is not None and not dc_probe.empty:
+                                resolved_price = safe(dc_probe.iloc[-1].close)
+                        except Exception:
+                            pass
+                    if not np.isfinite(resolved_price) or resolved_price <= 0:
                         continue
 
-                    symbol = str(p.get("mkt", pair)).upper()
+                    if p is None:
+                        p = {"pair": pair, "price": resolved_price, "lp": resolved_price}
+                    else:
+                        p.setdefault("pair", pair)
+                        p.setdefault("price", resolved_price)
+                        p.setdefault("lp", resolved_price)
+
+                    symbol = str(p.get("mkt") or p.get("symbol") or p.get("pair") or pair).upper()
                     if meme_only and not any(w in symbol or w in pair.upper() for w in MEME_WORDS):
                         continue
 
@@ -2999,7 +3025,7 @@ if st.button("🔍 Scan Current Hot / ATH / ATL Coins"):
                 st.success(f"Found {len(candidates)} current discovery candidates across {len(active)} active {margin} Futures contracts.")
                 st.dataframe(pd.DataFrame(out), use_container_width=True, hide_index=True)
             else:
-                st.warning("No current hot/ATH/ATL candidates were found. Open Scan diagnostics below to check CoinDCX history/API coverage.")
+                st.warning(f"No current hot/ATH/ATL candidates were found after evaluating {len(active)} active {margin} Futures contracts. This means the market did not meet the configured discovery thresholds, or some history was unavailable.")
 
             if failures:
                 with st.expander(f"Scan diagnostics ({len(failures)} contracts with errors)"):
