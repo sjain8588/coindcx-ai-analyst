@@ -2205,11 +2205,36 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
     try:
         with st.spinner("Fetching CoinDCX history and studying continuation vs reversal..."):
             prices=futures_prices(); req=normalize(coin); found=[]
+
+            # CoinDCX can expose the same Futures contract under slightly
+            # different casing/key fields in the active-instruments endpoint
+            # and the real-time price feed.  Resolve the pair through the
+            # normalized helper instead of doing a fragile exact dictionary
+            # lookup.  This keeps the legacy V5 analyzer compatible with the
+            # V6/V6.2 market-discovery layer.
+            def price_record_for_pair(price_map, target_pair):
+                if not isinstance(price_map, dict):
+                    return None
+                target = str(target_pair).strip().upper()
+                for key in (target_pair, str(target_pair).upper(), str(target_pair).lower()):
+                    rec = price_map.get(key)
+                    if isinstance(rec, dict):
+                        return rec
+                for key, rec in price_map.items():
+                    if not isinstance(rec, dict):
+                        continue
+                    ident = str(rec.get("pair") or rec.get("symbol") or rec.get("mkt") or rec.get("market") or key).strip().upper()
+                    if ident == target:
+                        return rec
+                return None
+
             for q in [margin]+[x for x in ("USDT","INR") if x!=margin]:
                 for pair in active_instruments(q):
-                    p=prices.get(pair)
+                    pair = v61_instrument_pair(pair)
+                    if not pair: continue
+                    p=price_record_for_pair(prices, pair)
                     if not p: continue
-                    symbol=str(p.get("mkt",pair)).upper()
+                    symbol=str(p.get("mkt") or p.get("symbol") or p.get("pair") or pair).upper()
                     if coin_matches(pair,symbol,req,q): found.append((pair,p,symbol,q))
             if not found:
                 st.error(f"No active CoinDCX Futures contract found for '{coin}'."); st.stop()
