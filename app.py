@@ -2662,38 +2662,61 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
 
 
 def v61_scan_all(progress=None, max_workers=6):
-    """Scan all active USDT Futures. Current-price data is fetched once; candle data is cached."""
+    """Scan every active USDT Futures contract.
+
+    The active-instrument list is the source of truth.  The live price feed is
+    only a preferred price source; a contract is NOT discarded when its price
+    key does not match the instrument key.  In that case the latest completed
+    15m candle supplies the current price.  This prevents a valid 500+ contract
+    universe from collapsing to zero because of a feed-key naming difference.
+    """
     instruments = active_instruments("USDT")
-    prices = futures_prices()
+    try:
+        prices = futures_prices()
+    except Exception:
+        prices = {}
+
     items = []
     seen = set()
     for inst in instruments:
         pair = v61_instrument_pair(inst)
-        if not pair or pair in seen:
+        if not pair:
             continue
-        seen.add(pair)
-        price = v61_price_for_pair(prices, pair)
-        if np.isfinite(price) and price > 0:
-            items.append((pair, v61_symbol(inst, pair), price))
+        canonical = str(pair).strip().upper()
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        live_price = v61_price_for_pair(prices, pair)
+        items.append((pair, v61_symbol(inst, pair), live_price))
 
-    # Concurrent network reads make a whole-market scan practical without changing
-    # the existing API functions or inventing private CoinDCX endpoints.
     from concurrent.futures import ThreadPoolExecutor, as_completed
     results = []
     done = 0
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         futs = {ex.submit(v61_fetch_candidate, p[0]): p for p in items}
         for fut in as_completed(futs):
-            base = futs[fut]; fetched = fut.result(); done += 1
+            base = futs[fut]
+            fetched = fut.result()
+            done += 1
             if progress:
                 progress(done, len(items))
             if not fetched:
                 continue
             pair, d15, d1h, d4h = fetched
             try:
-                a = v61_analyze_candidate(pair, base[1], base[2], d15, d1h, d4h)
+                # Prefer the live price, but ALWAYS fall back to the latest
+                # completed 15m close when the real-time feed key differs.
+                price = base[2]
+                if not np.isfinite(price) or price <= 0:
+                    c = completed(d15)
+                    if c is not None and not c.empty:
+                        price = v6_num(c.iloc[-1].close)
+                if not np.isfinite(price) or price <= 0:
+                    continue
+                a = v61_analyze_candidate(pair, base[1], price, d15, d1h, d4h)
                 if a:
-                    a["price"] = base[2]
+                    a["price"] = price
+                    a["price_source"] = "LIVE_FEED" if np.isfinite(base[2]) and base[2] > 0 else "15M_CANDLE_FALLBACK"
                     results.append(a)
             except Exception:
                 continue
