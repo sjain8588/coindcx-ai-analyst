@@ -2718,15 +2718,47 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
                 return None
 
             for q in [margin]+[x for x in ("USDT","INR") if x!=margin]:
-                for pair in active_instruments(q):
-                    pair = v61_instrument_pair(pair)
-                    if not pair: continue
-                    p=price_record_for_pair(prices, pair)
-                    if not p: continue
-                    symbol=str(p.get("mkt") or p.get("symbol") or p.get("pair") or pair).upper()
-                    if coin_matches(pair,symbol,req,q): found.append((pair,p,symbol,q))
+                for raw_pair in active_instruments(q):
+                    pair = v61_instrument_pair(raw_pair)
+                    if not pair:
+                        continue
+
+                    # Match against the active Futures universe first. The live
+                    # price feed may use a different key/field spelling, so it
+                    # must not decide whether the contract exists.
+                    active_symbol = pair
+                    if isinstance(raw_pair, dict):
+                        active_symbol = str(raw_pair.get("symbol") or raw_pair.get("display_name") or raw_pair.get("market") or raw_pair.get("pair") or pair)
+                    if not coin_matches(pair, active_symbol, req, q):
+                        continue
+
+                    p = price_record_for_pair(prices, pair)
+
+                    # Fuzzy price-feed lookup for B-LSK_USDT / LSK_USDT / LSKUSDT.
+                    if p is None:
+                        target = str(pair).upper().replace("-", "").replace("_", "")
+                        for key, rec in prices.items():
+                            ident = str(key).upper().replace("-", "").replace("_", "")
+                            if ident == target or (ident.startswith("B") and ident[1:] == target):
+                                p = rec if isinstance(rec, dict) else {"pair": key, "price": rec}
+                                break
+
+                    # Last-resort price from the latest completed 15m candle.
+                    if p is None:
+                        try:
+                            probe = completed(get_tf(pair, "15m", 2))
+                            if not probe.empty:
+                                last_close = float(probe.iloc[-1]["close"])
+                                p = {"pair": pair, "price": last_close, "ls": last_close}
+                        except Exception:
+                            p = None
+                    if p is None:
+                        continue
+
+                    symbol = str(p.get("mkt") or p.get("symbol") or p.get("pair") or active_symbol or pair).upper()
+                    found.append((pair, p, symbol, q))
             if not found:
-                st.error(f"No active CoinDCX Futures contract found for '{coin}'."); st.stop()
+                st.error(f"No active CoinDCX Futures contract found for '{coin}'. Active Futures were discovered, but the requested coin did not match. Try the exact pair shown by CoinDCX, e.g. B-LSK_USDT."); st.stop()
             found.sort(key=lambda z:(0 if z[3]==margin else 1,len(z[0])))
             pair,p,symbol,_=found[0]
             current=analyze_current_coin(pair,p)
