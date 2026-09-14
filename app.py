@@ -2511,16 +2511,37 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
     brk = v61_breakout_status(d15, support, resistance)
     structure = v63_structure_engine(d15, d1h, price)
     ema_cross = v63_ema_cross_context({"15m": d15, "4H": d4h})
+    ema15 = v63_ema_structure(d15)
+    ema1h = v63_ema_structure(d1h)
+    ema4h = v63_ema_structure(d4h)
     atr = m.get("atr", np.nan)
     candidates = []
 
     # ---------------- TRUE HH/HL / LH/LL STRUCTURE ----------------
     # Only strong two-sided swing sequences become actionable structure alerts.
     if structure.get("side") in ("LONG", "SHORT") and structure.get("score", 0) >= 55:
-        st = v63_structure_trade(pair, symbol, price, structure, structure["side"])
+        st = v63_structure_trade(pair, symbol, price, structure, structure["side"], d4h, d15)
         if st:
             st.update({"regime": regime, "rsi": m.get("rsi", np.nan), "vol_ratio": m.get("vol_ratio", np.nan),
-                       "structure_state": structure.get("state")})
+                       "structure_state": structure.get("state"),
+                       "ema_structure_15m": ema15.get("state"), "ema_structure_1h": ema1h.get("state"),
+                       "ema_structure_4h": ema4h.get("state"), "ema_stack_15m": ema15.get("stack"),
+                       "ema_gap_15m_pct": ema15.get("gap20_50_pct", np.nan),
+                       "ema_gap_4h_pct": ema4h.get("gap20_50_pct", np.nan),
+                       "ema20_slope_15m_pct": ema15.get("slope20_pct", np.nan),
+                       "ema50_slope_15m_pct": ema15.get("slope50_pct", np.nan),
+                       "ema100_slope_15m_pct": ema15.get("slope100_pct", np.nan),
+                       "ema_gap_expanding_15m": ema15.get("gap_expanding", False),
+                       "ema20_50_cross_15m": ema15.get("cross20_50"),
+                       "ema20_100_cross_15m": ema15.get("cross20_100")})
+            # A higher-timeframe EMA stack can veto an otherwise premature
+            # structure signal. It does not override a confirmed breakdown.
+            if st.get("side") == "SHORT" and ema4h.get("state") == "STRONG BULLISH EMA STRUCTURE":
+                st["status"] = "WAIT — 4H EMA STRUCTURE BULLISH"
+                st["reason"] = st.get("reason", "") + " | 4H EMA20/50/100 remain strongly bullish"
+            elif st.get("side") == "LONG" and ema4h.get("state") == "STRONG BEARISH EMA STRUCTURE":
+                st["status"] = "WAIT — 4H EMA STRUCTURE BEARISH"
+                st["reason"] = st.get("reason", "") + " | 4H EMA20/50/100 remain strongly bearish"
             candidates.append(st)
 
     # ---------------- RANGE LONG ----------------
@@ -2533,6 +2554,8 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
         if rejection: score += 10
         if m.get("vol_ratio", 1) >= 1.25: score += 5
         if regime == "BEAR TREND": score -= 15
+        if ema15.get("stack") == "BULLISH" and ema15.get("gap_expanding"): score += 8
+        if ema4h.get("stack") == "BULLISH" and ema4h.get("gap_expanding"): score += 8
         score = max(0, min(100, score))
         if score >= V61_DEFAULTS["min_score"]:
             t = v61_trade_from_setup(pair, "LONG", price, support, resistance, atr, score, "RANGE SUPPORT REJECTION")
@@ -2552,6 +2575,8 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
         if rejection: score += 10
         if m.get("vol_ratio", 1) >= 1.25: score += 5
         if regime == "BULL TREND": score -= 15
+        if ema15.get("stack") == "BEARISH" and ema15.get("gap_expanding"): score += 8
+        if ema4h.get("stack") == "BEARISH" and ema4h.get("gap_expanding"): score += 8
         score = max(0, min(100, score))
         if score >= V61_DEFAULTS["min_score"]:
             t = v61_trade_from_setup(pair, "SHORT", price, support, resistance, atr, score, "RANGE RESISTANCE REJECTION")
@@ -2585,6 +2610,10 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
         if m.get("rsi", 50) > 22: score += 7
         if regime == "BEAR TREND": score += 8
         if regime == "BULL TREND": score -= 20
+        if ema15.get("stack") == "BEARISH": score += 8
+        if ema15.get("gap_expanding"): score += 5
+        if ema4h.get("stack") == "BEARISH": score += 10
+        elif ema4h.get("stack") == "BULLISH" and not ema4h.get("gap_expanding"): score -= 8
         if score >= V61_DEFAULTS["min_score"]:
             fake_res = {"level": support["level"] + max(atr, price*0.006)} if support else None
             t = v61_trade_from_setup(pair, "SHORT", price, {"level": price-2.8*atr}, fake_res, atr, score, "15M BREAKDOWN + CONFIRMATION")
@@ -2746,7 +2775,14 @@ def v61_signal_card(t):
     emoji = "🟢" if side == "LONG" else "🔴"
     st.write(f"### {emoji} {t.get('status','SIGNAL')} — {t.get('symbol', t.get('pair'))}")
     st.write(f"**Type:** {t.get('type','')}  |  **Score:** {t.get('score',0)}/100  |  **Regime:** {t.get('regime','')}  ")
-    st.write(f"**Entry:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
+    st.write(f"**Entry / Trigger:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
+    if t.get("ema_structure_15m") or t.get("ema_structure_4h"):
+        st.write(f"**EMA Structure:** 15m `{t.get('ema_structure_15m','—')}` | 1H `{t.get('ema_structure_1h','—')}` | 4H `{t.get('ema_structure_4h','—')}`")
+        st.write(f"**15m EMA stack:** `{t.get('ema_stack_15m','—')}` | EMA20 slope `{v6_num(t.get('ema20_slope_15m_pct'), np.nan):+.3f}%` | 20–50 gap `{v6_num(t.get('ema_gap_15m_pct'), np.nan):.2f}%` | Gap expanding: `{ 'YES' if t.get('ema_gap_expanding_15m') else 'NO' }`")
+    if side == "SHORT" and np.isfinite(v6_num(t.get("four_h_ema20"))):
+        bounce = t.get("four_h_bounce_risk", "UNKNOWN")
+        st.write(f"**4H EMA20:** `{v61_fmt_price(t.get('four_h_ema20'))}`  |  **4H bounce risk:** **{bounce}**  |  **Distance from trigger:** `{v6_num(t.get('distance_to_4h_ema20_pct'), np.nan):+.2f}%`")
+        st.write("**Preferred SHORT:** wait for the 15m candle to close below the trigger; if the 4H EMA20 is still nearby support, wait for that support to break/reject before entering.")
     st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
 
 
@@ -3278,6 +3314,108 @@ def v6_structure_signal(d):
     return "RANGE"
 
 
+def v63_ema_structure(d, lookback=3):
+    """Multi-EMA trend structure using completed candles only.
+
+    Evaluates EMA20/50/100 as a *structure*: ordering, slope, separation,
+    separation momentum, price location, and fresh 20/50 or 20/100 crosses.
+    A single EMA cross is never enough to declare a trade direction.
+    """
+    empty = {
+        "state":"UNKNOWN", "side":None, "score":0, "price":np.nan,
+        "ema20":np.nan, "ema50":np.nan, "ema100":np.nan,
+        "slope20_pct":np.nan, "slope50_pct":np.nan, "slope100_pct":np.nan,
+        "gap20_50_pct":np.nan, "gap50_100_pct":np.nan,
+        "gap20_100_pct":np.nan, "gap20_50_change_pct":np.nan,
+        "gap50_100_change_pct":np.nan, "gap_expanding":False,
+        "stack":"UNKNOWN", "cross20_50":None, "cross20_100":None,
+        "price_vs_20":"UNKNOWN"
+    }
+    if d is None or d.empty:
+        return empty
+    x = indicators(completed(d))
+    if x is None or len(x) < max(105, lookback + 5):
+        return empty
+    r = x.iloc[-1]
+    prev = x.iloc[-1-lookback]
+    def n(v):
+        try: return float(v)
+        except Exception: return np.nan
+    p, e20, e50, e100 = map(n, [r.close, r.ema20, r.ema50, r.ema100])
+    if not all(np.isfinite(v) and v > 0 for v in [p,e20,e50,e100]):
+        return empty
+    slopes = {}
+    for name, now, old in [("20",e20,n(prev.ema20)),("50",e50,n(prev.ema50)),("100",e100,n(prev.ema100))]:
+        slopes[name] = (now/old-1)*100 if np.isfinite(old) and old > 0 else np.nan
+    g2050 = abs(e20-e50)/e50*100
+    g50100 = abs(e50-e100)/e100*100
+    g20100 = abs(e20-e100)/e100*100
+    pe20, pe50, pe100 = n(prev.ema20), n(prev.ema50), n(prev.ema100)
+    old_g2050 = abs(pe20-pe50)/pe50*100 if np.isfinite(pe50) and pe50>0 else np.nan
+    old_g50100 = abs(pe50-pe100)/pe100*100 if np.isfinite(pe100) and pe100>0 else np.nan
+    dg2050 = g2050-old_g2050 if np.isfinite(old_g2050) else np.nan
+    dg50100 = g50100-old_g50100 if np.isfinite(old_g50100) else np.nan
+    expanding = bool(np.isfinite(dg2050) and np.isfinite(dg50100) and dg2050 > 0 and dg50100 > 0)
+    stack = "BULLISH" if e20 > e50 > e100 else "BEARISH" if e20 < e50 < e100 else "MIXED"
+    price_vs = "ABOVE EMA20" if p > e20 else "BELOW EMA20"
+    # Detect the most recent completed-bar cross without using the forming candle.
+    cross2050 = "BULLISH" if np.isfinite(pe20) and np.isfinite(pe50) and pe20 <= pe50 and e20 > e50 else "BEARISH" if np.isfinite(pe20) and np.isfinite(pe50) and pe20 >= pe50 and e20 < e50 else None
+    cross20100 = "BULLISH" if np.isfinite(pe20) and np.isfinite(pe100) and pe20 <= pe100 and e20 > e100 else "BEARISH" if np.isfinite(pe20) and np.isfinite(pe100) and pe20 >= pe100 and e20 < e100 else None
+
+    bull = bear = 0
+    if stack == "BULLISH": bull += 35
+    elif stack == "BEARISH": bear += 35
+    if np.isfinite(slopes["20"]):
+        if slopes["20"] > 0.02: bull += 12
+        elif slopes["20"] < -0.02: bear += 12
+    if np.isfinite(slopes["50"]):
+        if slopes["50"] > 0.01: bull += 10
+        elif slopes["50"] < -0.01: bear += 10
+    if np.isfinite(slopes["100"]):
+        if slopes["100"] > 0: bull += 5
+        elif slopes["100"] < 0: bear += 5
+    if expanding:
+        if stack == "BULLISH": bull += 15
+        elif stack == "BEARISH": bear += 15
+    elif np.isfinite(dg2050) and np.isfinite(dg50100) and dg2050 < 0 and dg50100 < 0:
+        if stack == "BULLISH": bull += 5
+        elif stack == "BEARISH": bear += 5
+    if p > e20 and stack == "BULLISH": bull += 8
+    if p < e20 and stack == "BEARISH": bear += 8
+    # Crosses are confirmation/transition information, not standalone signals.
+    if cross2050 == "BULLISH": bull += 6
+    elif cross2050 == "BEARISH": bear += 6
+    if cross20100 == "BULLISH": bull += 4
+    elif cross20100 == "BEARISH": bear += 4
+
+    if stack == "BULLISH" and bull >= 70:
+        state, side = "STRONG BULLISH EMA STRUCTURE", "LONG"
+    elif stack == "BULLISH":
+        state, side = "BULLISH EMA STRUCTURE", "LONG"
+    elif stack == "BEARISH" and bear >= 70:
+        state, side = "STRONG BEARISH EMA STRUCTURE", "SHORT"
+    elif stack == "BEARISH":
+        state, side = "BEARISH EMA STRUCTURE", "SHORT"
+    elif bull >= bear + 12:
+        state, side = "BULLISH EMA TRANSITION", "LONG"
+    elif bear >= bull + 12:
+        state, side = "BEARISH EMA TRANSITION", "SHORT"
+    else:
+        state, side = "EMA MIXED / TRANSITION", None
+    score = int(min(100, max(bull, bear)))
+    return {
+        "state":state, "side":side, "score":score, "price":p,
+        "ema20":e20, "ema50":e50, "ema100":e100,
+        "slope20_pct":slopes["20"], "slope50_pct":slopes["50"], "slope100_pct":slopes["100"],
+        "gap20_50_pct":g2050, "gap50_100_pct":g50100, "gap20_100_pct":g20100,
+        "gap20_50_change_pct":dg2050, "gap50_100_change_pct":dg50100,
+        "gap_expanding":expanding, "stack":stack,
+        "cross20_50":cross2050, "cross20_100":cross20100,
+        "price_vs_20":price_vs,
+        "bull_score":int(min(100,bull)), "bear_score":int(min(100,bear))
+    }
+
+
 def v63_structure_engine(d15, d1h, price):
     """True swing-sequence detector for HH/HL and LH/LL structures.
 
@@ -3448,8 +3586,14 @@ def v63_ema_cross_context(tf_data):
     return {"15m":c15,"4H":c4,"bear_score":min(100,bear_points),
             "bull_score":min(100,bull_points),"reasons":reasons}
 
-def v63_structure_trade(pair, symbol, price, structure, direction):
-    """Create a structure-based alert with breakout/pullback trigger levels."""
+def v63_structure_trade(pair, symbol, price, structure, direction, d4h=None, d15=None):
+    """Create structure alerts with 4H EMA20-aware short entries.
+
+    SHORT logic is intentionally conservative: a 15m LH/LL break is only an
+    entry trigger. If the 4H EMA20 is still acting as nearby support, the
+    scanner changes the signal to WAIT rather than asking the trader to chase
+    price into a likely higher-timeframe bounce.
+    """
     atr = v6_num(structure.get("atr"))
     if not np.isfinite(atr) or atr <= 0 or price <= 0:
         return None
@@ -3468,19 +3612,81 @@ def v63_structure_trade(pair, symbol, price, structure, direction):
                 "status":status,"score":structure["score"],"entry":trigger,"stop":stop,"tp1":tp1,"tp2":tp2,
                 "rr1":2.0,"rr2":3.0,"support":hl,"resistance":hh,
                 "reason":f"15m {structure['state']} | HH +{structure['high_change_pct']:.2f}% | HL +{structure['low_change_pct']:.2f}%"}
+
+    # ---------------- 15M LH/LL SHORT ----------------
     lh = v6_num(structure.get("last_high")); ll = v6_num(structure.get("last_low"))
     trigger = ll - 0.12*atr
     stop = lh + 0.25*atr
     risk = stop-trigger
     if risk <= 0: return None
-    tp1, tp2 = trigger - 2*risk, trigger - 3*risk
+
+    # 4H support context. Use completed 4H candles only.
+    d4 = completed(d4h) if d4h is not None else pd.DataFrame()
+    x4 = indicators(d4) if d4 is not None and not d4.empty else pd.DataFrame()
+    r4 = x4.iloc[-1] if not x4.empty else None
+    ema4 = v6_num(r4.ema20) if r4 is not None else np.nan
+    close4 = v6_num(r4.close) if r4 is not None else np.nan
+    atr4 = v6_num(r4.atr) if r4 is not None else np.nan
+
+    htf_bullish = np.isfinite(close4) and np.isfinite(ema4) and close4 > ema4
+    support_buffer = max(0.50 * atr4 if np.isfinite(atr4) and atr4 > 0 else 0, ema4 * 0.005 if np.isfinite(ema4) and ema4 > 0 else 0)
+    # If the 4H trend is still bullish, only treat EMA20 as a bounce blocker
+    # when the 15m breakdown trigger is still above/inside that support zone.
+    # Once the trigger is clearly below EMA20, the 15m break has already taken
+    # out the higher-timeframe support and the short is allowed.
+    ema20_support_zone = (
+        htf_bullish and np.isfinite(ema4) and trigger >= ema4 and
+        trigger <= ema4 + support_buffer
+    )
+    distance_to_ema_pct = ((trigger / ema4) - 1) * 100 if np.isfinite(ema4) and ema4 > 0 else np.nan
+
+    # Require a COMPLETED 15m candle to close through the trigger. A live tick
+    # below the level is not enough; this prevents intrabar false shorts.
+    d15c = completed(d15) if d15 is not None else pd.DataFrame()
+    close15 = v6_num(d15c.iloc[-1].close) if d15c is not None and not d15c.empty else np.nan
+
+    # Normal structural targets are 2R/3R. When 4H EMA20 sits below the
+    # breakdown trigger, make it the first practical support target.
+    raw_tp1, raw_tp2 = trigger - 2*risk, trigger - 3*risk
+    tp1 = raw_tp1
+    if np.isfinite(ema4) and ema4 < trigger:
+        tp1 = max(ema4 * 1.002, raw_tp1) if ema4 > raw_tp1 else ema4 * 1.002
+    tp2 = raw_tp2
+
     near_pullback = abs(price-lh) <= max(0.75*atr, price*0.004)
-    triggered = price <= trigger
-    status = "SHORT NOW" if triggered else ("SHORT PULLBACK ZONE" if near_pullback else "WAIT FOR LL BREAK")
+    triggered = np.isfinite(close15) and close15 <= trigger
+
+    if triggered and htf_bullish and ema20_support_zone:
+        status = "WAIT — 4H EMA20 SUPPORT"
+    elif triggered:
+        status = "SHORT NOW"
+    elif htf_bullish and ema20_support_zone:
+        status = "WAIT — 4H EMA20 SUPPORT"
+    elif near_pullback:
+        status = "SHORT PULLBACK ZONE"
+    else:
+        status = "WAIT FOR LL BREAK"
+
+    bounce_note = (
+        "4H EMA20 is nearby support; wait for a 4H EMA20 rejection/break before shorting"
+        if htf_bullish and ema20_support_zone
+        else "4H EMA20 support is sufficiently below the 15m breakdown trigger"
+        if np.isfinite(ema4) and ema4 < trigger
+        else "4H EMA20 context unavailable"
+    )
+
     return {"pair":pair,"symbol":symbol,"side":"SHORT","direction":"SHORT","type":"LH/LL STRUCTURE",
             "status":status,"score":structure["score"],"entry":trigger,"stop":stop,"tp1":tp1,"tp2":tp2,
-            "rr1":2.0,"rr2":3.0,"support":ll,"resistance":lh,
-            "reason":f"15m {structure['state']} | LH {structure['high_change_pct']:.2f}% | LL {structure['low_change_pct']:.2f}%"}
+            "rr1":(trigger-tp1)/risk if risk > 0 else 0,
+            "rr2":(trigger-tp2)/risk if risk > 0 else 0,
+            "support":ll,"resistance":lh,
+            "break_trigger":trigger,"preferred_short":trigger,
+            "four_h_ema20":ema4,"four_h_close":close4,"four_h_atr":atr4,
+            "distance_to_4h_ema20_pct":distance_to_ema_pct,
+            "four_h_bounce_risk":"HIGH" if htf_bullish and ema20_support_zone else "NORMAL",
+        "closed_15m_price":close15,
+        "entry_confirmation":"15m CLOSED below trigger" if triggered else "WAIT for 15m CLOSE below trigger",
+            "reason":f"15m {structure['state']} | LH {structure['high_change_pct']:.2f}% | LL {structure['low_change_pct']:.2f}% | {bounce_note}"}
 
 
 def v6_squeeze_breakout(d):
@@ -3557,6 +3763,9 @@ def v6_setup_engine(current, direction, cfg):
     regime = v6_market_regime(tf)
     s15 = short_term_state(current)
     struct15 = v6_structure_signal(tf.get("15m"))
+    ema_s15 = v63_ema_structure(tf.get("15m"))
+    ema_s1 = v63_ema_structure(tf.get("1H"))
+    ema_s4 = v63_ema_structure(tf.get("4H"))
     volq = v6_volume_quality(tf.get("15m"))
     expansion = v6_squeeze_breakout(tf.get("15m"))
     rs = v6_relative_strength(tf)
@@ -3609,6 +3818,20 @@ def v6_setup_engine(current, direction, cfg):
             score += 12; reasons.append("V5 short-term reversal confirmation supports SHORT")
         if regime["bull"] >= 2:
             blockers.append("higher-timeframe regime is bullish")
+
+    # EMA20/50/100 structure: ordering + slope + separation.
+    if direction == "LONG":
+        if ema_s15.get("stack") == "BULLISH": score += 8; reasons.append("15m EMA20 > EMA50 > EMA100")
+        if ema_s15.get("gap_expanding"): score += 5; reasons.append("15m EMA separation expanding")
+        if ema_s15.get("slope20_pct", 0) > 0 and ema_s15.get("slope50_pct", 0) > 0: score += 5; reasons.append("15m EMA20/50 slopes rising")
+        if ema_s4.get("stack") == "BULLISH": score += 7; reasons.append("4H EMA20 > EMA50 > EMA100")
+        if ema_s4.get("stack") == "BEARISH" and ema_s4.get("gap_expanding"): blockers.append("4H EMA structure is strongly bearish")
+    else:
+        if ema_s15.get("stack") == "BEARISH": score += 8; reasons.append("15m EMA20 < EMA50 < EMA100")
+        if ema_s15.get("gap_expanding"): score += 5; reasons.append("15m EMA separation expanding")
+        if ema_s15.get("slope20_pct", 0) < 0 and ema_s15.get("slope50_pct", 0) < 0: score += 5; reasons.append("15m EMA20/50 slopes falling")
+        if ema_s4.get("stack") == "BEARISH": score += 7; reasons.append("4H EMA20 < EMA50 < EMA100")
+        if ema_s4.get("stack") == "BULLISH" and ema_s4.get("gap_expanding"): blockers.append("4H EMA structure is strongly bullish")
 
     # V5 historical evidence: 15 points maximum.
     last_summary = st.session_state.get("last_analysis", {}).get("summary")
@@ -5463,7 +5686,8 @@ with st.expander("How the signal works", expanded=False):
 **Your screen should answer one question: where is the trade?**
 
 - 🟢 **LONG NOW** = price has reached/confirmed a qualifying long trigger.
-- 🔴 **SHORT NOW** = price has reached/confirmed a qualifying short trigger.
+- 🔴 **SHORT NOW** = 15m bearish trigger is confirmed AND the 4H EMA20 is not acting as nearby support.
+- 🟠 **WAIT — 4H EMA20 SUPPORT** = 15m broke, but the projected short is too close to higher-timeframe EMA20 support; wait for rejection/break of that support.
 - 🟢/🔴 **SETUP** = level is identified, but the trigger is not confirmed yet.
 - 🟦 **RANGE** = repeated support/resistance behaviour; buy support / short resistance only with confirmation.
 - 🚀 **PUMP WATCH** and 🔻 **DUMP WATCH** are momentum warnings, **not automatic trade signals**.
