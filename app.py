@@ -6012,8 +6012,11 @@ def v71_scan_from_existing(scan):
             if short_score >= long_score: short_score += 8; short_reasons.append(f"volume {vol:.1f}x")
         if ret >= 3: long_score += 5; long_reasons.append(f"5h +{ret:.1f}%")
         if ret <= -3: short_score += 5; short_reasons.append(f"5h {ret:.1f}%")
-        # Historical learner, if V6.2 already blended it into candidates.
-        # Historical learner is optional. Ignore missing/non-finite values safely.
+        # Historical learner, if V6.2 already blended it into the V6.1
+        # market object's candidate list.  The previous V15 build referenced
+        # a non-existent local variable named `candidates`, which caused the
+        # V7 radar to fail with NameError.
+        candidates = a.get("candidates") or []
         _long_probs = []
         _short_probs = []
         for _t in candidates:
@@ -6026,8 +6029,8 @@ def v71_scan_from_existing(scan):
                 _short_probs.append(_p)
         learn_long = max(_long_probs) if _long_probs else _np.nan
         learn_short = max(_short_probs) if _short_probs else _np.nan
-        if np.isfinite(learn_long) and learn_long >= 65: long_score += 8; long_reasons.append(f"history {learn_long:.0f}%")
-        if np.isfinite(learn_short) and learn_short >= 65: short_score += 8; short_reasons.append(f"history {learn_short:.0f}%")
+        if _np.isfinite(learn_long) and learn_long >= 65: long_score += 8; long_reasons.append(f"history {learn_long:.0f}%")
+        if _np.isfinite(learn_short) and learn_short >= 65: short_score += 8; short_reasons.append(f"history {learn_short:.0f}%")
         rows.append({
             "symbol":symbol, "pair":pair, "price":price,
             "long_score":min(100,int(long_score)), "short_score":min(100,int(short_score)),
