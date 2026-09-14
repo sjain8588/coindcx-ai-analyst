@@ -5952,6 +5952,9 @@ def v71_build_radar(a):
 
 
 def v71_scan_from_existing(scan):
+    # Keep the V7 probability calculation self-contained in Streamlit Cloud.
+    # A stale module namespace must never make the structure radar crash.
+    import numpy as _np
     """Use V6.1's already-fetched market analysis without another 500-contract API scan.
 
     V6.1 normally does not retain candle frames, so this function uses the structure
@@ -6010,8 +6013,19 @@ def v71_scan_from_existing(scan):
         if ret >= 3: long_score += 5; long_reasons.append(f"5h +{ret:.1f}%")
         if ret <= -3: short_score += 5; short_reasons.append(f"5h {ret:.1f}%")
         # Historical learner, if V6.2 already blended it into candidates.
-        learn_long = max([v6_num(t.get("learned_probability"), np.nan) for t in candidates if t.get("side")=="LONG" and np.isfinite(v6_num(t.get("learned_probability")))], default=np.nan)
-        learn_short = max([v6_num(t.get("learned_probability"), np.nan) for t in candidates if t.get("side")=="SHORT" and np.isfinite(v6_num(t.get("learned_probability")))], default=np.nan)
+        # Historical learner is optional. Ignore missing/non-finite values safely.
+        _long_probs = []
+        _short_probs = []
+        for _t in candidates:
+            _p = v6_num(_t.get("learned_probability"), _np.nan)
+            if not _np.isfinite(_p):
+                continue
+            if _t.get("side") == "LONG":
+                _long_probs.append(_p)
+            elif _t.get("side") == "SHORT":
+                _short_probs.append(_p)
+        learn_long = max(_long_probs) if _long_probs else _np.nan
+        learn_short = max(_short_probs) if _short_probs else _np.nan
         if np.isfinite(learn_long) and learn_long >= 65: long_score += 8; long_reasons.append(f"history {learn_long:.0f}%")
         if np.isfinite(learn_short) and learn_short >= 65: short_score += 8; short_reasons.append(f"history {learn_short:.0f}%")
         rows.append({
@@ -6548,7 +6562,11 @@ if st.button("🚀 RUN V7 STRUCTURE RADAR", type="primary", key="v7_run_structur
         st.warning("Run **SCAN ALL COINDCX FUTURES** above first. V7 reuses that market-wide scan so it does not make another 500+ contract API request.")
     else:
         with st.spinner("Building HH/HL, LH/LL and EMA20/100 radar from the market-wide scan…"):
-            radar = v71_scan_from_existing(existing)
+            try:
+                radar = v71_scan_from_existing(existing)
+            except Exception as e:
+                radar = []
+                st.error(f"V7 radar could not be built: {type(e).__name__}: {e}")
         st.session_state["v7_radar_results"] = radar
         st.session_state["v7_radar_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
