@@ -3794,6 +3794,7 @@ def v6_daily_guard(balance, starting_balance, rows, cfg):
 STRATEGY_FILE = Path("strategy_signal_journal.json")
 V7_STRATEGY_HORIZONS_MIN = (60, 240, 480, 1440)  # 1h, 4h, 8h, 24h
 V7_STRATEGY_COOLDOWN_MIN = 240  # do not duplicate the same pair/side every scan
+V7_PAPER_LEVERAGE = 10.0  # fixed leverage for autonomous strategy paper trades
 
 
 def v7_strategy_load():
@@ -3919,6 +3920,9 @@ def v7_strategy_add_signals(rows, records, now=None):
             "direction": direction,
             "score": score,
             "entry": entry,
+            "leverage": V7_PAPER_LEVERAGE,
+            "paper_margin_usdt": float(st.session_state.get("v7_paper_amount", 1000.0)),
+            "paper_notional_usdt": float(st.session_state.get("v7_paper_amount", 1000.0)) * V7_PAPER_LEVERAGE,
             "structure": setup.get("structure15", r.get("15m Structure", "")),
             "regime": setup.get("regime", r.get("Regime", "")),
             "volume_ratio": v6_num((setup.get("volume") or {}).get("ratio")),
@@ -4100,14 +4104,14 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
 
     records, failures, scanned = v6_run_market_scan(scan_limit, cfg)
 
-    # Strategy Performance Lab: record qualifying signals independently of TP/SL.
-    # This measures what the strategy itself did after a signal, rather than
-    # assuming a particular stop/target construction.
+    # Autonomous strategy paper trading: every qualifying signal is treated as a
+    # paper trade. No TP/SL is required; the position is evaluated by forward price
+    # movement (1H/4H/8H/24H).
     try:
         _, lab_added = v7_strategy_lab_cycle(records)
     except Exception as exc:
         lab_added = []
-        failures.append(f"strategy_lab: {type(exc).__name__}: {exc}")
+        failures.append(f"strategy_paper: {type(exc).__name__}: {exc}")
 
     valid = [r for r in records if r["Valid"] == "✅ TRADE CANDIDATE"]
     # Only one position per contract; if both directions qualify, take the stronger one.
@@ -4118,32 +4122,11 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
             best_by_pair[pair] = r
     candidates = sorted(best_by_pair.values(), key=lambda r: r["Score"], reverse=True)
 
-    opened, skipped = [], []
-    open_pairs = {str(r.get("pair")) for r in rows if r.get("status") == "OPEN"}
-    open_count = len(open_pairs)
-    guard_ok, guard_msg = v6_daily_guard(balance, balance, rows, cfg)
-    if not guard_ok:
-        return records, failures, scanned, opened, [guard_msg], guard_msg
-
-    for r in candidates:
-        if len(opened) >= int(max_new_trades):
-            skipped.append(f"{r['Coin']}: per-cycle auto-trade limit reached")
-            break
-        if open_count >= int(cfg["max_open_positions"]):
-            skipped.append(f"{r['Coin']}: max open positions reached")
-            break
-        pair = r["Pair"]
-        if str(pair) in open_pairs:
-            skipped.append(f"{r['Coin']}: position already open")
-            continue
-        trade = v6_paper_open(r["setup"], balance, risk_pct, leverage,
-                              pair=pair, symbol=r["Coin"], source="AUTONOMOUS")
-        if trade:
-            opened.append(trade)
-            open_pairs.add(str(pair))
-            open_count += 1
-
-    msg = f"Auto cycle: scanned {scanned} contracts | {len(valid)} valid setups | opened {len(opened)} paper trade(s) | strategy signals logged {len(lab_added)}"
+    # For the simple strategy test, the qualifying signals themselves are the
+    # autonomous paper trades. Do not force TP/SL or risk-sizing rules here.
+    opened = list(lab_added)
+    skipped = []
+    msg = f"Auto cycle: scanned {scanned} contracts | {len(valid)} qualifying setups | opened {len(opened)} strategy paper trade(s)"
     return records, failures, scanned, opened, skipped, msg
 
 
@@ -4152,7 +4135,7 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
 # =============================================================================
 st.divider()
 st.header("🤖 V6 Professional Intraday Futures Agent")
-st.caption("V5 historical learning + multi-timeframe regime + LONG/SHORT scoring + ATR risk engine + paper execution.")
+st.caption("V5 historical learning + multi-timeframe regime + LONG/SHORT scoring + autonomous strategy paper tracking.")
 
 with st.expander("⚙️ V6 Risk Controls", expanded=False):
     vc1, vc2, vc3, vc4 = st.columns(4)
@@ -4177,10 +4160,21 @@ with a1:
 with a2:
     v6_auto_minutes = st.selectbox("Auto scan interval", [1, 5, 10, 15], index=1, key="v6_auto_minutes")
 with a3:
-    v6_auto_limit = st.slider("Max auto trades / cycle", 1, 3, 1, key="v6_auto_limit")
+    v7_paper_amount = st.number_input(
+        "Paper margin / trade (USDT)", min_value=100.0, max_value=100000.0,
+        value=1000.0, step=100.0, key="v7_paper_amount"
+    )
+    st.caption(
+        f"Autonomous strategy leverage: **{V7_PAPER_LEVERAGE:.0f}x** | "
+        f"Notional per trade: **{v7_paper_amount * V7_PAPER_LEVERAGE:,.2f} USDT**"
+    )
 
 if v6_auto_paper:
-    st.warning("AUTONOMOUS PAPER MODE: the agent will scan the V6 universe, open qualifying paper trades automatically, and update open positions. No live CoinDCX order is sent.")
+    st.warning(
+        "AUTONOMOUS STRATEGY PAPER MODE: every qualifying setup is treated as a 10x leveraged paper trade. "
+        "No TP/SL is required. The agent reports current profit/loss and evaluates the trade "
+        "at 1H/4H/8H/24H. No live CoinDCX order is sent."
+    )
 
 if st.button("🚦 Run Professional LONG / SHORT Scan", type="primary"):
     try:
@@ -4253,7 +4247,7 @@ if v6_auto_paper:
                 try:
                     auto_cfg = dict(v6_cfg)
                     recs, fails, scanned, opened, skipped, msg = v6_autonomous_paper_cycle(
-                        v6_balance, v6_risk, v6_lev, auto_cfg, v6_scan_limit, v6_auto_limit
+                        v6_balance, v6_risk, v6_lev, auto_cfg, v6_scan_limit
                     )
                     st.session_state["v6_scan"] = recs
                     st.session_state["v6_scan_failures"] = fails
@@ -4319,9 +4313,9 @@ if st.session_state.get("v6_scan_failures"):
     with st.expander(f"V6 scan diagnostics ({len(st.session_state['v6_scan_failures'])})"):
         st.code("\n".join(st.session_state["v6_scan_failures"][:100]))
 
-st.markdown("### 🧪 Paper Position Manager")
+st.markdown("### 🧪 Manual Risk-Based Paper Position Manager")
 if v6_auto_paper:
-    st.caption(f"🤖 Autonomous mode ON | Interval: {v6_auto_minutes} min | Last cycle: {st.session_state.get('v6_auto_last', 'waiting for first cycle')}")
+    st.caption(f"🤖 Autonomous strategy paper mode ON | Interval: {v6_auto_minutes} min | Last cycle: {st.session_state.get('v6_auto_last', 'waiting for first cycle')}")
 paper_rows = v6_load_paper()
 if paper_rows:
     pactive = [r for r in paper_rows if r.get("status") == "OPEN"]
@@ -4341,77 +4335,98 @@ else:
 
 
 # =============================================================================
-# V7 STRATEGY PERFORMANCE LAB UI
+# AUTONOMOUS STRATEGY PAPER TRADES — SIMPLE TRADER VIEW
 # =============================================================================
-st.markdown("### 🧠 Strategy Performance Lab — Forward Returns")
+st.markdown("### 🧪 Autonomous Paper Trades")
 st.caption(
-    "Autonomous strategy evaluation. No TP/SL is assumed. Each qualifying signal is "
-    "tracked from its signal price and evaluated at 1H, 4H, 8H and 24H. "
-    "This measures the strategy's raw directional edge before designing execution rules."
+    "Every qualifying autonomous signal is treated as a paper trade. "
+    "No TP/SL is required. Autonomous paper trades use fixed 10x leverage. "
+    "Profit/loss is calculated from the signal entry price to the latest live Futures price."
 )
 
 strategy_rows = v7_strategy_load()
+paper_amount = float(v7_paper_amount)
+
 if strategy_rows:
-    strategy_stats = v7_strategy_stats(strategy_rows)
-    m1, m2, m3, m4, m5 = st.columns(5)
-    m1.metric("Signals logged", len(strategy_rows))
-    tracking = sum(1 for s in strategy_rows if s.get("status") != "COMPLETE")
-    m2.metric("Tracking", tracking)
-    s4 = strategy_stats["240m"]
-    m3.metric("4H completed", s4["n"])
-    m4.metric("4H win rate", f"{s4['win_rate']:.1f}%" if np.isfinite(s4["win_rate"]) else "—")
-    m5.metric("4H avg return", f"{s4['avg_return']:+.2f}%" if np.isfinite(s4["avg_return"]) else "—")
+    active_strategy = [s for s in strategy_rows if s.get("status") != "COMPLETE"]
+    completed_strategy = [s for s in strategy_rows if s.get("status") == "COMPLETE"]
 
-    horizon_labels = {"60m":"1H", "240m":"4H", "480m":"8H", "1440m":"24H"}
-    horizon_rows = []
-    for key, label in horizon_labels.items():
-        s = strategy_stats[key]
-        horizon_rows.append({
-            "Horizon": label,
-            "Completed": s["n"],
-            "Win %": round(s["win_rate"], 1) if np.isfinite(s["win_rate"]) else np.nan,
-            "Avg Return %": round(s["avg_return"], 3) if np.isfinite(s["avg_return"]) else np.nan,
-            "Median %": round(s["median_return"], 3) if np.isfinite(s["median_return"]) else np.nan,
-            "Best %": round(s["best"], 3) if np.isfinite(s["best"]) else np.nan,
-            "Worst %": round(s["worst"], 3) if np.isfinite(s["worst"]) else np.nan,
-        })
-    st.dataframe(pd.DataFrame(horizon_rows), use_container_width=True, hide_index=True)
+    def _price_move_pct(s):
+        r = v6_num(s.get("current_return_pct"))
+        return r if np.isfinite(r) else np.nan
 
-    st.markdown("#### 4H Strategy Breakdown")
-    st.dataframe(pd.DataFrame(v7_strategy_breakdown(strategy_rows, "240m")),
-                 use_container_width=True, hide_index=True)
+    def _leveraged_pnl_pct(s):
+        r = _price_move_pct(s)
+        return (r * V7_PAPER_LEVERAGE) if np.isfinite(r) else np.nan
 
-    st.markdown("#### Recent Strategy Signals")
-    recent = []
-    for s in v7_strategy_recent(strategy_rows, 30):
-        recent.append({
-            "Time": s.get("signal_time", ""),
-            "Coin": s.get("symbol", s.get("pair", "")),
-            "Side": s.get("direction", ""),
-            "Score": s.get("score", ""),
-            "Entry": fmt(s.get("entry")),
-            "Current": fmt(s.get("last_price")),
-            "Now %": round(v6_num(s.get("current_return_pct")), 3) if np.isfinite(v6_num(s.get("current_return_pct"))) else np.nan,
-            "1H %": round(v6_num(s.get("return_60m")), 3) if np.isfinite(v6_num(s.get("return_60m"))) else np.nan,
-            "4H %": round(v6_num(s.get("return_240m")), 3) if np.isfinite(v6_num(s.get("return_240m"))) else np.nan,
-            "8H %": round(v6_num(s.get("return_480m")), 3) if np.isfinite(v6_num(s.get("return_480m"))) else np.nan,
-            "24H %": round(v6_num(s.get("return_1440m")), 3) if np.isfinite(v6_num(s.get("return_1440m"))) else np.nan,
-            "MFE %": round(v6_num(s.get("mfe_pct")), 3),
-            "MAE %": round(v6_num(s.get("mae_pct")), 3),
-            "Status": s.get("status", ""),
-        })
-    st.dataframe(pd.DataFrame(recent), use_container_width=True, hide_index=True)
+    def _paper_pnl_usdt(s):
+        r = _price_move_pct(s)
+        return (r / 100.0 * paper_amount * V7_PAPER_LEVERAGE) if np.isfinite(r) else np.nan
 
-    st.download_button(
-        "⬇️ Download Strategy Signal Journal",
-        data=json.dumps(strategy_rows, indent=2, default=str),
-        file_name="coindcx_strategy_signal_journal.json",
-        mime="application/json",
-    )
+    active_pnl = [_paper_pnl_usdt(s) for s in active_strategy]
+    active_pnl = [x for x in active_pnl if np.isfinite(x)]
+
+    a1, a2, a3, a4 = st.columns(4)
+    a1.metric("🟢 Open paper trades", len(active_strategy))
+    a2.metric("💰 Open P/L (10x)", f"{sum(active_pnl):+.2f} USDT" if active_pnl else "0.00 USDT")
+
+    complete_4h = [v6_num(s.get("return_240m")) for s in completed_strategy]
+    complete_4h = [x for x in complete_4h if np.isfinite(x)]
+    wins = sum(x > 0 for x in complete_4h)
+    losses = sum(x < 0 for x in complete_4h)
+    a3.metric("4H wins / losses", f"{wins} / {losses}")
+    a4.metric("4H avg result", f"{float(np.mean(complete_4h)):+.2f}%" if complete_4h else "—")
+
+    if active_strategy:
+        st.markdown("#### 📈 Currently Paper Traded")
+        active_display = []
+        for s in sorted(active_strategy, key=lambda x: x.get("signal_time", ""), reverse=True):
+            r = v6_num(s.get("current_return_pct"))
+            pnl = _paper_pnl_usdt(s)
+            active_display.append({
+                "Coin": s.get("symbol", s.get("pair", "")),
+                "Side": s.get("direction", ""),
+                "Score": s.get("score", ""),
+                "Entry": fmt(s.get("entry")),
+                "Current": fmt(s.get("last_price")),
+                "Price Move %": round(r, 3) if np.isfinite(r) else np.nan,
+                "10x P/L %": round(_leveraged_pnl_pct(s), 3) if np.isfinite(r) else np.nan,
+                "10x P/L USDT": round(pnl, 2) if np.isfinite(pnl) else np.nan,
+                "Leverage": "10x",
+                "Age": f"{v6_num(s.get('age_minutes'), 0):.0f}m",
+                "Status": "🟢 PROFIT" if np.isfinite(r) and r > 0 else ("🔴 LOSS" if np.isfinite(r) and r < 0 else "⚪ FLAT"),
+            })
+        st.dataframe(pd.DataFrame(active_display), use_container_width=True, hide_index=True)
+    else:
+        st.info("No active paper trades right now.")
+
+    if completed_strategy:
+        st.markdown("#### 📋 Recently Completed Paper Trades")
+        completed_display = []
+        for s in sorted(completed_strategy, key=lambda x: x.get("signal_time", ""), reverse=True)[:30]:
+            r4 = v6_num(s.get("return_240m"))
+            pnl4 = (r4 / 100.0 * paper_amount * V7_PAPER_LEVERAGE) if np.isfinite(r4) else np.nan
+            completed_display.append({
+                "Time": s.get("signal_time", ""),
+                "Coin": s.get("symbol", s.get("pair", "")),
+                "Side": s.get("direction", ""),
+                "Score": s.get("score", ""),
+                "Entry": fmt(s.get("entry")),
+                "4H Exit": fmt(s.get("price_240m")),
+                "4H Price Move %": round(r4, 3) if np.isfinite(r4) else np.nan,
+                "4H 10x P/L %": round(r4 * V7_PAPER_LEVERAGE, 3) if np.isfinite(r4) else np.nan,
+                "4H 10x P/L USDT": round(pnl4, 2) if np.isfinite(pnl4) else np.nan,
+                "Leverage": "10x",
+                "Result": "WIN" if np.isfinite(r4) and r4 > 0 else ("LOSS" if np.isfinite(r4) and r4 < 0 else "FLAT"),
+            })
+        st.dataframe(pd.DataFrame(completed_display), use_container_width=True, hide_index=True)
 else:
-    st.info("No qualifying strategy signals have been logged yet. Leave Autonomous Paper Trading ON and let the agent collect observations.")
+    st.info("No qualifying paper trades yet. Leave Autonomous Paper Trading ON and wait for the agent to find a valid setup.")
 
-st.caption(f"V{V6_VERSION}: existing V5 engine retained above; V6 adds deterministic intraday analysis, risk sizing and paper trade management; V7 adds autonomous strategy-performance tracking. Live execution is intentionally disabled until exchange order integration is explicitly implemented and verified.")
+st.caption(
+    f"Paper amount shown for P/L illustration: {paper_amount:,.0f} USDT per trade. "
+    "This is a strategy test, not real money and not an exchange position."
+)
 
 # =============================================================================
 # V6.2 AUTONOMOUS HISTORICAL PATTERN LEARNING ENGINE
