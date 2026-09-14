@@ -4607,6 +4607,81 @@ def v10_extreme_record(x):
         "setup": x,
     }
 
+
+def v10_scan_all_extreme(progress=None, max_workers=6):
+    """Scan the ENTIRE active USDT Futures universe for V10 extreme-move setups.
+
+    This is deliberately separate from the normal 25/60-contract V6 scan.
+    Every active contract is considered; a missing live-price-feed key falls
+    back to the latest completed 15m close instead of discarding the contract.
+    """
+    instruments = active_instruments("USDT")
+    try:
+        prices = futures_prices()
+    except Exception:
+        prices = {}
+
+    items, seen = [], set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair:
+            continue
+        canonical = str(pair).strip().upper()
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+
+        live = v61_price_for_pair(prices, pair)
+        symbol = v61_symbol(inst, pair)
+        if meme_only and not any(w in symbol or w in canonical for w in MEME_WORDS):
+            continue
+        items.append((pair, symbol, live))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch(item):
+        pair, symbol, live = item
+        try:
+            # V10 needs daily history for 3D/5D/7D plus intraday structure.
+            tf_data = {
+                "15m": get_tf(pair, "15m", 12),
+                "1H": get_tf(pair, "1H", 45),
+                "4H": get_tf(pair, "4H", 120),
+                "1D": get_tf(pair, "1D", 180),
+            }
+            p = live
+            if not np.isfinite(p) or p <= 0:
+                c = completed(tf_data["15m"])
+                if c is not None and not c.empty:
+                    p = v6_num(c.iloc[-1].get("close"))
+            if not np.isfinite(p) or p <= 0:
+                return None
+            sig = v10_extreme_move_signal(pair, symbol, tf_data, p)
+            if not sig:
+                return None
+            rec = v10_extreme_record(sig)
+            if rec:
+                rec["price_source"] = "LIVE_FEED" if np.isfinite(live) and live > 0 else "15M_CANDLE_FALLBACK"
+            return rec
+        except Exception:
+            return None
+
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_fetch, item) for item in items]
+        for fut in as_completed(futs):
+            done += 1
+            if progress:
+                progress(done, len(items))
+            r = fut.result()
+            if r:
+                results.append(r)
+
+    results.sort(key=lambda r: (r.get("Valid") != "✅ TRADE CANDIDATE",
+                                -float(r.get("Score", 0))))
+    return results, len(items)
+
+
 def v6_run_market_scan(scan_limit, cfg):
     """Run the same V6 deterministic scan used by the manual button."""
     prices = futures_prices()
@@ -4692,7 +4767,11 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
             v6_paper_update(t.get("pair"), live)
     rows = v6_load_paper()
 
-    records, failures, scanned = v6_run_market_scan(scan_limit, cfg)
+    # The Extreme Move Hunter is a whole-market strategy. It does not use the
+    # top-25/top-60 mover shortlist because a +500%/+1000% multi-day move may
+    # no longer rank highly on the current 24h leaderboard.
+    records, scanned = v10_scan_all_extreme(max_workers=6)
+    failures = []
 
     # Autonomous strategy paper trading: every qualifying signal is treated as a
     # paper trade. No TP/SL is required; the position is evaluated by forward price
@@ -4748,7 +4827,7 @@ st.divider()
 st.header("🤖 V6 Professional Intraday Futures Agent")
 st.caption("V5 historical learning + multi-timeframe regime + LONG/SHORT scoring + autonomous strategy paper tracking.")
 st.info(
-    "🎯 V10 Extreme Move mode: the autonomous paper trader hunts **massive pumps/dumps** and trades next-leg/reversal structure. "
+    "🎯 V12 Signal mode: scans **ALL active Futures** and generates actionable LONG/SHORT signals; the 10x paper trader mirrors them and trades next-leg/reversal structure. "
     "**ATL / near-ATL** coins. ATH is not automatically a SHORT and ATL is not automatically a LONG. "
     "The agent requires breakout/continuation or rejection/breakdown structure before paper trading."
 )
@@ -5956,6 +6035,227 @@ if st.session_state.get("v6_scan_results"):
                 "Blockers": r.get("Blockers"),
             })
         st.dataframe(pd.DataFrame(_ew), use_container_width=True, hide_index=True)
+
+
+
+# ----------------------- V12 ACTIONABLE SIGNAL BOARD ---------------------------
+def v12_signal_row(r):
+    direction = str(r.get("Direction", "")).upper()
+    valid = str(r.get("Valid", ""))
+    if valid == "✅ TRADE CANDIDATE" and direction == "LONG":
+        decision = "🟢 LONG"
+    elif valid == "✅ TRADE CANDIDATE" and direction == "SHORT":
+        decision = "🔴 SHORT"
+    else:
+        decision = "⚪ WAIT"
+
+    return {
+        "Signal": decision,
+        "Coin": r.get("Coin"),
+        "Setup": r.get("Extreme Move"),
+        "Score": r.get("Score"),
+        "Current": r.get("Current"),
+        "3D %": r.get("3D %"),
+        "5D %": r.get("5D %"),
+        "7D %": r.get("7D %"),
+        "From Peak %": r.get("From Peak %"),
+        "From Low %": r.get("From Low %"),
+        "15m Structure": r.get("15m Structure"),
+        "1H Structure": r.get("1H Structure"),
+        "Entry Trigger": r.get("Entry Trigger"),
+        "Invalidation": r.get("Invalidation"),
+        "Why": r.get("Reasons"),
+    }
+
+
+def v12_actionable_candidates(records, minimum_score=78):
+    """Return only actionable LONG/SHORT signals for manual trading."""
+    out = []
+    for r in records or []:
+        try:
+            score = float(r.get("Score", 0))
+        except Exception:
+            score = 0
+        if r.get("Valid") != "✅ TRADE CANDIDATE":
+            continue
+        if score < minimum_score:
+            continue
+        if str(r.get("Direction", "")).upper() not in ("LONG", "SHORT"):
+            continue
+        out.append(r)
+    return sorted(out, key=lambda x: float(x.get("Score", 0)), reverse=True)
+
+
+def v12_render_signal_cards(records, title="🎯 ACTIONABLE MANUAL TRADING SIGNALS"):
+    candidates = v12_actionable_candidates(records)
+    st.subheader(title)
+    if not candidates:
+        st.info("No confirmed LONG/SHORT signals right now. WAIT is the correct decision.")
+        return
+
+    longs = [r for r in candidates if str(r.get("Direction")).upper() == "LONG"]
+    shorts = [r for r in candidates if str(r.get("Direction")).upper() == "SHORT"]
+
+    a, b, c = st.columns(3)
+    a.metric("🟢 LONG signals", len(longs))
+    b.metric("🔴 SHORT signals", len(shorts))
+    c.metric("Total actionable", len(candidates))
+
+    def render_side(side_records, heading, emoji):
+        if not side_records:
+            st.caption(f"{emoji} {heading}: none")
+            return
+        st.markdown(f"### {emoji} {heading}")
+        for r in side_records[:15]:
+            score = r.get("Score", 0)
+            st.markdown(
+                f"**{r.get('Coin','—')} — {r.get('Extreme Move','—')} — "
+                f"Score {score}/100**"
+            )
+            x1, x2, x3, x4 = st.columns(4)
+            x1.metric("Current", r.get("Current", "—"))
+            x2.metric("3D", r.get("3D %", "—"))
+            x3.metric("5D", r.get("5D %", "—"))
+            x4.metric("7D", r.get("7D %", "—"))
+            st.write(
+                f"**Entry trigger:** {r.get('Entry Trigger','—')}  |  "
+                f"**Invalidation:** {r.get('Invalidation','—')}"
+            )
+            st.write(
+                f"**Structure:** 15m {r.get('15m Structure','—')} | "
+                f"1H {r.get('1H Structure','—')}"
+            )
+            st.write(f"**Why:** {r.get('Reasons','—')}")
+            st.divider()
+
+    render_side(longs, "LONG — manual candidates", "🟢")
+    render_side(shorts, "SHORT — manual candidates", "🔴")
+
+    st.markdown("#### 📋 Compact signal table")
+    st.dataframe(
+        pd.DataFrame([v12_signal_row(r) for r in candidates]),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+
+st.divider()
+st.subheader("🎯 V12 — Actionable Manual Trading Signals")
+st.caption(
+    "The agent scans the whole Futures universe and gives you the actual LONG/SHORT "
+    "decision. The paper trader uses the same signal; you can trade it manually on CoinDCX."
+)
+
+v12_min = st.slider(
+    "Minimum actionable signal score",
+    70, 95, 78, 1,
+    key="v12_min_signal",
+)
+
+if st.button(
+    "🎯 SCAN ALL COINS & GENERATE LONG / SHORT SIGNALS",
+    type="primary",
+    key="v12_signal_scan",
+):
+    bar_v12 = st.progress(0, text="Scanning all active Futures for actionable signals…")
+    def _v12_progress(done, total):
+        bar_v12.progress(
+            int(done / max(total, 1) * 100),
+            text=f"Analyzing {done}/{total} Futures contracts…"
+        )
+    with st.spinner("Finding extreme moves and deciding LONG / SHORT / WAIT…"):
+        _v12_records, _v12_total = v10_scan_all_extreme(
+            progress=_v12_progress,
+            max_workers=6,
+        )
+    bar_v12.progress(100, text=f"Complete — {_v12_total} contracts scanned")
+    st.session_state["v12_signal_records"] = _v12_records
+    st.session_state["v12_signal_total"] = _v12_total
+    st.session_state["v12_signal_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+_v12_records = st.session_state.get("v12_signal_records", [])
+if _v12_records:
+    st.caption(
+        f"Last signal scan: {st.session_state.get('v12_signal_time','—')} | "
+        f"Contracts scanned: {st.session_state.get('v12_signal_total','—')}"
+    )
+    # Render only actual LONG/SHORT candidates prominently.
+    _v12_filtered = [
+        r for r in _v12_records
+        if float(r.get("Score", 0) or 0) >= v12_min
+    ]
+    v12_render_signal_cards(_v12_filtered)
+
+
+# --------------------- V10 WHOLE-MARKET SCAN CONTROL ---------------------------
+st.divider()
+st.subheader("🧨 V10 Whole-Market Extreme Move Hunter")
+st.caption(
+    "Scans every active CoinDCX USDT Futures contract and shows only coins matching "
+    "the massive-pump / massive-dump conditions. This is separate from the normal "
+    "25/60-contract intraday shortlist."
+)
+v10w1, v10w2 = st.columns([1, 3])
+with v10w1:
+    v10_workers = st.slider("V10 concurrent workers", 2, 10, 6, 1, key="v10_workers")
+with v10w2:
+    st.info(
+        "The hunter looks for 3D/5D/7D extreme moves, then classifies the current "
+        "state as LONG next-leg, SHORT reversal, LONG dump-reversal, SHORT dump-continuation, or WAIT."
+    )
+
+if st.button("🧨 SCAN ALL COINDCX FUTURES FOR EXTREME MOVES", type="primary", key="v10_all_scan"):
+    bar_v10 = st.progress(0, text="Starting whole-market extreme-move scan…")
+    def _v10_progress(done, total):
+        bar_v10.progress(int(done / max(total, 1) * 100),
+                         text=f"Scanning extreme moves: {done}/{total}")
+    with st.spinner("Scanning every active Futures contract…"):
+        _v10_scan, _v10_total = v10_scan_all_extreme(_v10_progress, max_workers=v10_workers)
+    bar_v10.progress(100, text=f"Extreme scan complete: {_v10_total} active contracts checked")
+    st.session_state["v10_all_scan_results"] = _v10_scan
+    st.session_state["v10_all_scan_total"] = _v10_total
+    st.session_state["v10_all_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+_v10_all = st.session_state.get("v10_all_scan_results", [])
+if _v10_all:
+    _v10_trades = [x for x in _v10_all if x.get("Valid") == "✅ TRADE CANDIDATE"]
+    _v10_longs = [x for x in _v10_trades if x.get("Direction") == "LONG"]
+    _v10_shorts = [x for x in _v10_trades if x.get("Direction") == "SHORT"]
+
+    st.caption(
+        f"Last whole-market scan: {st.session_state.get('v10_all_scan_time','—')} | "
+        f"Contracts checked: {st.session_state.get('v10_all_scan_total','—')}"
+    )
+    q1, q2, q3, q4 = st.columns(4)
+    q1.metric("Extreme candidates", len(_v10_trades))
+    q2.metric("🟢 LONG", len(_v10_longs))
+    q3.metric("🔴 SHORT", len(_v10_shorts))
+    q4.metric("WAIT / watch", max(0, len(_v10_all) - len(_v10_trades)))
+
+    _rows = []
+    for r in _v10_all:
+        _rows.append({
+            "Coin": r.get("Coin"),
+            "State": r.get("Extreme Move"),
+            "Direction": r.get("Direction"),
+            "Score": r.get("Score"),
+            "3D %": r.get("3D %"),
+            "5D %": r.get("5D %"),
+            "7D %": r.get("7D %"),
+            "From Peak %": r.get("From Peak %"),
+            "From Low %": r.get("From Low %"),
+            "15m Structure": r.get("15m Structure"),
+            "Volume": r.get("Volume"),
+            "Decision": "🟢 PAPER LONG" if r.get("Direction") == "LONG" and r.get("Valid") == "✅ TRADE CANDIDATE"
+                       else "🔴 PAPER SHORT" if r.get("Direction") == "SHORT" and r.get("Valid") == "✅ TRADE CANDIDATE"
+                       else "⚪ WAIT",
+            "Reasons": r.get("Reasons"),
+            "Blockers": r.get("Blockers"),
+        })
+    st.dataframe(
+        pd.DataFrame(_rows).sort_values(["Decision", "Score"], ascending=[True, False]),
+        use_container_width=True, hide_index=True
+    )
 
 # --------------------------- V10 EXTREME MOVE UI -----------------------------
 if st.session_state.get("v6_scan_results"):
