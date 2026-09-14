@@ -4390,3 +4390,346 @@ if v62_db_stats()["samples"] >= 100:
     st.info("🧠 Learning is active. Current signals can now be compared with historical patterns from the entire trained Futures universe. Re-run training periodically to add newer market behaviour.")
 else:
     st.warning("The learning database is not populated yet. Run the training button once before relying on historical pattern confirmation.")
+
+# =============================================================================
+# V7 — STRUCTURE RADAR + EMA20/100 DUMP CONFIRMATION + CROSS-COIN LEARNING
+# =============================================================================
+# V7 keeps every earlier V5/V6/V6.1/V6.2 component.  This layer focuses on the
+# exact market behaviour the trader wants to see first: newly forming HH/HL for
+# LONGs, LH/LL for SHORTs, and fresh EMA20/EMA100 transitions on 15m and 4H.
+# It does not place live orders.
+
+V7_VERSION = "7.0-STRUCTURE-RADAR"
+V7_DEFAULTS = {
+    "min_score": 70,
+    "pivot_left": 2,
+    "pivot_right": 2,
+    "min_structure_move_pct": 0.12,
+    "fresh_cross_15m_bars": 6,
+    "fresh_cross_4h_bars": 4,
+}
+
+
+def v71_pivots(d, left=2, right=2, lookback=160):
+    """Confirmed swing pivots from completed candles only."""
+    if d is None or d.empty:
+        return [], []
+    x = completed(d).tail(lookback).reset_index(drop=True)
+    if len(x) < left + right + 10:
+        return [], []
+    h = pd.to_numeric(x.high, errors="coerce").to_numpy(float)
+    l = pd.to_numeric(x.low, errors="coerce").to_numpy(float)
+    highs, lows = [], []
+    for i in range(left, len(x)-right):
+        hs = h[i-left:i+right+1]
+        ls = l[i-left:i+right+1]
+        if np.isfinite(h[i]) and h[i] >= np.nanmax(hs) and h[i] > h[i-1] and h[i] >= h[i+1]:
+            highs.append({"idx": i, "price": float(h[i])})
+        if np.isfinite(l[i]) and l[i] <= np.nanmin(ls) and l[i] < l[i-1] and l[i] <= l[i+1]:
+            lows.append({"idx": i, "price": float(l[i])})
+    return highs, lows
+
+
+def v71_structure_tf(d, tf_name):
+    """Classify the latest swing sequence on one timeframe."""
+    highs, lows = v71_pivots(d, V7_DEFAULTS["pivot_left"], V7_DEFAULTS["pivot_right"], 180 if tf_name == "15m" else 120)
+    out = {
+        "tf": tf_name, "state": "INSUFFICIENT", "side": None, "score": 0,
+        "hh": False, "hl": False, "lh": False, "ll": False,
+        "last_high": np.nan, "previous_high": np.nan,
+        "last_low": np.nan, "previous_low": np.nan,
+        "high_change_pct": np.nan, "low_change_pct": np.nan,
+        "pivot_high_age": None, "pivot_low_age": None,
+    }
+    if len(highs) < 2 or len(lows) < 2:
+        return out
+    ph0, ph1 = highs[-2], highs[-1]
+    pl0, pl1 = lows[-2], lows[-1]
+    high_change = (ph1["price"] / ph0["price"] - 1) * 100
+    low_change = (pl1["price"] / pl0["price"] - 1) * 100
+    threshold = max(V7_DEFAULTS["min_structure_move_pct"], 0.18 * (v61_atr(d) / max(v6_num(completed(d).iloc[-1].close), 1) * 100 if np.isfinite(v61_atr(d)) else 0))
+    hh, hl = high_change >= threshold, low_change >= threshold
+    lh, ll = high_change <= -threshold, low_change <= -threshold
+    age_base = len(completed(d)) - 1
+    out.update({
+        "hh": bool(hh), "hl": bool(hl), "lh": bool(lh), "ll": bool(ll),
+        "last_high": ph1["price"], "previous_high": ph0["price"],
+        "last_low": pl1["price"], "previous_low": pl0["price"],
+        "high_change_pct": high_change, "low_change_pct": low_change,
+        "pivot_high_age": max(0, age_base - ph1["idx"]),
+        "pivot_low_age": max(0, age_base - pl1["idx"]),
+    })
+    if hh and hl:
+        out["state"], out["side"], out["score"] = "STARTED / CONFIRMED HH/HL", "LONG", 75
+        if high_change >= threshold * 2: out["score"] += 8
+        if low_change >= threshold * 2: out["score"] += 8
+    elif lh and ll:
+        out["state"], out["side"], out["score"] = "STARTED / CONFIRMED LH/LL", "SHORT", 75
+        if abs(high_change) >= threshold * 2: out["score"] += 8
+        if abs(low_change) >= threshold * 2: out["score"] += 8
+    elif hh or hl:
+        out["state"], out["side"], out["score"] = "EARLY BULLISH STRUCTURE", "LONG", 48
+    elif lh or ll:
+        out["state"], out["side"], out["score"] = "EARLY BEARISH STRUCTURE", "SHORT", 48
+    else:
+        out["state"] = "MIXED STRUCTURE"
+    return out
+
+
+def v71_ema_transition(d, recent_bars):
+    """Fresh EMA20/EMA100 transition using completed candles only."""
+    if d is None or d.empty:
+        return {"state":"NO DATA", "bearish":False, "bullish":False, "fresh_bearish":False, "fresh_bullish":False, "age":None, "spread_pct":np.nan}
+    x = indicators(completed(d)).dropna(subset=["ema20", "ema100"]).reset_index(drop=True)
+    if len(x) < 105:
+        return {"state":"NO DATA", "bearish":False, "bullish":False, "fresh_bearish":False, "fresh_bullish":False, "age":None, "spread_pct":np.nan}
+    diff = (x.ema20.astype(float) - x.ema100.astype(float)).to_numpy()
+    fresh_bear = fresh_bull = False
+    bear_age = bull_age = None
+    for j in range(1, min(int(recent_bars), len(diff)-1) + 1):
+        prev, cur = diff[-j-1], diff[-j]
+        if not (np.isfinite(prev) and np.isfinite(cur)):
+            continue
+        age = j - 1
+        if prev >= 0 and cur < 0 and not fresh_bear:
+            fresh_bear, bear_age = True, age
+        if prev <= 0 and cur > 0 and not fresh_bull:
+            fresh_bull, bull_age = True, age
+    price = v6_num(x.iloc[-1].close)
+    spread = diff[-1] / price * 100 if np.isfinite(price) and price > 0 else np.nan
+    if fresh_bear:
+        state = "FRESH BEARISH EMA20/100 CROSS"
+    elif fresh_bull:
+        state = "FRESH BULLISH EMA20/100 CROSS"
+    elif diff[-1] < 0:
+        state = "EMA20 BELOW EMA100"
+    elif diff[-1] > 0:
+        state = "EMA20 ABOVE EMA100"
+    else:
+        state = "FLAT"
+    return {"state":state, "bearish":bool(diff[-1] < 0), "bullish":bool(diff[-1] > 0),
+            "fresh_bearish":fresh_bear, "fresh_bullish":fresh_bull,
+            "age":bear_age if fresh_bear else bull_age, "spread_pct":spread}
+
+
+def v71_structure_trade_score(struct15, struct4, ema15, ema4, r15, r4, vol_ratio, price):
+    """Score a structure-led directional setup; score is not a guarantee."""
+    results = []
+    for side in ("LONG", "SHORT"):
+        score = 0
+        reasons = []
+        confirmations = []
+        blockers = []
+        s = struct15 if side == "LONG" else struct15
+        wanted = (s.get("hh") and s.get("hl")) if side == "LONG" else (s.get("lh") and s.get("ll"))
+        if wanted:
+            score += 38
+            reasons.append("15m has both required swing components")
+        elif (s.get("hh") or s.get("hl")) if side == "LONG" else (s.get("lh") or s.get("ll")):
+            score += 18
+            reasons.append("15m structure is starting to form")
+        if side == "LONG":
+            htf = struct4.get("hh") and struct4.get("hl")
+            if htf: score += 20; reasons.append("4H also confirms HH/HL")
+            elif struct4.get("hh") or struct4.get("hl"): score += 8; reasons.append("4H is beginning to improve")
+            if ema15.get("fresh_bullish"): score += 12; confirmations.append("fresh 15m EMA20 > EMA100")
+            elif ema15.get("bullish"): score += 5
+            if ema4.get("fresh_bullish"): score += 18; confirmations.append("fresh 4H EMA20 > EMA100")
+            elif ema4.get("bullish"): score += 7
+            if v6_num(r15.rsi, 50) >= 50: score += 5; reasons.append("15m momentum is bullish")
+            if v6_num(r15.macd, 0) > v6_num(r15.macd_signal, 0): score += 5
+            if v6_num(vol_ratio, 0) >= 1.2: score += 7; reasons.append("volume confirms participation")
+            if v6_num(r15.rsi, 50) >= 82: blockers.append("15m RSI is overextended")
+        else:
+            htf = struct4.get("lh") and struct4.get("ll")
+            if htf: score += 20; reasons.append("4H also confirms LH/LL")
+            elif struct4.get("lh") or struct4.get("ll"): score += 8; reasons.append("4H is beginning to weaken")
+            if ema15.get("fresh_bearish"): score += 12; confirmations.append("fresh 15m EMA20 < EMA100")
+            elif ema15.get("bearish"): score += 5
+            if ema4.get("fresh_bearish"): score += 18; confirmations.append("fresh 4H EMA20 < EMA100")
+            elif ema4.get("bearish"): score += 7
+            if v6_num(r15.rsi, 50) <= 50: score += 5; reasons.append("15m momentum is bearish")
+            if v6_num(r15.macd, 0) < v6_num(r15.macd_signal, 0): score += 5
+            if v6_num(vol_ratio, 0) >= 1.2: score += 7; reasons.append("volume confirms participation")
+            if v6_num(r15.rsi, 50) <= 18: blockers.append("15m RSI is overextended")
+        results.append((side, min(100, int(score)), reasons, confirmations, blockers))
+    return results
+
+
+def v71_build_radar(a):
+    """Convert an existing V6.1 market result into a compact V7 radar row."""
+    pair = a.get("pair") or ""
+    candidates = a.get("candidates", [])
+    symbol = next((x.get("symbol") for x in candidates if x.get("symbol")), pair)
+    price = v6_num(a.get("price"))
+    s15 = v71_structure_tf((a.get("_d15") if a.get("_d15") is not None else pd.DataFrame()), "15m")
+    return {"pair":pair, "symbol":symbol, "price":price, "structure15":s15}
+
+
+def v71_scan_from_existing(scan):
+    """Use V6.1's already-fetched market analysis without another 500-contract API scan.
+
+    V6.1 normally does not retain candle frames, so this function uses the structure
+    and EMA results already attached to each market object.  If a V6.1 object lacks
+    the detailed fields, it is marked unavailable rather than inventing a signal.
+    """
+    rows = []
+    for a in scan or []:
+        pair = a.get("pair") or next((t.get("pair") for t in a.get("candidates",[]) if t.get("pair")), "")
+        symbol = next((t.get("symbol") for t in a.get("candidates",[]) if t.get("symbol")), pair)
+        price = v6_num(a.get("price"))
+        stx = a.get("structure") or {}
+        ec = a.get("ema_cross") or {}
+        c15 = ec.get("15m") or {}
+        c4 = ec.get("4H") or {}
+        long_structure = bool(stx.get("hh") and stx.get("hl"))
+        short_structure = bool(stx.get("lh") and stx.get("ll"))
+        long_score = 0; short_score = 0
+        long_reasons=[]; short_reasons=[]
+        if long_structure:
+            long_score += 45; long_reasons.append("15m HH + HL")
+        elif stx.get("hh") or stx.get("hl"):
+            long_score += 22; long_reasons.append("15m early HH/HL")
+        if short_structure:
+            short_score += 45; short_reasons.append("15m LH + LL")
+        elif stx.get("lh") or stx.get("ll"):
+            short_score += 22; short_reasons.append("15m early LH/LL")
+        if stx.get("h1_hh") and stx.get("h1_hl"):
+            long_score += 20; long_reasons.append("1H HH + HL")
+        if stx.get("h1_lh") and stx.get("h1_ll"):
+            short_score += 20; short_reasons.append("1H LH + LL")
+        if c15.get("fresh_bullish"): long_score += 10; long_reasons.append("fresh 15m EMA20/100 bullish cross")
+        if c4.get("fresh_bullish"): long_score += 15; long_reasons.append("fresh 4H EMA20/100 bullish cross")
+        if c15.get("fresh_bearish"): short_score += 10; short_reasons.append("fresh 15m EMA20/100 bearish cross")
+        if c4.get("fresh_bearish"): short_score += 15; short_reasons.append("fresh 4H EMA20/100 bearish cross")
+        if c15.get("bearish"): short_score += 4
+        if c4.get("bearish"): short_score += 6
+        if c15.get("bullish"): long_score += 4
+        if c4.get("bullish"): long_score += 6
+        momentum = a.get("momentum") or {}
+        vol = v6_num(momentum.get("vol_ratio"), 1)
+        rsi = v6_num(momentum.get("rsi"), 50)
+        ret = v6_num(momentum.get("return_5h_pct"), 0)
+        if vol >= 1.3:
+            if long_score >= short_score: long_score += 8; long_reasons.append(f"volume {vol:.1f}x")
+            if short_score >= long_score: short_score += 8; short_reasons.append(f"volume {vol:.1f}x")
+        if ret >= 3: long_score += 5; long_reasons.append(f"5h +{ret:.1f}%")
+        if ret <= -3: short_score += 5; short_reasons.append(f"5h {ret:.1f}%")
+        # Historical learner, if V6.2 already blended it into candidates.
+        learn_long = max([v6_num(t.get("learned_probability"), np.nan) for t in candidates if t.get("side")=="LONG" and np.isfinite(v6_num(t.get("learned_probability")))], default=np.nan)
+        learn_short = max([v6_num(t.get("learned_probability"), np.nan) for t in candidates if t.get("side")=="SHORT" and np.isfinite(v6_num(t.get("learned_probability")))], default=np.nan)
+        if np.isfinite(learn_long) and learn_long >= 65: long_score += 8; long_reasons.append(f"history {learn_long:.0f}%")
+        if np.isfinite(learn_short) and learn_short >= 65: short_score += 8; short_reasons.append(f"history {learn_short:.0f}%")
+        rows.append({
+            "symbol":symbol, "pair":pair, "price":price,
+            "long_score":min(100,int(long_score)), "short_score":min(100,int(short_score)),
+            "long_reasons":long_reasons, "short_reasons":short_reasons,
+            "structure":stx.get("state","UNKNOWN"),
+            "hh":bool(stx.get("hh")), "hl":bool(stx.get("hl")), "lh":bool(stx.get("lh")), "ll":bool(stx.get("ll")),
+            "h1_hh":bool(stx.get("h1_hh")), "h1_hl":bool(stx.get("h1_hl")), "h1_lh":bool(stx.get("h1_lh")), "h1_ll":bool(stx.get("h1_ll")),
+            "ema15":c15.get("state","NO DATA"), "ema4h":c4.get("state","NO DATA"),
+            "fresh_ema_bear":bool(c15.get("fresh_bearish") or c4.get("fresh_bearish")),
+            "fresh_ema_bull":bool(c15.get("fresh_bullish") or c4.get("fresh_bullish")),
+            "rsi":rsi, "vol_ratio":vol, "return_5h_pct":ret,
+            "regime":a.get("regime","UNKNOWN"),
+        })
+    return rows
+
+
+# --------------------------- V7 UI -------------------------------------------
+st.divider()
+st.header("🎯 V7 — HH/HL • LH/LL Structure Radar")
+st.caption("Finds coins that are beginning to build higher highs/higher lows for LONGs, lower highs/lower lows for SHORTs, and highlights fresh EMA20/EMA100 transitions on 15m and 4H. Existing V5/V6/V6.1/V6.2 remain intact.")
+
+with st.expander("How V7 decides what matters", expanded=False):
+    st.markdown("""
+**LONG radar**
+- 15m **HH + HL** is the core structure signal.
+- 1H HH + HL strengthens it.
+- Fresh 15m/4H **EMA20 crossing above EMA100** strengthens the trend transition.
+- Volume and momentum are confirmations.
+
+**SHORT / dump radar**
+- 15m **LH + LL** is the core bearish structure signal.
+- 1H LH + LL strengthens it.
+- Fresh 15m/4H **EMA20 crossing below EMA100** is a high-impact bearish confirmation.
+- A bearish EMA cross alone is **not** treated as an automatic SHORT.
+
+**Important:** PUMP/DUMP describes what price is doing. LONG/SHORT describes whether the structure and confirmations provide a tradeable direction.
+""")
+
+v7_min = st.slider("V7 minimum structure score", 50, 95, V7_DEFAULTS["min_score"], 1, key="v7_min_score")
+
+if st.button("🚀 RUN V7 STRUCTURE RADAR", type="primary", key="v7_run_structure_radar"):
+    existing = st.session_state.get("v61_scan_results", [])
+    if not existing:
+        st.warning("Run **SCAN ALL COINDCX FUTURES** above first. V7 reuses that market-wide scan so it does not make another 500+ contract API request.")
+    else:
+        with st.spinner("Building HH/HL, LH/LL and EMA20/100 radar from the market-wide scan…"):
+            radar = v71_scan_from_existing(existing)
+        st.session_state["v7_radar_results"] = radar
+        st.session_state["v7_radar_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+radar = st.session_state.get("v7_radar_results", [])
+if radar:
+    longs = sorted([x for x in radar if x["long_score"] >= v7_min], key=lambda x:x["long_score"], reverse=True)
+    shorts = sorted([x for x in radar if x["short_score"] >= v7_min], key=lambda x:x["short_score"], reverse=True)
+    hhhl = sorted([x for x in radar if x["hh"] and x["hl"]], key=lambda x:(x["long_score"], x["h1_hh"] and x["h1_hl"]), reverse=True)
+    lhll = sorted([x for x in radar if x["lh"] and x["ll"]], key=lambda x:(x["short_score"], x["h1_lh"] and x["h1_ll"]), reverse=True)
+    bear_cross = sorted([x for x in radar if x["fresh_ema_bear"]], key=lambda x:x["short_score"], reverse=True)
+    bull_cross = sorted([x for x in radar if x["fresh_ema_bull"]], key=lambda x:x["long_score"], reverse=True)
+
+    st.caption(f"V7 radar built from {len(radar)} market records | {st.session_state.get('v7_radar_time','—')}")
+    q1,q2,q3,q4,q5 = st.columns(5)
+    q1.metric("Tradeable LONG", len(longs))
+    q2.metric("Tradeable SHORT", len(shorts))
+    q3.metric("HH + HL", len(hhhl))
+    q4.metric("LH + LL", len(lhll))
+    q5.metric("Bear EMA crosses", len(bear_cross))
+
+    t1,t2,t3,t4,t5 = st.tabs(["🟢 LONG", "🔴 SHORT / DUMP", "📈 HH + HL", "📉 LH + LL", "⚠️ EMA20/100"])
+    with t1:
+        if longs:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "Score":x["long_score"], "Price":x["price"], "Structure":x["structure"],
+                "EMA15":x["ema15"], "EMA4H":x["ema4h"], "RSI":x["rsi"], "Vol":x["vol_ratio"],
+                "Why":" | ".join(x["long_reasons"])
+            } for x in longs[:20]]), use_container_width=True, hide_index=True)
+        else: st.info("No LONG setup reached the selected structure score. No trade is the correct result.")
+    with t2:
+        if shorts:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "Score":x["short_score"], "Price":x["price"], "Structure":x["structure"],
+                "EMA15":x["ema15"], "EMA4H":x["ema4h"], "RSI":x["rsi"], "Vol":x["vol_ratio"],
+                "Why":" | ".join(x["short_reasons"])
+            } for x in shorts[:20]]), use_container_width=True, hide_index=True)
+        else: st.info("No SHORT/LH-LL setup reached the selected score.")
+    with t3:
+        if hhhl:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "LONG score":x["long_score"], "Price":x["price"],
+                "15m":"HH + HL", "1H":"HH + HL" if x["h1_hh"] and x["h1_hl"] else "Partial / mixed",
+                "EMA15":x["ema15"], "EMA4H":x["ema4h"], "Why":" | ".join(x["long_reasons"])
+            } for x in hhhl[:30]]), use_container_width=True, hide_index=True)
+        else: st.info("No current 15m HH + HL sequence found in the market scan.")
+    with t4:
+        if lhll:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "SHORT score":x["short_score"], "Price":x["price"],
+                "15m":"LH + LL", "1H":"LH + LL" if x["h1_lh"] and x["h1_ll"] else "Partial / mixed",
+                "EMA15":x["ema15"], "EMA4H":x["ema4h"], "Why":" | ".join(x["short_reasons"])
+            } for x in lhll[:30]]), use_container_width=True, hide_index=True)
+        else: st.info("No current 15m LH + LL sequence found in the market scan.")
+    with t5:
+        cross = bear_cross + bull_cross
+        if cross:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "Direction":"🔴 BEARISH" if x["fresh_ema_bear"] else "🟢 BULLISH",
+                "SHORT score":x["short_score"], "LONG score":x["long_score"], "15m":x["ema15"], "4H":x["ema4h"],
+                "Structure":x["structure"], "5h %":x["return_5h_pct"]
+            } for x in cross[:40]]), use_container_width=True, hide_index=True)
+        else: st.info("No fresh EMA20/EMA100 crossover detected in the existing market scan.")
+else:
+    st.info("Run **SCAN ALL COINDCX FUTURES** above, then run **V7 STRUCTURE RADAR**.")
+
+st.caption(f"V{V7_VERSION}: V5 retained + V6 intraday + V6.1 market-wide scan + V6.2 learning + HH/HL/LH/LL and EMA20/100 structure radar. Analysis only; live orders remain disabled.")
