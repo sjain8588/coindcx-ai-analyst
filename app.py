@@ -5391,6 +5391,25 @@ def v62_db():
     """)
     con.execute("CREATE INDEX IF NOT EXISTS idx_pattern_ts ON pattern_samples(ts)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_pattern_pair_ts ON pattern_samples(pair, ts)")
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS learning_meta (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+    """)
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS learned_behavior (
+            bucket TEXT PRIMARY KEY,
+            samples INTEGER NOT NULL,
+            long_wins INTEGER NOT NULL,
+            short_wins INTEGER NOT NULL,
+            long_avg_move REAL,
+            short_avg_move REAL,
+            long_win_rate REAL,
+            short_win_rate REAL,
+            updated_at TEXT NOT NULL
+        )
+    """)
     con.commit()
     return con
 
@@ -5500,23 +5519,40 @@ def v62_label_sample(x, i, feat, atr):
     }
 
 
-def v62_train_one(pair, days=45, sample_every=4):
-    """Download historical 15m candles for one active Futures contract and learn.
-    sample_every=4 means one training observation per hour, reducing duplicate states.
+def v62_train_one(pair, days=45, sample_every=4, incremental=True):
+    """Learn one contract into the persistent SQLite knowledge base.
+
+    First run: build the requested historical foundation (normally 45 days).
+    Later runs: fetch only a small rolling window and insert observations newer
+    than the latest learned timestamp for this pair. This prevents every scan
+    from re-studying the full historical dataset.
     """
     try:
-        d = get_tf(pair, "15m", days)
+        con = v62_db()
+        last_ts = None
+        if incremental:
+            row = con.execute("SELECT MAX(ts) FROM pattern_samples WHERE pair=?", (pair,)).fetchone()
+            last_ts = row[0] if row and row[0] else None
+        con.close()
+
+        # A short overlap is enough to rebuild indicator warm-up state while
+        # keeping incremental updates dramatically smaller than a 45-day pass.
+        fetch_days = 45 if not last_ts else min(max(3, days), 7)
+        d = get_tf(pair, "15m", fetch_days)
         d = completed(d)
         if d is None or len(d) < 260:
             return pair, 0, 0, "insufficient history"
         x = d.reset_index(drop=True)
+        ind = indicators(x)
         con = v62_db()
         inserted = 0
         skipped = 0
-        # Recalculate indicators once for labeling efficiency.
-        ind = indicators(x)
+        cutoff = pd.to_datetime(last_ts, utc=True) if last_ts else None
         with V62_LOCK:
             for i in range(205, len(x)-16, sample_every):
+                ts_dt = pd.to_datetime(x.iloc[i].time, utc=True)
+                if cutoff is not None and ts_dt <= cutoff:
+                    continue
                 feat_bias = v62_feature_row(x, i)
                 if feat_bias is None:
                     skipped += 1
@@ -5527,7 +5563,7 @@ def v62_train_one(pair, days=45, sample_every=4):
                 if label is None:
                     skipped += 1
                     continue
-                ts = pd.to_datetime(x.iloc[i].time, utc=True).isoformat()
+                ts = ts_dt.isoformat()
                 cols = [
                     pair, ts, side_bias,
                     *[feat[k] for k in V62_FEATURES],
@@ -5547,12 +5583,12 @@ def v62_train_one(pair, days=45, sample_every=4):
             con.commit()
             count = con.execute("SELECT COUNT(*) FROM pattern_samples WHERE pair=?", (pair,)).fetchone()[0]
         con.close()
-        return pair, inserted, int(count), "ok"
+        return pair, inserted, int(count), "ok" if inserted or last_ts else "ok"
     except Exception as e:
         return pair, 0, 0, str(e)[:160]
 
-
-def v62_train_all(progress=None, days=45, workers=4):
+def v62_train_all(progress=None, days=45, workers=4, incremental=True):
+    """Initialize or incrementally update the persistent market knowledge base."""
     instruments = active_instruments("USDT")
     pairs = []
     seen = set()
@@ -5563,12 +5599,68 @@ def v62_train_all(progress=None, days=45, workers=4):
     results = []
     done = 0
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futs = {ex.submit(v62_train_one, p, days, 4): p for p in pairs}
+        futs = {ex.submit(v62_train_one, p, days, 4, incremental): p for p in pairs}
         for fut in as_completed(futs):
             res = fut.result(); results.append(res); done += 1
             if progress:
                 progress(done, len(pairs), res)
+    v62_refresh_behavior_summary()
     return results, len(pairs)
+
+def v62_refresh_behavior_summary():
+    """Rebuild compact, persistent market-behaviour statistics from samples.
+    This is cheap SQL aggregation; it does not download or re-study charts.
+    """
+    try:
+        con = v62_db()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        rows = con.execute("""
+            SELECT side_bias, COUNT(*), SUM(long_win), SUM(short_win),
+                   AVG(long_max_4h), AVG(short_min_4h),
+                   AVG(long_win)*1.0, AVG(short_win)*1.0
+            FROM pattern_samples GROUP BY side_bias
+        """).fetchall()
+        con.execute("DELETE FROM learned_behavior")
+        for side, n, lw, sw, lam, sam, lwr, swr in rows:
+            con.execute("""INSERT INTO learned_behavior
+                (bucket,samples,long_wins,short_wins,long_avg_move,short_avg_move,
+                 long_win_rate,short_win_rate,updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?)""",
+                (str(side), int(n or 0), int(lw or 0), int(sw or 0),
+                 float(lam or 0), float(sam or 0), float(lwr or 0), float(swr or 0), now))
+        con.execute("INSERT OR REPLACE INTO learning_meta(key,value) VALUES(?,?)",
+                    ("last_refresh", now))
+        con.execute("INSERT OR REPLACE INTO learning_meta(key,value) VALUES(?,?)",
+                    ("version", V62_VERSION))
+        con.commit(); con.close()
+    except Exception:
+        pass
+
+
+def v62_behavior_summary():
+    try:
+        con = v62_db()
+        df = pd.read_sql_query("SELECT * FROM learned_behavior ORDER BY samples DESC", con)
+        meta = dict(con.execute("SELECT key,value FROM learning_meta").fetchall())
+        con.close()
+        return df, meta
+    except Exception:
+        return pd.DataFrame(), {}
+
+
+def v62_learning_status():
+    stats = v62_db_stats()
+    try:
+        con = v62_db()
+        latest_by_pair = con.execute("SELECT COUNT(DISTINCT pair), MAX(ts) FROM pattern_samples").fetchone()
+        meta = dict(con.execute("SELECT key,value FROM learning_meta").fetchall())
+        con.close()
+        stats["latest"] = latest_by_pair[1] if latest_by_pair else None
+        stats["last_refresh"] = meta.get("last_refresh")
+        stats["version"] = meta.get("version", V62_VERSION)
+    except Exception:
+        stats.update({"latest":None,"last_refresh":None,"version":V62_VERSION})
+    return stats
 
 
 def v62_db_stats():
@@ -5828,36 +5920,61 @@ with ls3:
 
 st.write(f"**Coins learned:** {v62_stats['coins']:,}  |  **History:** {v62_stats['first'] or '—'} → {v62_stats['last'] or '—'}")
 
-if st.button("🧠 TRAIN / REFRESH ALL COINDCX CHART PATTERNS", type="secondary", key="v62_train"):
-    bar2 = st.progress(0, text="Starting historical learning…")
+st.markdown("### Knowledge lifecycle")
+st.caption("The first run builds the historical foundation. Later updates fetch only a small rolling window per coin and add observations newer than that coin's last learned timestamp. Scans do not retrain the historical database.")
+
+k1, k2 = st.columns(2)
+with k1:
+    init_learning = st.button("🧠 BUILD / REBUILD 45-DAY KNOWLEDGE", type="secondary", key="v62_train")
+with k2:
+    update_learning = st.button("🔄 LEARN NEW DATA ONLY", type="secondary", key="v62_incremental")
+
+if init_learning or update_learning:
+    bar2 = st.progress(0, text="Starting persistent learning…")
     errors = []
     def _learn_progress(done, total, result):
         pct = int(done/max(total,1)*100)
-        status = f"Learning {done}/{total}: {result[0]} (+{result[1]} samples)"
+        mode_text = "Foundation" if init_learning else "Incremental"
+        status = f"{mode_text} {done}/{total}: {result[0]} (+{result[1]} samples)"
         bar2.progress(pct, text=status)
         if result[3] != "ok":
             errors.append(result)
     try:
-        with st.spinner(f"Reading {v62_days} days of 15m charts for every active Futures contract…"):
-            results, learned_total = v62_train_all(_learn_progress, days=v62_days, workers=v62_workers)
+        with st.spinner("Updating the persistent SQLite knowledge base…"):
+            # Foundation explicitly rebuilds the requested history by clearing the
+            # sample table first. Incremental mode preserves everything learned.
+            if init_learning:
+                con = v62_db(); con.execute("DELETE FROM pattern_samples"); con.commit(); con.close()
+            results, learned_total = v62_train_all(_learn_progress, days=v62_days, workers=v62_workers, incremental=not init_learning)
     except Exception as exc:
         bar2.progress(100, text="Learning stopped — CoinDCX market discovery failed")
         st.error(f"Historical learning could not start: {type(exc).__name__}: {exc}")
         results, learned_total = [], 0
-    final_stats = v62_db_stats()
-    bar2.progress(100, text=f"Learning complete: {final_stats['coins']:,} coins / {final_stats['samples']:,} samples")
+    final_stats = v62_learning_status()
+    bar2.progress(100, text=f"Knowledge update complete: {final_stats['coins']:,} coins / {final_stats['samples']:,} samples")
     st.session_state["v62_train_stats"] = final_stats
     if learned_total == 0:
         st.error("Training found 0 active Futures contracts. CoinDCX instrument discovery failed; no learning was performed.")
     elif errors:
-        st.warning(f"{len(errors)} contracts could not be learned. The scanner will continue using the contracts that succeeded.")
+        st.warning(f"{len(errors)} contracts could not be learned. Existing knowledge remains available for the successful contracts.")
     else:
-        st.success(f"Training processed {learned_total:,} active Futures contracts successfully.")
+        action = "foundation built" if init_learning else "new data incorporated"
+        st.success(f"{learned_total:,} active Futures contracts processed; {action}. Existing historical knowledge was not re-studied during normal scans.")
 
-if v62_db_stats()["samples"] >= 100:
-    st.info("🧠 Learning is active. Current signals can now be compared with historical patterns from the entire trained Futures universe. Re-run training periodically to add newer market behaviour.")
+status = v62_learning_status()
+if status["samples"] >= 100:
+    st.success(f"🧠 Persistent knowledge active — {status['samples']:,} samples across {status['coins']:,} coins. Last learned candle: {status.get('latest') or '—'} | Last knowledge refresh: {status.get('last_refresh') or '—'}")
+    behavior_df, behavior_meta = v62_behavior_summary()
+    if not behavior_df.empty:
+        st.markdown("#### What the dataset has learned")
+        show = behavior_df.copy()
+        show["Long win %"] = (show["long_win_rate"]*100).round(1)
+        show["Short win %"] = (show["short_win_rate"]*100).round(1)
+        show = show.rename(columns={"bucket":"Market state", "samples":"Cases", "long_wins":"Long wins", "short_wins":"Short wins"})
+        st.dataframe(show[["Market state","Cases","Long wins","Short wins","Long win %","Short win %","long_avg_move","short_avg_move"]], use_container_width=True, hide_index=True)
+        st.caption("These are empirical outcomes from the stored CoinDCX sample set, not textbook guarantees. Small sample buckets should not be treated as reliable edges.")
 else:
-    st.warning("The learning database is not populated yet. Run the training button once before relying on historical pattern confirmation.")
+    st.warning("The persistent learning database is not populated yet. Build the 45-day foundation once. After that, use **LEARN NEW DATA ONLY**; normal market scans only match against saved knowledge.")
 
 # =============================================================================
 # V7 — STRUCTURE RADAR + EMA20/100 DUMP CONFIRMATION + CROSS-COIN LEARNING
