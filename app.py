@@ -2656,9 +2656,18 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
                         "vol_ratio":vol,"rsi":rsi,"regime":regime,
                         "ema15":ema_cross["15m"]["state"],"ema4h":ema_cross["4H"]["state"]})
 
+    # V7 early-transition radar is computed while the candles are already in memory.
+    # This avoids another market-wide candle fetch when the V7 UI runs.
+    try:
+        early_structure = v71_early_structure_transition(d15, d1h)
+    except Exception:
+        early_structure = {"state":"UNAVAILABLE", "side":None, "score":0, "trigger":"", "sequence":"",
+                           "prior_state":"", "first_break_price":np.nan, "pullback_price":np.nan,
+                           "breakout_price":np.nan, "age_bars":None}
+
     return {"candidates": candidates, "watches": watches, "range": rng, "regime": regime,
             "momentum": m, "support": support, "resistance": resistance, "structure": structure,
-            "ema_cross": ema_cross}
+            "ema_cross": ema_cross, "early_structure": early_structure}
 
 
 def v61_scan_all(progress=None, max_workers=6):
@@ -4410,6 +4419,120 @@ V7_DEFAULTS = {
 }
 
 
+def v71_early_structure_transition(d15, d1h=None):
+    """Detect the *chronological* start of a trend reversal, not just the
+    latest HH/HL or LH/LL pair.
+
+    Bullish transition:
+        prior LH/LL -> first HH -> HL -> second HH
+    Bearish transition:
+        prior HH/HL -> first LH -> LL -> second LH
+
+    The first break is an early warning; the subsequent pullback and second
+    break increase confidence. All pivots come from completed candles only.
+    """
+    out = {
+        "state":"NO TRANSITION", "side":None, "score":0, "trigger":"",
+        "sequence":"", "prior_state":"", "first_break_price":np.nan,
+        "pullback_price":np.nan, "breakout_price":np.nan, "age_bars":None,
+        "h1_state":""
+    }
+    if d15 is None or d15.empty:
+        return out
+
+    def _seq(d, tf_name, lookback):
+        highs, lows = v71_pivots(d, V7_DEFAULTS["pivot_left"], V7_DEFAULTS["pivot_right"], lookback)
+        if len(highs) < 3 or len(lows) < 3:
+            return None
+        # Merge pivots chronologically. A pivot is classified relative to the
+        # previous pivot of the same type.
+        events=[]
+        for i,h in enumerate(highs):
+            prev = highs[i-1]["price"] if i else np.nan
+            if i:
+                kind = "HH" if h["price"] > prev else "LH"
+                events.append({"idx":h["idx"],"price":h["price"],"kind":kind})
+        for i,l in enumerate(lows):
+            prev = lows[i-1]["price"] if i else np.nan
+            if i:
+                kind = "HL" if l["price"] > prev else "LL"
+                events.append({"idx":l["idx"],"price":l["price"],"kind":kind})
+        events.sort(key=lambda z:z["idx"])
+        # Keep the most recent meaningful event window. We deliberately require
+        # chronology rather than merely having all four labels somewhere.
+        events = events[-14:]
+        if len(events) < 4:
+            return None
+
+        # Search from newest backwards for the strongest completed transition.
+        best=None
+        for start in range(max(0,len(events)-10), len(events)-3):
+            e=events[start:]
+            kinds=[x["kind"] for x in e]
+            # Bullish: a bearish regime must precede the first HH, then HL,
+            # then a higher HH. Allow unrelated same-type pivots between steps.
+            hh_positions=[i for i,k in enumerate(kinds) if k=="HH"]
+            for p in hh_positions:
+                prior_bear = any(k in ("LH","LL") for k in kinds[:p])
+                if not prior_bear: continue
+                hl = next((i for i in range(p+1,len(kinds)) if kinds[i]=="HL"), None)
+                if hl is None: continue
+                hh2 = next((i for i in range(hl+1,len(kinds)) if kinds[i]=="HH"), None)
+                if hh2 is None:
+                    # First HH + subsequent HL = early developing transition.
+                    cand=("EARLY LONG", "LONG", 72, e[p], e[hl], None,
+                          f"LH/LL → HH → HL", "Prior bearish structure")
+                else:
+                    cand=("CONFIRMED EARLY LONG", "LONG", 92, e[p], e[hl], e[hh2],
+                          f"LH/LL → HH → HL → HH", "Prior bearish structure")
+                if best is None or cand[2] > best[2] or e[hl]["idx"] > best[4]["idx"]:
+                    best=cand
+
+            # Bearish mirror: bullish regime -> LH -> LL -> LH.
+            lh_positions=[i for i,k in enumerate(kinds) if k=="LH"]
+            for p in lh_positions:
+                prior_bull = any(k in ("HH","HL") for k in kinds[:p])
+                if not prior_bull: continue
+                ll = next((i for i in range(p+1,len(kinds)) if kinds[i]=="LL"), None)
+                if ll is None: continue
+                lh2 = next((i for i in range(ll+1,len(kinds)) if kinds[i]=="LH"), None)
+                if lh2 is None:
+                    cand=("EARLY SHORT", "SHORT", 72, e[p], e[ll], None,
+                          f"HH/HL → LH → LL", "Prior bullish structure")
+                else:
+                    cand=("CONFIRMED EARLY SHORT", "SHORT", 92, e[p], e[ll], e[lh2],
+                          f"HH/HL → LH → LL → LH", "Prior bullish structure")
+                if best is None or cand[2] > best[2] or e[ll]["idx"] > best[4]["idx"]:
+                    best=cand
+        if best is None:
+            return None
+        state,side,score,first,pull,second,sequence,prior=best
+        age=max(0, len(completed(d))-1-first["idx"])
+        return {"state":state,"side":side,"score":score,"sequence":sequence,
+                "prior_state":prior,"first_break_price":first["price"],
+                "pullback_price":pull["price"],"breakout_price":second["price"] if second else np.nan,
+                "age_bars":age,"tf":tf_name}
+
+    s15=_seq(d15,"15m",180)
+    s4=_seq(d1h,"1H",120) if d1h is not None and not d1h.empty else None
+    if s15 is None:
+        if s4: out.update(s4); out["h1_state"]=s4["state"]
+        return out
+
+    out.update(s15)
+    if s4:
+        out["h1_state"]=s4["state"]
+        # Higher-timeframe transition agreement is a confirmation, not a
+        # requirement for the first 15m warning.
+        if s4["side"] == s15["side"]:
+            out["score"]=min(100, int(out["score"])+8)
+            out["state"] += " + 1H ALIGNED"
+        elif s4["side"] is not None and s4["side"] != s15["side"]:
+            out["score"]=max(0, int(out["score"])-12)
+            out["state"] += " / 1H CONFLICT"
+    return out
+
+
 def v71_pivots(d, left=2, right=2, lookback=160):
     """Confirmed swing pivots from completed candles only."""
     if d is None or d.empty:
@@ -4579,6 +4702,7 @@ def v71_scan_from_existing(scan):
         symbol = next((t.get("symbol") for t in a.get("candidates",[]) if t.get("symbol")), pair)
         price = v6_num(a.get("price"))
         stx = a.get("structure") or {}
+        early = a.get("early_structure") or {}
         ec = a.get("ema_cross") or {}
         c15 = ec.get("15m") or {}
         c4 = ec.get("4H") or {}
@@ -4594,6 +4718,14 @@ def v71_scan_from_existing(scan):
             short_score += 45; short_reasons.append("15m LH + LL")
         elif stx.get("lh") or stx.get("ll"):
             short_score += 22; short_reasons.append("15m early LH/LL")
+        # Chronological trend-change detector. This is intentionally separate
+        # from the static HH/HL/LH/LL state so the first reversal leg can surface earlier.
+        if early.get("side") == "LONG":
+            long_score += min(25, int(early.get("score",0)*0.25))
+            long_reasons.append(early.get("sequence", "early bullish transition"))
+        elif early.get("side") == "SHORT":
+            short_score += min(25, int(early.get("score",0)*0.25))
+            short_reasons.append(early.get("sequence", "early bearish transition"))
         if stx.get("h1_hh") and stx.get("h1_hl"):
             long_score += 20; long_reasons.append("1H HH + HL")
         if stx.get("h1_lh") and stx.get("h1_ll"):
@@ -4625,6 +4757,11 @@ def v71_scan_from_existing(scan):
             "long_score":min(100,int(long_score)), "short_score":min(100,int(short_score)),
             "long_reasons":long_reasons, "short_reasons":short_reasons,
             "structure":stx.get("state","UNKNOWN"),
+            "early_state":early.get("state","NO TRANSITION"), "early_side":early.get("side"),
+            "early_score":int(early.get("score",0) or 0), "early_sequence":early.get("sequence",""),
+            "early_first_break":early.get("first_break_price",np.nan),
+            "early_pullback":early.get("pullback_price",np.nan), "early_breakout":early.get("breakout_price",np.nan),
+            "early_age_bars":early.get("age_bars"), "h1_transition":early.get("h1_state",""),
             "hh":bool(stx.get("hh")), "hl":bool(stx.get("hl")), "lh":bool(stx.get("lh")), "ll":bool(stx.get("ll")),
             "h1_hh":bool(stx.get("h1_hh")), "h1_hl":bool(stx.get("h1_hl")), "h1_lh":bool(stx.get("h1_lh")), "h1_ll":bool(stx.get("h1_ll")),
             "ema15":c15.get("state","NO DATA"), "ema4h":c4.get("state","NO DATA"),
@@ -4676,18 +4813,21 @@ if radar:
     shorts = sorted([x for x in radar if x["short_score"] >= v7_min], key=lambda x:x["short_score"], reverse=True)
     hhhl = sorted([x for x in radar if x["hh"] and x["hl"]], key=lambda x:(x["long_score"], x["h1_hh"] and x["h1_hl"]), reverse=True)
     lhll = sorted([x for x in radar if x["lh"] and x["ll"]], key=lambda x:(x["short_score"], x["h1_lh"] and x["h1_ll"]), reverse=True)
+    early_longs = sorted([x for x in radar if x.get("early_side")=="LONG" and x.get("early_score",0)>=70], key=lambda x:(x.get("early_score",0), x.get("long_score",0)), reverse=True)
+    early_shorts = sorted([x for x in radar if x.get("early_side")=="SHORT" and x.get("early_score",0)>=70], key=lambda x:(x.get("early_score",0), x.get("short_score",0)), reverse=True)
     bear_cross = sorted([x for x in radar if x["fresh_ema_bear"]], key=lambda x:x["short_score"], reverse=True)
     bull_cross = sorted([x for x in radar if x["fresh_ema_bull"]], key=lambda x:x["long_score"], reverse=True)
 
     st.caption(f"V7 radar built from {len(radar)} market records | {st.session_state.get('v7_radar_time','—')}")
-    q1,q2,q3,q4,q5 = st.columns(5)
+    q1,q2,q3,q4,q5,q6 = st.columns(6)
     q1.metric("Tradeable LONG", len(longs))
     q2.metric("Tradeable SHORT", len(shorts))
-    q3.metric("HH + HL", len(hhhl))
-    q4.metric("LH + LL", len(lhll))
-    q5.metric("Bear EMA crosses", len(bear_cross))
+    q3.metric("EARLY LONG", len(early_longs))
+    q4.metric("EARLY SHORT", len(early_shorts))
+    q5.metric("HH + HL", len(hhhl))
+    q6.metric("LH + LL", len(lhll))
 
-    t1,t2,t3,t4,t5 = st.tabs(["🟢 LONG", "🔴 SHORT / DUMP", "📈 HH + HL", "📉 LH + LL", "⚠️ EMA20/100"])
+    t1,t2,t3,t4,t5,t6,t7 = st.tabs(["🟢 LONG", "🔴 SHORT / DUMP", "🟡 EARLY LONG", "🟠 EARLY SHORT", "📈 HH + HL", "📉 LH + LL", "⚠️ EMA20/100"])
     with t1:
         if longs:
             st.dataframe(pd.DataFrame([{
@@ -4705,6 +4845,28 @@ if radar:
             } for x in shorts[:20]]), use_container_width=True, hide_index=True)
         else: st.info("No SHORT/LH-LL setup reached the selected score.")
     with t3:
+        if early_longs:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "Early score":x.get("early_score",0), "LONG score":x["long_score"],
+                "Price":x["price"], "Transition":x.get("early_sequence",""),
+                "First HH":x.get("early_first_break",np.nan), "HL":x.get("early_pullback",np.nan),
+                "2nd HH":x.get("early_breakout",np.nan), "Age 15m bars":x.get("early_age_bars"),
+                "1H":x.get("h1_transition",""), "EMA15":x["ema15"], "EMA4H":x["ema4h"]
+            } for x in early_longs[:30]]), use_container_width=True, hide_index=True)
+            st.caption("EARLY LONG = prior bearish structure followed chronologically by first HH → HL; a second HH upgrades it to confirmed early transition. This is an alert, not an automatic entry.")
+        else: st.info("No early bullish transition detected.")
+    with t4:
+        if early_shorts:
+            st.dataframe(pd.DataFrame([{
+                "Symbol":x["symbol"], "Early score":x.get("early_score",0), "SHORT score":x["short_score"],
+                "Price":x["price"], "Transition":x.get("early_sequence",""),
+                "First LH":x.get("early_first_break",np.nan), "LL":x.get("early_pullback",np.nan),
+                "2nd LH":x.get("early_breakout",np.nan), "Age 15m bars":x.get("early_age_bars"),
+                "1H":x.get("h1_transition",""), "EMA15":x["ema15"], "EMA4H":x["ema4h"]
+            } for x in early_shorts[:30]]), use_container_width=True, hide_index=True)
+            st.caption("EARLY SHORT = prior bullish structure followed chronologically by first LH → LL; a second LH upgrades it to confirmed early transition. This is an alert, not an automatic entry.")
+        else: st.info("No early bearish transition detected.")
+    with t5:
         if hhhl:
             st.dataframe(pd.DataFrame([{
                 "Symbol":x["symbol"], "LONG score":x["long_score"], "Price":x["price"],
@@ -4712,7 +4874,7 @@ if radar:
                 "EMA15":x["ema15"], "EMA4H":x["ema4h"], "Why":" | ".join(x["long_reasons"])
             } for x in hhhl[:30]]), use_container_width=True, hide_index=True)
         else: st.info("No current 15m HH + HL sequence found in the market scan.")
-    with t4:
+    with t6:
         if lhll:
             st.dataframe(pd.DataFrame([{
                 "Symbol":x["symbol"], "SHORT score":x["short_score"], "Price":x["price"],
@@ -4720,7 +4882,7 @@ if radar:
                 "EMA15":x["ema15"], "EMA4H":x["ema4h"], "Why":" | ".join(x["short_reasons"])
             } for x in lhll[:30]]), use_container_width=True, hide_index=True)
         else: st.info("No current 15m LH + LL sequence found in the market scan.")
-    with t5:
+    with t7:
         cross = bear_cross + bull_cross
         if cross:
             st.dataframe(pd.DataFrame([{
