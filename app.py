@@ -3680,20 +3680,39 @@ def v6_save_paper(rows):
         pass
 
 
-def v6_paper_open(setup, balance, risk_pct, leverage):
+def v6_paper_open(setup, balance, risk_pct, leverage, pair=None, symbol=None, source="MANUAL"):
+    """Open a paper position without requiring the V5 last_analysis selection.
+
+    The optional pair/symbol/source fields let the autonomous scanner open trades
+    directly from the market-wide scan while preserving the original manual flow.
+    """
     rows = v6_load_paper()
+    pair = pair or setup.get("pair") or st.session_state.get("last_analysis", {}).get("pair", "")
+    symbol = symbol or setup.get("symbol") or pair
+    if not pair:
+        return None
+    # Never stack duplicate exposure on the same contract while an earlier paper
+    # position is still open.
+    if any(r.get("status") == "OPEN" and str(r.get("pair")) == str(pair) for r in rows):
+        return None
     qty = v6_position_size(balance, setup["entry"], setup["stop"], risk_pct, leverage)
     if qty <= 0:
         return None
+    now = datetime.now(timezone.utc)
     trade = {
-        "id": datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f"),
-        "time": datetime.now(timezone.utc).isoformat(),
-        "pair": st.session_state.get("last_analysis", {}).get("pair", ""),
+        "id": now.strftime("%Y%m%d%H%M%S%f"),
+        "time": now.isoformat(),
+        "pair": pair,
+        "symbol": symbol,
         "direction": setup["direction"],
         "score": setup["score"],
         "entry": setup["entry"], "stop": setup["stop"],
         "tp1": setup["tp1"], "tp2": setup["tp2"], "tp3": setup["tp3"],
         "qty": qty, "status": "OPEN", "pnl": 0.0,
+        "last_price": setup["entry"],
+        "tp1_hit": False, "tp2_hit": False,
+        "source": source,
+        "reason": " | ".join(setup.get("reasons", [])[:5]),
     }
     rows.append(trade)
     v6_save_paper(rows)
@@ -3701,38 +3720,178 @@ def v6_paper_open(setup, balance, risk_pct, leverage):
 
 
 def v6_paper_update(pair, price):
+    """Update one open paper position and record TP milestones/exit state."""
     rows = v6_load_paper()
     changed = False
     for t in rows:
-        if t.get("status") != "OPEN" or t.get("pair") != pair:
+        if t.get("status") != "OPEN" or str(t.get("pair")) != str(pair):
             continue
         p = v6_num(price)
         entry = v6_num(t.get("entry")); qty = v6_num(t.get("qty"), 0)
-        stop = v6_num(t.get("stop")); tp3 = v6_num(t.get("tp3"))
+        stop = v6_num(t.get("stop")); tp1 = v6_num(t.get("tp1")); tp2 = v6_num(t.get("tp2")); tp3 = v6_num(t.get("tp3"))
         direction = t.get("direction")
-        hit_stop = p <= stop if direction == "LONG" else p >= stop
-        hit_tp3 = p >= tp3 if direction == "LONG" else p <= tp3
+        if not np.isfinite(p) or p <= 0:
+            continue
+        t["last_price"] = p
+        t["unrealized_pnl"] = ((p-entry) * qty if direction == "LONG" else (entry-p) * qty)
+        if direction == "LONG":
+            t["tp1_hit"] = bool(t.get("tp1_hit")) or p >= tp1
+            t["tp2_hit"] = bool(t.get("tp2_hit")) or p >= tp2
+            hit_stop = p <= stop
+            hit_tp3 = p >= tp3
+        else:
+            t["tp1_hit"] = bool(t.get("tp1_hit")) or p <= tp1
+            t["tp2_hit"] = bool(t.get("tp2_hit")) or p <= tp2
+            hit_stop = p >= stop
+            hit_tp3 = p <= tp3
         if hit_stop or hit_tp3:
             raw = (p-entry) * qty if direction == "LONG" else (entry-p) * qty
             t["exit"] = p; t["pnl"] = raw
             t["status"] = "STOP" if hit_stop else "TP3"
             t["closed_at"] = datetime.now(timezone.utc).isoformat()
-            changed = True
+        changed = True
     if changed:
         v6_save_paper(rows)
     return rows
 
 
 def v6_daily_guard(balance, starting_balance, rows, cfg):
-    """Kill switch based on closed paper PnL and configured daily loss limit."""
+    """Kill switch based on today's closed paper PnL and the configured daily loss limit."""
     if starting_balance <= 0:
         return True, "No valid starting balance"
-    closed = [r for r in rows if r.get("status") != "OPEN"]
+    today = datetime.now(timezone.utc).date().isoformat()
+    closed = [r for r in rows if r.get("status") != "OPEN" and str(r.get("closed_at", "")).startswith(today)]
     pnl = sum(v6_num(r.get("pnl"), 0) for r in closed)
     loss_pct = max(0.0, -pnl / starting_balance * 100)
     if loss_pct >= float(cfg["max_daily_loss_pct"]):
         return False, f"DAILY KILL SWITCH: closed loss {loss_pct:.2f}% >= {cfg['max_daily_loss_pct']:.2f}%"
     return True, f"Daily risk OK: closed PnL {pnl:+.2f}"
+
+
+# =============================================================================
+# V6 AUTONOMOUS PAPER-TRADING LOOP
+# =============================================================================
+def v6_resolve_live_price(prices, pair):
+    """Resolve a Futures price despite CoinDCX feed-key formatting differences."""
+    if not pair:
+        return None
+    keys = [str(pair), str(pair).upper(), str(pair).lower()]
+    for k in keys:
+        if k in prices:
+            return current_price(prices[k])
+    target = str(pair).upper().replace("-", "").replace("_", "")
+    for k, rec in (prices or {}).items():
+        kk = str(k).upper().replace("-", "").replace("_", "")
+        if kk == target:
+            return current_price(rec)
+    return None
+
+
+def v6_run_market_scan(scan_limit, cfg):
+    """Run the same V6 deterministic scan used by the manual button."""
+    prices = futures_prices()
+    active = active_instruments(margin)
+    universe = []
+    for pair in active:
+        p = prices.get(pair) or prices.get(str(pair).upper()) or prices.get(str(pair).lower())
+        if not p:
+            # Some CoinDCX feeds use a differently formatted contract key.
+            target = str(pair).upper().replace("-", "").replace("_", "")
+            p = next((rec for k, rec in (prices or {}).items()
+                      if str(k).upper().replace("-", "").replace("_", "") == target), None)
+        if not p:
+            continue
+        symbol = str(p.get("mkt", pair)).upper()
+        if meme_only and not any(w in symbol or w in str(pair).upper() for w in MEME_WORDS):
+            continue
+        cur = current_price(p)
+        pc = v6_num(p.get("pc"), 0)
+        if cur > 0:
+            universe.append((pair, symbol, p, cur, abs(pc)))
+    universe.sort(key=lambda z: z[4], reverse=True)
+    universe = universe[:int(scan_limit)]
+
+    records, failures = [], []
+    for pair, symbol, p, cur, _ in universe:
+        try:
+            tf_data = {tf: get_tf(pair, tf, days) for tf, days in {
+                "5m": 5, "15m": 12, "1H": 30, "4H": 120, "1D": 180
+            }.items()}
+            dummy = {"tf_data": tf_data, "current": cur, "pair": pair, "symbol": symbol}
+            for direction in ("LONG", "SHORT"):
+                setup = v6_setup_engine(dummy, direction, cfg)
+                if not setup:
+                    continue
+                setup = dict(setup)
+                setup["pair"] = pair
+                setup["symbol"] = symbol
+                records.append({
+                    "Coin": symbol, "Pair": pair, "Direction": setup["direction"],
+                    "Score": setup["score"],
+                    "Valid": "✅ TRADE CANDIDATE" if setup["valid"] else "WAIT",
+                    "Regime": setup["regime"], "15m Structure": setup["structure15"],
+                    "Volume": f"{setup['volume']['ratio']:.1f}x" if np.isfinite(setup['volume']['ratio']) else "—",
+                    "Entry": fmt(setup["entry"]), "Stop": fmt(setup["stop"]),
+                    "TP1": fmt(setup["tp1"]), "TP2": fmt(setup["tp2"]), "TP3": fmt(setup["tp3"]),
+                    "Blockers": "; ".join(setup["blockers"]) if setup["blockers"] else "—",
+                    "Reasons": " | ".join(setup["reasons"][:4]), "setup": setup,
+                })
+        except Exception as exc:
+            failures.append(f"{pair}: {type(exc).__name__}: {exc}")
+    records.sort(key=lambda r: (r["Valid"] != "✅ TRADE CANDIDATE", -r["Score"]))
+    return records, failures, len(universe)
+
+
+def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_new_trades=1):
+    """Scan, manage existing paper positions, and automatically open new valid setups."""
+    # First mark existing positions using the freshest public Futures prices.
+    prices = futures_prices()
+    rows = v6_load_paper()
+    for t in rows:
+        if t.get("status") != "OPEN":
+            continue
+        live = v6_resolve_live_price(prices, t.get("pair"))
+        if live is not None:
+            v6_paper_update(t.get("pair"), live)
+    rows = v6_load_paper()
+
+    records, failures, scanned = v6_run_market_scan(scan_limit, cfg)
+    valid = [r for r in records if r["Valid"] == "✅ TRADE CANDIDATE"]
+    # Only one position per contract; if both directions qualify, take the stronger one.
+    best_by_pair = {}
+    for r in valid:
+        pair = r["Pair"]
+        if pair not in best_by_pair or r["Score"] > best_by_pair[pair]["Score"]:
+            best_by_pair[pair] = r
+    candidates = sorted(best_by_pair.values(), key=lambda r: r["Score"], reverse=True)
+
+    opened, skipped = [], []
+    open_pairs = {str(r.get("pair")) for r in rows if r.get("status") == "OPEN"}
+    open_count = len(open_pairs)
+    guard_ok, guard_msg = v6_daily_guard(balance, balance, rows, cfg)
+    if not guard_ok:
+        return records, failures, scanned, opened, [guard_msg], guard_msg
+
+    for r in candidates:
+        if len(opened) >= int(max_new_trades):
+            skipped.append(f"{r['Coin']}: per-cycle auto-trade limit reached")
+            break
+        if open_count >= int(cfg["max_open_positions"]):
+            skipped.append(f"{r['Coin']}: max open positions reached")
+            break
+        pair = r["Pair"]
+        if str(pair) in open_pairs:
+            skipped.append(f"{r['Coin']}: position already open")
+            continue
+        trade = v6_paper_open(r["setup"], balance, risk_pct, leverage,
+                              pair=pair, symbol=r["Coin"], source="AUTONOMOUS")
+        if trade:
+            opened.append(trade)
+            open_pairs.add(str(pair))
+            open_count += 1
+
+    msg = f"Auto cycle: scanned {scanned} contracts | {len(valid)} valid setups | opened {len(opened)} paper trade(s)"
+    return records, failures, scanned, opened, skipped, msg
 
 
 # =============================================================================
@@ -3758,6 +3917,17 @@ with v6_col1:
 with v6_col2:
     v6_min_score = st.slider("Minimum setup score", 60, 90, V6_DEFAULTS["min_setup_score"], 1)
 v6_cfg["min_setup_score"] = v6_min_score
+
+a1, a2, a3 = st.columns(3)
+with a1:
+    v6_auto_paper = st.checkbox("🤖 Autonomous Paper Trading", value=False, key="v6_auto_paper")
+with a2:
+    v6_auto_minutes = st.selectbox("Auto scan interval", [1, 5, 10, 15], index=1, key="v6_auto_minutes")
+with a3:
+    v6_auto_limit = st.slider("Max auto trades / cycle", 1, 3, 1, key="v6_auto_limit")
+
+if v6_auto_paper:
+    st.warning("AUTONOMOUS PAPER MODE: the agent will scan the V6 universe, open qualifying paper trades automatically, and update open positions. No live CoinDCX order is sent.")
 
 if st.button("🚦 Run Professional LONG / SHORT Scan", type="primary"):
     try:
@@ -3820,6 +3990,34 @@ if st.button("🚦 Run Professional LONG / SHORT Scan", type="primary"):
     except Exception as exc:
         st.error(f"V6 scan failed: {type(exc).__name__}: {exc}")
 
+# The fragment reruns independently, so autonomous paper trading does not require
+# repeatedly clicking the manual scan button. Streamlit >=1.37 supports fragments.
+if v6_auto_paper:
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every=f"{int(v6_auto_minutes)}m")
+        def _v6_autonomous_runner():
+            with st.status("🤖 Autonomous paper cycle running…", expanded=False):
+                try:
+                    auto_cfg = dict(v6_cfg)
+                    recs, fails, scanned, opened, skipped, msg = v6_autonomous_paper_cycle(
+                        v6_balance, v6_risk, v6_lev, auto_cfg, v6_scan_limit, v6_auto_limit
+                    )
+                    st.session_state["v6_scan"] = recs
+                    st.session_state["v6_scan_failures"] = fails
+                    st.session_state["v6_auto_last"] = datetime.now(timezone.utc).isoformat()
+                    st.session_state["v6_auto_message"] = msg
+                    if opened:
+                        st.success("AUTO-OPENED: " + ", ".join(
+                            f"{t.get('symbol', t.get('pair'))} {t.get('direction')} {t.get('score')}/100" for t in opened
+                        ))
+                    else:
+                        st.info(msg)
+                except Exception as exc:
+                    st.error(f"Autonomous paper cycle failed: {type(exc).__name__}: {exc}")
+        _v6_autonomous_runner()
+    else:
+        st.error("Autonomous mode requires a recent Streamlit version with st.fragment. Manual paper trading remains available.")
+
 v6_records = st.session_state.get("v6_scan", [])
 if v6_records:
     st.subheader("📋 Ranked Intraday Opportunities")
@@ -3860,7 +4058,7 @@ if v6_records:
                     if not ok:
                         st.error(guard)
                     else:
-                        trade = v6_paper_open(setup, v6_balance, v6_risk, v6_lev)
+                        trade = v6_paper_open(setup, v6_balance, v6_risk, v6_lev, pair=chosen.get("Pair"), symbol=chosen.get("Coin"), source="MANUAL")
                         if trade:
                             st.success(f"Paper trade opened: {trade['direction']} {trade['pair']} qty {trade['qty']:.6f}")
 
@@ -3869,6 +4067,8 @@ if st.session_state.get("v6_scan_failures"):
         st.code("\n".join(st.session_state["v6_scan_failures"][:100]))
 
 st.markdown("### 🧪 Paper Position Manager")
+if v6_auto_paper:
+    st.caption(f"🤖 Autonomous mode ON | Interval: {v6_auto_minutes} min | Last cycle: {st.session_state.get('v6_auto_last', 'waiting for first cycle')}")
 paper_rows = v6_load_paper()
 if paper_rows:
     pactive = [r for r in paper_rows if r.get("status") == "OPEN"]
@@ -3879,9 +4079,9 @@ if paper_rows:
         for t in paper_rows:
             if t.get("status") != "OPEN":
                 continue
-            p = prices.get(t.get("pair"))
-            if p:
-                v6_paper_update(t.get("pair"), current_price(p))
+            live = v6_resolve_live_price(prices, t.get("pair"))
+            if live is not None:
+                v6_paper_update(t.get("pair"), live)
         st.rerun()
 else:
     st.info("No paper trades yet. Run the V6 scan first.")
