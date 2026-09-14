@@ -3124,7 +3124,7 @@ import json
 import os
 from pathlib import Path
 
-V6_VERSION = "6.0-INTRADAY"
+V6_VERSION = "6.0-INTRADAY+V7-STRATEGY-LAB"
 PAPER_FILE = Path("paper_trades.json")
 
 # ----------------------------- V6 CONFIG -------------------------------------
@@ -3695,6 +3695,22 @@ def v6_paper_open(setup, balance, risk_pct, leverage, pair=None, symbol=None, so
     # position is still open.
     if any(r.get("status") == "OPEN" and str(r.get("pair")) == str(pair) for r in rows):
         return None
+    # Realistic paper positions require a physically valid positive-price plan.
+    # Strategy Performance Lab does not use this guard; it evaluates the signal
+    # from its entry/reference price without TP/SL assumptions.
+    entry0 = v6_num(setup.get("entry"))
+    stop0 = v6_num(setup.get("stop"))
+    tp10 = v6_num(setup.get("tp1"))
+    tp20 = v6_num(setup.get("tp2"))
+    tp30 = v6_num(setup.get("tp3"))
+    direction0 = setup.get("direction")
+    if (
+        not all(np.isfinite(x) and x > 0 for x in (entry0, stop0, tp10, tp20, tp30))
+        or (direction0 == "LONG" and not (stop0 < entry0 < tp10 < tp20 < tp30))
+        or (direction0 == "SHORT" and not (tp30 < tp20 < tp10 < entry0 < stop0))
+    ):
+        return None
+
     qty = v6_position_size(balance, setup["entry"], setup["stop"], risk_pct, leverage)
     if qty <= 0:
         return None
@@ -3766,6 +3782,233 @@ def v6_daily_guard(balance, starting_balance, rows, cfg):
     if loss_pct >= float(cfg["max_daily_loss_pct"]):
         return False, f"DAILY KILL SWITCH: closed loss {loss_pct:.2f}% >= {cfg['max_daily_loss_pct']:.2f}%"
     return True, f"Daily risk OK: closed PnL {pnl:+.2f}"
+
+
+
+# =============================================================================
+# V7 STRATEGY PERFORMANCE LAB — AUTONOMOUS FORWARD-RETURN EVALUATION
+# =============================================================================
+# This is deliberately separate from exchange-style paper positions.
+# It answers: "When the strategy emits a signal, what happens next?"
+# No TP/SL is required. Each signal is evaluated at fixed forward horizons.
+STRATEGY_FILE = Path("strategy_signal_journal.json")
+V7_STRATEGY_HORIZONS_MIN = (60, 240, 480, 1440)  # 1h, 4h, 8h, 24h
+V7_STRATEGY_COOLDOWN_MIN = 240  # do not duplicate the same pair/side every scan
+
+
+def v7_strategy_load():
+    try:
+        if STRATEGY_FILE.exists():
+            data = json.loads(STRATEGY_FILE.read_text())
+            return data if isinstance(data, list) else []
+    except Exception:
+        pass
+    return []
+
+
+def v7_strategy_save(rows):
+    try:
+        STRATEGY_FILE.write_text(json.dumps(rows, indent=2, default=str))
+    except Exception:
+        pass
+
+
+def v7_strategy_parse_ts(value):
+    try:
+        x = pd.to_datetime(value, utc=True)
+        return x.to_pydatetime()
+    except Exception:
+        return None
+
+
+def v7_strategy_return(direction, entry, price):
+    entry = v6_num(entry)
+    price = v6_num(price)
+    if not np.isfinite(entry) or not np.isfinite(price) or entry <= 0:
+        return np.nan
+    return ((price - entry) / entry * 100.0
+            if direction == "LONG"
+            else (entry - price) / entry * 100.0)
+
+
+def v7_strategy_update(rows, prices, now=None):
+    """Mark active signals and finalize 1h/4h/8h/24h forward-return observations."""
+    now = now or datetime.now(timezone.utc)
+    changed = False
+    for s in rows:
+        if s.get("status") == "COMPLETE":
+            continue
+        pair = s.get("pair")
+        live = v6_resolve_live_price(prices, pair)
+        if live is None or live <= 0:
+            continue
+
+        entry = v6_num(s.get("entry"))
+        direction = s.get("direction")
+        if not np.isfinite(entry) or entry <= 0 or direction not in ("LONG", "SHORT"):
+            continue
+
+        ret = v7_strategy_return(direction, entry, live)
+        if not np.isfinite(ret):
+            continue
+        s["last_price"] = live
+        s["current_return_pct"] = ret
+        changed = True
+
+        favorable = max(0.0, ret)
+        adverse = min(0.0, ret)
+        s["mfe_pct"] = max(v6_num(s.get("mfe_pct"), 0.0), favorable)
+        s["mae_pct"] = min(v6_num(s.get("mae_pct"), 0.0), adverse)
+
+        opened = v7_strategy_parse_ts(s.get("signal_time"))
+        if opened is None:
+            continue
+        age_min = max(0.0, (now - opened).total_seconds() / 60.0)
+        s["age_minutes"] = age_min
+
+        completed_count = 0
+        for mins in V7_STRATEGY_HORIZONS_MIN:
+            key = f"{mins}m"
+            if age_min >= mins and s.get(f"return_{key}") is None:
+                s[f"return_{key}"] = ret
+                s[f"price_{key}"] = live
+                s[f"completed_{key}"] = now.isoformat()
+                completed_count += 1
+
+        if age_min >= max(V7_STRATEGY_HORIZONS_MIN):
+            s["status"] = "COMPLETE"
+            s["completed_at"] = now.isoformat()
+        if completed_count:
+            changed = True
+    return rows, changed
+
+
+def v7_strategy_add_signals(rows, records, now=None):
+    """Create one forward-evaluation record for each new qualifying strategy signal."""
+    now = now or datetime.now(timezone.utc)
+    added = []
+    for r in records or []:
+        if r.get("Valid") != "✅ TRADE CANDIDATE":
+            continue
+        setup = r.get("setup") or {}
+        pair = r.get("Pair")
+        direction = r.get("Direction")
+        score = int(v6_num(r.get("Score"), 0))
+        entry = v6_num(setup.get("entry"))
+        if not pair or direction not in ("LONG", "SHORT") or not np.isfinite(entry) or entry <= 0:
+            continue
+
+        # Avoid creating a new observation every 5 minutes while the same setup
+        # remains valid. A fresh observation is allowed after the cooldown.
+        recent = False
+        for old in reversed(rows[-5000:]):
+            if str(old.get("pair")) != str(pair) or old.get("direction") != direction:
+                continue
+            ts = v7_strategy_parse_ts(old.get("signal_time"))
+            if ts is not None and (now - ts).total_seconds() < V7_STRATEGY_COOLDOWN_MIN * 60:
+                recent = True
+                break
+        if recent:
+            continue
+
+        signal = {
+            "id": now.strftime("%Y%m%d%H%M%S%f"),
+            "signal_time": now.isoformat(),
+            "pair": pair,
+            "symbol": r.get("Coin", pair),
+            "direction": direction,
+            "score": score,
+            "entry": entry,
+            "structure": setup.get("structure15", r.get("15m Structure", "")),
+            "regime": setup.get("regime", r.get("Regime", "")),
+            "volume_ratio": v6_num((setup.get("volume") or {}).get("ratio")),
+            "reasons": setup.get("reasons", [])[:8],
+            "status": "TRACKING",
+            "last_price": entry,
+            "current_return_pct": 0.0,
+            "mfe_pct": 0.0,
+            "mae_pct": 0.0,
+            "age_minutes": 0.0,
+        }
+        rows.append(signal)
+        added.append(signal)
+    return rows, added
+
+
+def v7_strategy_lab_cycle(records):
+    """Update prior observations and register new qualifying signals."""
+    now = datetime.now(timezone.utc)
+    prices = futures_prices()
+    rows = v7_strategy_load()
+    rows, changed = v7_strategy_update(rows, prices, now)
+    rows, added = v7_strategy_add_signals(rows, records, now)
+    if added or changed:
+        v7_strategy_save(rows)
+    return rows, added
+
+
+def v7_strategy_stats(rows):
+    """Aggregate only completed forward observations; no TP/SL assumptions."""
+    stats = {}
+    for mins in V7_STRATEGY_HORIZONS_MIN:
+        key = f"{mins}m"
+        vals = []
+        wins = losses = 0
+        for s in rows:
+            v = v6_num(s.get(f"return_{key}"))
+            if np.isfinite(v):
+                vals.append(v)
+                if v > 0:
+                    wins += 1
+                elif v < 0:
+                    losses += 1
+        arr = np.asarray(vals, dtype=float)
+        stats[key] = {
+            "n": int(len(arr)),
+            "wins": wins,
+            "losses": losses,
+            "flat": int(len(arr) - wins - losses),
+            "win_rate": (wins / len(arr) * 100.0) if len(arr) else np.nan,
+            "avg_return": float(np.mean(arr)) if len(arr) else np.nan,
+            "median_return": float(np.median(arr)) if len(arr) else np.nan,
+            "best": float(np.max(arr)) if len(arr) else np.nan,
+            "worst": float(np.min(arr)) if len(arr) else np.nan,
+        }
+    return stats
+
+
+def v7_strategy_breakdown(rows, horizon="240m"):
+    """Break completed results down by direction and score bucket."""
+    groups = []
+    for label, predicate in [
+        ("ALL", lambda s: True),
+        ("LONG", lambda s: s.get("direction") == "LONG"),
+        ("SHORT", lambda s: s.get("direction") == "SHORT"),
+        ("Score 72-79", lambda s: 72 <= int(v6_num(s.get("score"), 0)) <= 79),
+        ("Score 80-89", lambda s: 80 <= int(v6_num(s.get("score"), 0)) <= 89),
+        ("Score 90+", lambda s: int(v6_num(s.get("score"), 0)) >= 90),
+    ]:
+        vals = [
+            v6_num(s.get(f"return_{horizon}"))
+            for s in rows
+            if predicate(s) and np.isfinite(v6_num(s.get(f"return_{horizon}")))
+        ]
+        vals = np.asarray(vals, dtype=float)
+        groups.append({
+            "Group": label,
+            "Signals": int(len(vals)),
+            "Win %": round(float(np.mean(vals > 0) * 100.0), 1) if len(vals) else np.nan,
+            "Avg Return %": round(float(np.mean(vals)), 3) if len(vals) else np.nan,
+            "Median %": round(float(np.median(vals)), 3) if len(vals) else np.nan,
+            "Best %": round(float(np.max(vals)), 3) if len(vals) else np.nan,
+            "Worst %": round(float(np.min(vals)), 3) if len(vals) else np.nan,
+        })
+    return groups
+
+
+def v7_strategy_recent(rows, limit=25):
+    """Newest observations first, including still-tracking signals."""
+    return sorted(rows, key=lambda s: s.get("signal_time", ""), reverse=True)[:limit]
 
 
 # =============================================================================
@@ -3856,6 +4099,16 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
     rows = v6_load_paper()
 
     records, failures, scanned = v6_run_market_scan(scan_limit, cfg)
+
+    # Strategy Performance Lab: record qualifying signals independently of TP/SL.
+    # This measures what the strategy itself did after a signal, rather than
+    # assuming a particular stop/target construction.
+    try:
+        _, lab_added = v7_strategy_lab_cycle(records)
+    except Exception as exc:
+        lab_added = []
+        failures.append(f"strategy_lab: {type(exc).__name__}: {exc}")
+
     valid = [r for r in records if r["Valid"] == "✅ TRADE CANDIDATE"]
     # Only one position per contract; if both directions qualify, take the stronger one.
     best_by_pair = {}
@@ -3890,7 +4143,7 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
             open_pairs.add(str(pair))
             open_count += 1
 
-    msg = f"Auto cycle: scanned {scanned} contracts | {len(valid)} valid setups | opened {len(opened)} paper trade(s)"
+    msg = f"Auto cycle: scanned {scanned} contracts | {len(valid)} valid setups | opened {len(opened)} paper trade(s) | strategy signals logged {len(lab_added)}"
     return records, failures, scanned, opened, skipped, msg
 
 
@@ -4086,7 +4339,79 @@ if paper_rows:
 else:
     st.info("No paper trades yet. Run the V6 scan first.")
 
-st.caption(f"V{V6_VERSION}: existing V5 engine retained above; V6 adds deterministic intraday analysis, risk sizing and paper trade management. Live execution is intentionally disabled until exchange order integration is explicitly implemented and verified.")
+
+# =============================================================================
+# V7 STRATEGY PERFORMANCE LAB UI
+# =============================================================================
+st.markdown("### 🧠 Strategy Performance Lab — Forward Returns")
+st.caption(
+    "Autonomous strategy evaluation. No TP/SL is assumed. Each qualifying signal is "
+    "tracked from its signal price and evaluated at 1H, 4H, 8H and 24H. "
+    "This measures the strategy's raw directional edge before designing execution rules."
+)
+
+strategy_rows = v7_strategy_load()
+if strategy_rows:
+    strategy_stats = v7_strategy_stats(strategy_rows)
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Signals logged", len(strategy_rows))
+    tracking = sum(1 for s in strategy_rows if s.get("status") != "COMPLETE")
+    m2.metric("Tracking", tracking)
+    s4 = strategy_stats["240m"]
+    m3.metric("4H completed", s4["n"])
+    m4.metric("4H win rate", f"{s4['win_rate']:.1f}%" if np.isfinite(s4["win_rate"]) else "—")
+    m5.metric("4H avg return", f"{s4['avg_return']:+.2f}%" if np.isfinite(s4["avg_return"]) else "—")
+
+    horizon_labels = {"60m":"1H", "240m":"4H", "480m":"8H", "1440m":"24H"}
+    horizon_rows = []
+    for key, label in horizon_labels.items():
+        s = strategy_stats[key]
+        horizon_rows.append({
+            "Horizon": label,
+            "Completed": s["n"],
+            "Win %": round(s["win_rate"], 1) if np.isfinite(s["win_rate"]) else np.nan,
+            "Avg Return %": round(s["avg_return"], 3) if np.isfinite(s["avg_return"]) else np.nan,
+            "Median %": round(s["median_return"], 3) if np.isfinite(s["median_return"]) else np.nan,
+            "Best %": round(s["best"], 3) if np.isfinite(s["best"]) else np.nan,
+            "Worst %": round(s["worst"], 3) if np.isfinite(s["worst"]) else np.nan,
+        })
+    st.dataframe(pd.DataFrame(horizon_rows), use_container_width=True, hide_index=True)
+
+    st.markdown("#### 4H Strategy Breakdown")
+    st.dataframe(pd.DataFrame(v7_strategy_breakdown(strategy_rows, "240m")),
+                 use_container_width=True, hide_index=True)
+
+    st.markdown("#### Recent Strategy Signals")
+    recent = []
+    for s in v7_strategy_recent(strategy_rows, 30):
+        recent.append({
+            "Time": s.get("signal_time", ""),
+            "Coin": s.get("symbol", s.get("pair", "")),
+            "Side": s.get("direction", ""),
+            "Score": s.get("score", ""),
+            "Entry": fmt(s.get("entry")),
+            "Current": fmt(s.get("last_price")),
+            "Now %": round(v6_num(s.get("current_return_pct")), 3) if np.isfinite(v6_num(s.get("current_return_pct"))) else np.nan,
+            "1H %": round(v6_num(s.get("return_60m")), 3) if np.isfinite(v6_num(s.get("return_60m"))) else np.nan,
+            "4H %": round(v6_num(s.get("return_240m")), 3) if np.isfinite(v6_num(s.get("return_240m"))) else np.nan,
+            "8H %": round(v6_num(s.get("return_480m")), 3) if np.isfinite(v6_num(s.get("return_480m"))) else np.nan,
+            "24H %": round(v6_num(s.get("return_1440m")), 3) if np.isfinite(v6_num(s.get("return_1440m"))) else np.nan,
+            "MFE %": round(v6_num(s.get("mfe_pct")), 3),
+            "MAE %": round(v6_num(s.get("mae_pct")), 3),
+            "Status": s.get("status", ""),
+        })
+    st.dataframe(pd.DataFrame(recent), use_container_width=True, hide_index=True)
+
+    st.download_button(
+        "⬇️ Download Strategy Signal Journal",
+        data=json.dumps(strategy_rows, indent=2, default=str),
+        file_name="coindcx_strategy_signal_journal.json",
+        mime="application/json",
+    )
+else:
+    st.info("No qualifying strategy signals have been logged yet. Leave Autonomous Paper Trading ON and let the agent collect observations.")
+
+st.caption(f"V{V6_VERSION}: existing V5 engine retained above; V6 adds deterministic intraday analysis, risk sizing and paper trade management; V7 adds autonomous strategy-performance tracking. Live execution is intentionally disabled until exchange order integration is explicitly implemented and verified.")
 
 # =============================================================================
 # V6.2 AUTONOMOUS HISTORICAL PATTERN LEARNING ENGINE
