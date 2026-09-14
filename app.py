@@ -1486,7 +1486,8 @@ def analyze_current_coin(pair, price_info):
         "tf_data":tf_data,"ema_rows":ema_rows,"bull":bull,"bear":bear,"total":total,
         "current":current,"event":event,"target":target,
         "4h":last4,"1d":last1,"15m":d15.iloc[-1] if not d15.empty else None,
-        "structure4":structure(d4),"structure1":structure(d1),"structure15":structure(d15) if not d15.empty else "Mixed"
+        "structure4":structure(d4),"structure1":structure(d1),"structure15":structure(d15) if not d15.empty else "Mixed",
+        "mtf_sr": v13_mtf_support_resistance(tf_data, current) if "v13_mtf_support_resistance" in globals() else {}
     }
 
 # =============================================================================
@@ -2755,7 +2756,7 @@ def v61_signal_card(t):
 # =============================================================================
 # V5 UI
 # =============================================================================
-st.title("🧠 CoinDCX Historical Pattern Learning Scanner V5")
+st.title("🧠 CoinDCX Historical Pattern Learning Scanner V14")
 st.caption("Learns from historical CoinDCX Futures behavior and separates active continuation from a confirmed reversal. Analysis only — no orders.")
 
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
@@ -2885,6 +2886,30 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
             t2.metric("Momentum", "EXTREME" if event_is_extreme(current["target"]) else "NORMAL")
             t3.metric("Reversal stage",s15["reversal_stage"])
             t4.metric("15m structure",current.get("structure15","Mixed"))
+
+            # V14: Support/resistance is shown for EVERY coin analyzed,
+            # regardless of whether the final decision is LONG, SHORT or WAIT.
+            st.markdown("### 📐 Multi-Timeframe Support & Resistance")
+            _coin_sr = current.get("mtf_sr", {}) or {}
+            _sr_summary = v14_sr_summary(_coin_sr, current.get("current")) if _coin_sr else {}
+            if _coin_sr:
+                st.dataframe(
+                    pd.DataFrame(v13_sr_columns(_coin_sr)),
+                    use_container_width=True,
+                    hide_index=True,
+                )
+                if _sr_summary:
+                    sr1,sr2,sr3,sr4=st.columns(4)
+                    sr1.metric("Nearest Support", v13_format_price(_sr_summary.get("nearest_support")))
+                    sr2.metric("Support distance", f"{_sr_summary.get('support_dist_pct'):.2f}%" if _sr_summary.get('support_dist_pct') is not None else "—")
+                    sr3.metric("Nearest Resistance", v13_format_price(_sr_summary.get("nearest_resistance")))
+                    sr4.metric("Resistance distance", f"+{_sr_summary.get('resistance_dist_pct'):.2f}%" if _sr_summary.get('resistance_dist_pct') is not None else "—")
+                    st.caption(
+                        f"Nearest support: {_sr_summary.get('support_tf','—')} | "
+                        f"Nearest resistance: {_sr_summary.get('resistance_tf','—')}"
+                    )
+            else:
+                st.warning("Support/resistance data could not be calculated for this coin from the available completed candles.")
 
             if summary:
                 st.markdown("### 📚 What happened to similar coins AFTER the setup?")
@@ -4597,7 +4622,9 @@ def v10_extreme_record(x):
         "Score": x.get("score", 0),
         "Valid": "✅ TRADE CANDIDATE" if x.get("valid") else "WAIT",
         "Regime": x.get("state", ""), "15m Structure": x.get("structure15", ""),
-        "Volume": f"{x.get('volume', 0):.1f}x", "Entry": fmt(x.get("entry", x.get("price", 0))),
+        "Volume": f"{x.get('volume', 0):.1f}x",
+        "Current": fmt(x.get("price", x.get("entry", 0))),
+        "Entry": fmt(x.get("entry", x.get("price", 0))),
         "Stop": "—", "TP1": "—", "TP2": "—", "TP3": "—",
         "Blockers": "; ".join(x.get("blockers", [])) or "—",
         "Reasons": " | ".join(x.get("reasons", [])[:5]),
@@ -6150,13 +6177,19 @@ def v13_sr_columns(sr):
     } for tf in V13_SR_TIMEFRAMES]
 
 def v13_attach_sr_to_records(records):
+    """Attach MTF S/R to scanner records. Uses Current, then Entry as fallback.
+
+    The original V13 expected a Current field that V10 did not emit, which
+    caused S/R to be skipped. This version accepts either field.
+    """
     enriched = []
     for r in records or []:
         rr = dict(r)
         pair = rr.get("Pair") or rr.get("pair")
         try:
-            current = float(rr.get("Current"))
+            current = float(rr.get("Current", rr.get("Entry")))
         except Exception:
+            rr["MTF_SR"] = {}
             enriched.append(rr)
             continue
         try:
@@ -6166,11 +6199,48 @@ def v13_attach_sr_to_records(records):
                 "1D": get_tf(pair, "1D", 180),
                 "1W": get_tf(pair, "1W", 365),
             }
+            rr["Current"] = v13_format_price(current)
             rr["MTF_SR"] = v13_mtf_support_resistance(tf_data, current)
         except Exception:
             rr["MTF_SR"] = {}
         enriched.append(rr)
     return enriched
+
+
+def v14_sr_distance(current, level):
+    try:
+        current = float(current); level = float(level)
+        if current <= 0 or level <= 0:
+            return None
+        return (level-current)/current*100.0
+    except Exception:
+        return None
+
+def v14_sr_summary(sr, current):
+    """Create nearest multi-timeframe S/R and trading-room summary."""
+    out = {"nearest_support": None, "nearest_resistance": None, "support_tf": None, "resistance_tf": None,
+           "support_dist_pct": None, "resistance_dist_pct": None}
+    supports=[]; resistances=[]
+    for tf in V13_SR_TIMEFRAMES:
+        z=sr.get(tf,{}) or {}
+        for k in ("S1","S2","S3"):
+            v=z.get(k)
+            if v is not None:
+                supports.append((float(v),tf,k))
+        for k in ("R1","R2","R3"):
+            v=z.get(k)
+            if v is not None:
+                resistances.append((float(v),tf,k))
+    if supports:
+        # Highest support below current = nearest support.
+        v,tf,k=max((x for x in supports if x[0] < float(current)), key=lambda x:x[0], default=(None,None,None))
+        if v is not None:
+            out.update(nearest_support=v,support_tf=f"{tf} {k}",support_dist_pct=v14_sr_distance(current,v))
+    if resistances:
+        v,tf,k=min((x for x in resistances if x[0] > float(current)), key=lambda x:x[0], default=(None,None,None))
+        if v is not None:
+            out.update(nearest_resistance=v,resistance_tf=f"{tf} {k}",resistance_dist_pct=v14_sr_distance(current,v))
+    return out
 
 
 # ----------------------- V12 ACTIONABLE SIGNAL BOARD ---------------------------
@@ -6200,13 +6270,29 @@ def v12_signal_row(r):
         "Entry Trigger": r.get("Entry Trigger"),
         "Invalidation": r.get("Invalidation"),
         "15m S1": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("S1"),
+        "15m S2": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("S2"),
+        "15m S3": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("S3"),
         "15m R1": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("R1"),
+        "15m R2": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("R2"),
+        "15m R3": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("R3"),
         "4H S1": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("S1"),
+        "4H S2": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("S2"),
+        "4H S3": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("S3"),
         "4H R1": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("R1"),
+        "4H R2": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("R2"),
+        "4H R3": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("R3"),
         "1D S1": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("S1"),
+        "1D S2": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("S2"),
+        "1D S3": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("S3"),
         "1D R1": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("R1"),
+        "1D R2": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("R2"),
+        "1D R3": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("R3"),
         "1W S1": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("S1"),
+        "1W S2": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("S2"),
+        "1W S3": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("S3"),
         "1W R1": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("R1"),
+        "1W R2": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("R2"),
+        "1W R3": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("R3"),
         "Why": r.get("Reasons"),
     }
 
@@ -6290,10 +6376,10 @@ def v12_render_signal_cards(records, title="🎯 ACTIONABLE MANUAL TRADING SIGNA
 
 
 st.divider()
-st.subheader("🎯 V12 — Actionable Manual Trading Signals")
+st.subheader("🎯 V14 — Actionable Manual Trading Signals + MTF S/R")
 st.caption(
-    "The agent scans the whole Futures universe, gives you the actual LONG/SHORT decision, and maps 15m/4H/1D/1W support and resistance. "
-    "decision. The paper trader uses the same signal; you can trade it manually on CoinDCX."
+    "The agent scans the whole Futures universe for actionable LONG/SHORT setups. "
+    "Every individually analyzed coin also receives 15m/4H/1D/1W support and resistance."
 )
 
 v12_min = st.slider(
