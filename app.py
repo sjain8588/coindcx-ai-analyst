@@ -4034,6 +4034,350 @@ def v6_resolve_live_price(prices, pair):
     return None
 
 
+
+# =============================================================================
+# V8 EXTREME EDGE RADAR — ATH / NEAR-ATH / ATL / NEAR-ATL
+# =============================================================================
+V8_EXTREME_NEAR_PCT = 2.0
+V8_EXTREME_MIN_SCORE = 72
+
+
+def v8_extreme_edge_signal(pair, symbol, tf_data, current):
+    """
+    Decide whether an ATH/near-ATH or ATL/near-ATL condition is a valid
+    directional paper-trade setup.
+
+    Important:
+      - Being at an extreme is NOT itself a short/long signal.
+      - ATH: LONG requires breakout/continuation evidence. SHORT requires
+        rejection + bearish structure evidence.
+      - ATL: SHORT requires breakdown/continuation evidence. LONG requires
+        rejection + bullish structure evidence.
+      - All structure/EMA calculations use completed candles.
+    """
+    try:
+        d1 = tf_data.get("1D")
+        d15 = tf_data.get("15m")
+        d1h = tf_data.get("1H")
+        d4 = tf_data.get("4H")
+        if any(x is None or x.empty for x in (d1, d15, d1h, d4)):
+            return None
+
+        x1 = completed(d1)
+        x15 = completed(d15)
+        x1h = completed(d1h)
+        if len(x1) < 30 or len(x15) < 30 or len(x1h) < 30:
+            return None
+
+        price = float(current)
+        if not np.isfinite(price) or price <= 0:
+            return None
+
+        # Exclude today's still-forming daily candle from the extreme reference.
+        hist = x1.iloc[:-1] if len(x1) > 2 else x1
+        ath = float(pd.to_numeric(hist.high, errors="coerce").max())
+        atl = float(pd.to_numeric(hist.low, errors="coerce").min())
+        if not np.isfinite(ath) or not np.isfinite(atl) or ath <= 0 or atl <= 0:
+            return None
+
+        dist_ath = (price / ath - 1.0) * 100.0
+        dist_atl = (price / atl - 1.0) * 100.0
+
+        # "ATH" means a fresh break; "NEAR ATH" means within 2% below the
+        # historical high. Mirror logic is used for ATL.
+        ath_state = "ATH" if price >= ath else "NEAR ATH" if dist_ath >= -V8_EXTREME_NEAR_PCT else None
+        atl_state = "ATL" if price <= atl else "NEAR ATL" if dist_atl <= V8_EXTREME_NEAR_PCT else None
+        if not ath_state and not atl_state:
+            return None
+
+        s15 = v71_structure_tf(x15, "15m")
+        s1h = v71_structure_tf(x1h, "1H")
+        e15 = v71_ema_transition(x15, 8)
+        e4 = v71_ema_transition(d4, 6)
+        ind15 = indicators(x15)
+        ind4 = indicators(completed(d4))
+        if ind15.empty or ind4.empty:
+            return None
+        r15 = ind15.iloc[-1]
+        r4 = ind4.iloc[-1]
+        vol = v6_num(r15.get("vol_ratio"), 1.0)
+        rsi = v6_num(r15.get("rsi"), 50.0)
+        macd = v6_num(r15.get("macd"), 0.0)
+        macd_sig = v6_num(r15.get("macd_signal"), 0.0)
+
+        # Detect whether price actually tested the extreme recently.
+        recent15 = x15.tail(12)
+        recent_high = float(pd.to_numeric(recent15.high, errors="coerce").max())
+        recent_low = float(pd.to_numeric(recent15.low, errors="coerce").min())
+        ath_test = np.isfinite(recent_high) and recent_high >= ath * 0.995
+        atl_test = np.isfinite(recent_low) and recent_low <= atl * 1.005
+
+        results = []
+
+        # ---------------- ATH / NEAR ATH ----------------
+        if ath_state:
+            long_score = 0
+            long_reasons = [ath_state]
+            short_score = 0
+            short_reasons = [ath_state]
+            long_blockers = []
+            short_blockers = []
+
+            # Breakout/continuation side.
+            if price > ath:
+                long_score += 32
+                long_reasons.append("price is above prior ATH")
+            elif dist_ath >= -1.0:
+                long_score += 18
+                long_reasons.append("price is within 1% of ATH")
+            else:
+                long_score += 10
+                long_reasons.append("price is within 2% of ATH")
+
+            if s15.get("hh") and s15.get("hl"):
+                long_score += 25; long_reasons.append("15m HH + HL")
+            elif s15.get("hh") or s15.get("hl"):
+                long_score += 12; long_reasons.append("15m early HH/HL")
+            if s1h.get("hh") and s1h.get("hl"):
+                long_score += 15; long_reasons.append("1H HH + HL")
+            elif s1h.get("hh") or s1h.get("hl"):
+                long_score += 7; long_reasons.append("1H improving structure")
+            if e15.get("bullish"):
+                long_score += 6; long_reasons.append("15m EMA20 > EMA100")
+            if e15.get("fresh_bullish"):
+                long_score += 8; long_reasons.append("fresh 15m bullish EMA cross")
+            if e4.get("bullish"):
+                long_score += 6; long_reasons.append("4H EMA20 > EMA100")
+            if e4.get("fresh_bullish"):
+                long_score += 10; long_reasons.append("fresh 4H bullish EMA cross")
+            if macd > macd_sig:
+                long_score += 5; long_reasons.append("15m MACD bullish")
+            if vol >= 1.25:
+                long_score += 8; long_reasons.append(f"volume {vol:.1f}x")
+            if rsi >= 82 and price <= ath * 1.015:
+                long_blockers.append("momentum is highly extended near ATH")
+                long_score -= 12
+
+            # Rejection side: touching ATH is not enough; demand bearish structure.
+            if ath_test:
+                short_score += 20
+                short_reasons.append("recent 15m test of ATH")
+            if price < ath:
+                short_score += 15
+                short_reasons.append("price rejected back below ATH")
+            if s15.get("lh") and s15.get("ll"):
+                short_score += 30; short_reasons.append("15m LH + LL")
+            elif s15.get("lh") or s15.get("ll"):
+                short_score += 15; short_reasons.append("15m early LH/LL")
+            if s1h.get("lh") and s1h.get("ll"):
+                short_score += 15; short_reasons.append("1H LH + LL")
+            elif s1h.get("lh") or s1h.get("ll"):
+                short_score += 7; short_reasons.append("1H weakening structure")
+            if e15.get("bearish"):
+                short_score += 6; short_reasons.append("15m EMA20 < EMA100")
+            if e15.get("fresh_bearish"):
+                short_score += 8; short_reasons.append("fresh 15m bearish EMA cross")
+            if e4.get("bearish"):
+                short_score += 6; short_reasons.append("4H EMA20 < EMA100")
+            if e4.get("fresh_bearish"):
+                short_score += 10; short_reasons.append("fresh 4H bearish EMA cross")
+            if macd < macd_sig:
+                short_score += 5; short_reasons.append("15m MACD bearish")
+            if vol >= 1.25:
+                short_score += 7; short_reasons.append(f"volume {vol:.1f}x")
+            if price >= ath and not (s15.get("lh") and s15.get("ll")):
+                short_blockers.append("no confirmed rejection structure; do not blindly short ATH")
+
+            results.extend([
+                ("LONG", max(0, min(100, int(long_score))), long_reasons, long_blockers),
+                ("SHORT", max(0, min(100, int(short_score))), short_reasons, short_blockers),
+            ])
+
+        # ---------------- ATL / NEAR ATL ----------------
+        if atl_state:
+            short_score = 0
+            short_reasons = [atl_state]
+            long_score = 0
+            long_reasons = [atl_state]
+            short_blockers = []
+            long_blockers = []
+
+            # Breakdown/continuation side.
+            if price < atl:
+                short_score += 32
+                short_reasons.append("price is below prior ATL")
+            elif dist_atl <= 1.0:
+                short_score += 18
+                short_reasons.append("price is within 1% of ATL")
+            else:
+                short_score += 10
+                short_reasons.append("price is within 2% of ATL")
+
+            if s15.get("lh") and s15.get("ll"):
+                short_score += 25; short_reasons.append("15m LH + LL")
+            elif s15.get("lh") or s15.get("ll"):
+                short_score += 12; short_reasons.append("15m early LH/LL")
+            if s1h.get("lh") and s1h.get("ll"):
+                short_score += 15; short_reasons.append("1H LH + LL")
+            elif s1h.get("lh") or s1h.get("ll"):
+                short_score += 7; short_reasons.append("1H weakening structure")
+            if e15.get("bearish"):
+                short_score += 6; short_reasons.append("15m EMA20 < EMA100")
+            if e15.get("fresh_bearish"):
+                short_score += 8; short_reasons.append("fresh 15m bearish EMA cross")
+            if e4.get("bearish"):
+                short_score += 6; short_reasons.append("4H EMA20 < EMA100")
+            if e4.get("fresh_bearish"):
+                short_score += 10; short_reasons.append("fresh 4H bearish EMA cross")
+            if macd < macd_sig:
+                short_score += 5; short_reasons.append("15m MACD bearish")
+            if vol >= 1.25:
+                short_score += 8; short_reasons.append(f"volume {vol:.1f}x")
+            if rsi <= 18 and price <= atl * 1.015:
+                short_blockers.append("momentum is highly extended near ATL")
+                short_score -= 12
+
+            # Rebound side: touching ATL is not enough; demand bullish structure.
+            if atl_test:
+                long_score += 20
+                long_reasons.append("recent 15m test of ATL")
+            if price > atl:
+                long_score += 15
+                long_reasons.append("price rejected back above ATL")
+            if s15.get("hh") and s15.get("hl"):
+                long_score += 30; long_reasons.append("15m HH + HL")
+            elif s15.get("hh") or s15.get("hl"):
+                long_score += 15; long_reasons.append("15m early HH/HL")
+            if s1h.get("hh") and s1h.get("hl"):
+                long_score += 15; long_reasons.append("1H HH + HL")
+            elif s1h.get("hh") or s1h.get("hl"):
+                long_score += 7; long_reasons.append("1H improving structure")
+            if e15.get("bullish"):
+                long_score += 6; long_reasons.append("15m EMA20 > EMA100")
+            if e15.get("fresh_bullish"):
+                long_score += 8; long_reasons.append("fresh 15m bullish EMA cross")
+            if e4.get("bullish"):
+                long_score += 6; long_reasons.append("4H EMA20 > EMA100")
+            if e4.get("fresh_bullish"):
+                long_score += 10; long_reasons.append("fresh 4H bullish EMA cross")
+            if macd > macd_sig:
+                long_score += 5; long_reasons.append("15m MACD bullish")
+            if vol >= 1.25:
+                long_score += 7; long_reasons.append(f"volume {vol:.1f}x")
+            if price <= atl and not (s15.get("hh") and s15.get("hl")):
+                long_blockers.append("no confirmed rebound structure; do not blindly buy ATL")
+
+            results.extend([
+                ("SHORT", max(0, min(100, int(short_score))), short_reasons, short_blockers),
+                ("LONG", max(0, min(100, int(long_score))), long_reasons, long_blockers),
+            ])
+
+        # Keep only the strongest side and require the extreme-specific rules.
+        valid = []
+        for side, score, reasons, blockers in results:
+            hard_reject = any("do not blindly" in b.lower() for b in blockers)
+            if score >= V8_EXTREME_MIN_SCORE and not hard_reject:
+                valid.append((side, score, reasons, blockers))
+
+        if not valid:
+            # Still return the radar state so UI can explain WAIT.
+            best = max(results, key=lambda z: z[1]) if results else None
+            return {
+                "pair": pair, "symbol": symbol, "price": price,
+                "extreme": ath_state or atl_state,
+                "ath": ath, "atl": atl,
+                "dist_ath_pct": dist_ath, "dist_atl_pct": dist_atl,
+                "side": "WAIT",
+                "score": int(best[1]) if best else 0,
+                "reasons": (best[2] if best else [])[:8],
+                "blockers": (best[3] if best else [])[:8],
+                "valid": False,
+                "entry": price,
+                "structure15": s15.get("state"),
+                "structure1h": s1h.get("state"),
+            }
+
+        # If both ATH and ATL are technically in range (possible only with
+        # extremely compressed data), choose the strongest side.
+        side, score, reasons, blockers = max(valid, key=lambda z: z[1])
+        return {
+            "pair": pair, "symbol": symbol, "price": price,
+            "extreme": ath_state or atl_state,
+            "ath": ath, "atl": atl,
+            "dist_ath_pct": dist_ath, "dist_atl_pct": dist_atl,
+            "side": side, "score": int(score), "reasons": reasons[:10],
+            "blockers": blockers[:8], "valid": True, "entry": price,
+            "structure15": s15.get("state"), "structure1h": s1h.get("state"),
+        }
+    except Exception:
+        return None
+
+
+def v8_extreme_record(ext):
+    """Convert an extreme signal into the common strategy-journal record shape."""
+    if not ext:
+        return None
+    side = ext.get("side")
+    score = int(v6_num(ext.get("score"), 0))
+    if side not in ("LONG", "SHORT"):
+        return {
+            "Coin": ext.get("symbol", ext.get("pair", "")),
+            "Pair": ext.get("pair", ""),
+            "Direction": "WAIT",
+            "Score": score,
+            "Valid": "WAIT",
+            "Regime": ext.get("extreme", ""),
+            "15m Structure": ext.get("structure15", ""),
+            "Volume": "—",
+            "Entry": fmt(ext.get("entry")),
+            "Stop": "—", "TP1": "—", "TP2": "—", "TP3": "—",
+            "Blockers": "; ".join(ext.get("blockers", [])) or "—",
+            "Reasons": " | ".join(ext.get("reasons", [])[:6]),
+            "Extreme": ext.get("extreme", ""),
+            "ATH": fmt(ext.get("ath")),
+            "ATL": fmt(ext.get("atl")),
+            "Distance ATH %": ext.get("dist_ath_pct"),
+            "Distance ATL %": ext.get("dist_atl_pct"),
+            "setup": {
+                "direction": "WAIT", "score": score, "entry": ext.get("entry"),
+                "structure15": ext.get("structure15", ""),
+                "regime": ext.get("extreme", ""),
+                "reasons": ext.get("reasons", []),
+                "blockers": ext.get("blockers", []),
+                "extreme": ext.get("extreme", ""),
+            },
+        }
+    setup = {
+        "direction": side, "score": score, "entry": ext.get("entry"),
+        "stop": np.nan, "tp1": np.nan, "tp2": np.nan, "tp3": np.nan,
+        "structure15": ext.get("structure15", ""),
+        "regime": ext.get("extreme", ""),
+        "reasons": ext.get("reasons", []),
+        "blockers": ext.get("blockers", []),
+        "extreme": ext.get("extreme", ""),
+    }
+    return {
+        "Coin": ext.get("symbol", ext.get("pair", "")),
+        "Pair": ext.get("pair", ""),
+        "Direction": side, "Score": score,
+        "Valid": "✅ TRADE CANDIDATE",
+        "Regime": ext.get("extreme", ""),
+        "15m Structure": ext.get("structure15", ""),
+        "Volume": "—",
+        "Entry": fmt(ext.get("entry")),
+        "Stop": "—", "TP1": "—", "TP2": "—", "TP3": "—",
+        "Blockers": "; ".join(ext.get("blockers", [])) or "—",
+        "Reasons": " | ".join(ext.get("reasons", [])[:6]),
+        "Extreme": ext.get("extreme", ""),
+        "ATH": fmt(ext.get("ath")),
+        "ATL": fmt(ext.get("atl")),
+        "Distance ATH %": ext.get("dist_ath_pct"),
+        "Distance ATL %": ext.get("dist_atl_pct"),
+        "setup": setup,
+        "source": "V8 EXTREME EDGE",
+    }
+
+
 def v6_run_market_scan(scan_limit, cfg):
     """Run the same V6 deterministic scan used by the manual button."""
     prices = futures_prices()
@@ -4083,6 +4427,15 @@ def v6_run_market_scan(scan_limit, cfg):
                     "Blockers": "; ".join(setup["blockers"]) if setup["blockers"] else "—",
                     "Reasons": " | ".join(setup["reasons"][:4]), "setup": setup,
                 })
+            # Extreme Edge Radar: ATH / near-ATH / ATL / near-ATL.
+            # This is intentionally evaluated separately from the generic V6
+            # setup engine so an extreme coin is not shorted merely because
+            # RSI is high, or bought merely because RSI is low.
+            ext = v8_extreme_edge_signal(pair, symbol, tf_data, cur)
+            if ext:
+                er = v8_extreme_record(ext)
+                if er:
+                    records.append(er)
         except Exception as exc:
             failures.append(f"{pair}: {type(exc).__name__}: {exc}")
     records.sort(key=lambda r: (r["Valid"] != "✅ TRADE CANDIDATE", -r["Score"]))
@@ -4107,26 +4460,47 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
     # Autonomous strategy paper trading: every qualifying signal is treated as a
     # paper trade. No TP/SL is required; the position is evaluated by forward price
     # movement (1H/4H/8H/24H).
+    # Build the autonomous journal only from the Extreme Edge records.
+    extreme_records = [
+        r for r in records
+        if r.get("source") == "V8 EXTREME EDGE"
+        and r.get("Valid") == "✅ TRADE CANDIDATE"
+    ]
     try:
-        _, lab_added = v7_strategy_lab_cycle(records)
+        _, lab_added = v7_strategy_lab_cycle(extreme_records)
     except Exception as exc:
         lab_added = []
         failures.append(f"strategy_paper: {type(exc).__name__}: {exc}")
 
-    valid = [r for r in records if r["Valid"] == "✅ TRADE CANDIDATE"]
-    # Only one position per contract; if both directions qualify, take the stronger one.
+    # V8 Extreme Edge is the autonomous paper-trading focus: ATH/near-ATH and
+    # ATL/near-ATL only. Generic V6 signals remain visible in the app but do not
+    # become autonomous paper trades in this mode.
+    extreme_valid = [
+        r for r in records
+        if r.get("source") == "V8 EXTREME EDGE"
+        and r.get("Valid") == "✅ TRADE CANDIDATE"
+        and r.get("Direction") in ("LONG", "SHORT")
+    ]
+
+    # Keep one direction per contract and let the strongest extreme setup win.
     best_by_pair = {}
-    for r in valid:
+    for r in extreme_valid:
         pair = r["Pair"]
         if pair not in best_by_pair or r["Score"] > best_by_pair[pair]["Score"]:
             best_by_pair[pair] = r
-    candidates = sorted(best_by_pair.values(), key=lambda r: r["Score"], reverse=True)
+    extreme_candidates = sorted(best_by_pair.values(), key=lambda r: r["Score"], reverse=True)
 
-    # For the simple strategy test, the qualifying signals themselves are the
-    # autonomous paper trades. Do not force TP/SL or risk-sizing rules here.
-    opened = list(lab_added)
-    skipped = []
-    msg = f"Auto cycle: scanned {scanned} contracts | {len(valid)} qualifying setups | opened {len(opened)} strategy paper trade(s)"
+    # Only extreme-edge qualifying signals become autonomous paper trades.
+    # No TP/SL is forced; the strategy journal evaluates forward 1H/4H/8H/24H.
+    # Filter the lab additions to the extreme source for the message/display.
+    extreme_pairs = {r["Pair"] for r in extreme_candidates}
+    opened = [s for s in lab_added if s.get("pair") in extreme_pairs]
+    skipped = [s for s in lab_added if s.get("pair") not in extreme_pairs]
+    msg = (
+        f"Auto cycle: scanned {scanned} contracts | "
+        f"{len(extreme_valid)} ATH/ATL qualifying setups | "
+        f"opened {len(opened)} extreme-edge paper trade(s)"
+    )
     return records, failures, scanned, opened, skipped, msg
 
 
@@ -4136,6 +4510,11 @@ def v6_autonomous_paper_cycle(balance, risk_pct, leverage, cfg, scan_limit, max_
 st.divider()
 st.header("🤖 V6 Professional Intraday Futures Agent")
 st.caption("V5 historical learning + multi-timeframe regime + LONG/SHORT scoring + autonomous strategy paper tracking.")
+st.info(
+    "🎯 V8 Extreme Edge mode: the autonomous paper trader focuses on **ATH / near-ATH** and "
+    "**ATL / near-ATL** coins. ATH is not automatically a SHORT and ATL is not automatically a LONG. "
+    "The agent requires breakout/continuation or rejection/breakdown structure before paper trading."
+)
 
 with st.expander("⚙️ V6 Risk Controls", expanded=False):
     vc1, vc2, vc3, vc4 = st.columns(4)
@@ -5312,6 +5691,34 @@ def v71_scan_from_existing(scan):
         })
     return rows
 
+
+
+# --------------------------- V8 EXTREME EDGE UI -------------------------------
+if st.session_state.get("v6_scan_results"):
+    _all_v8 = st.session_state.get("v6_scan_results", [])
+    _extreme_watch = [r for r in _all_v8 if r.get("source") == "V8 EXTREME EDGE"]
+    if _extreme_watch:
+        st.subheader("🎯 ATH / ATL Extreme Edge Radar")
+        st.caption(
+            "ATH is not automatically a SHORT and ATL is not automatically a LONG. "
+            "The agent waits for breakout/continuation or rejection/breakdown structure."
+        )
+        _ew = []
+        for r in _extreme_watch:
+            _ew.append({
+                "Coin": r.get("Coin"),
+                "Extreme": r.get("Extreme"),
+                "Side": r.get("Direction"),
+                "Score": r.get("Score"),
+                "Price": r.get("Entry"),
+                "Distance ATH %": r.get("Distance ATH %"),
+                "Distance ATL %": r.get("Distance ATL %"),
+                "15m Structure": r.get("15m Structure"),
+                "Decision": "PAPER TRADE" if r.get("Valid") == "✅ TRADE CANDIDATE" else "WAIT",
+                "Why": r.get("Reasons"),
+                "Blockers": r.get("Blockers"),
+            })
+        st.dataframe(pd.DataFrame(_ew), use_container_width=True, hide_index=True)
 
 # --------------------------- V7 UI -------------------------------------------
 st.divider()
