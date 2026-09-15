@@ -2753,7 +2753,15 @@ def v61_scan_all(progress=None, max_workers=6):
     15m candle supplies the current price.  This prevents a valid 500+ contract
     universe from collapsing to zero because of a feed-key naming difference.
     """
-    instruments = active_instruments("USDT")
+    try:
+        instruments = active_instruments("USDT")
+    except Exception as e:
+        try:
+            st.session_state["v24_data_ok"] = 0
+            st.session_state["v24_scan_errors"] = [f"Futures universe: {type(e).__name__}: {e}"]
+        except Exception:
+            pass
+        return [], 0
     try:
         prices = futures_prices()
     except Exception:
@@ -3970,16 +3978,15 @@ def v23_yesterday_pump_today_fall(d1, current, today_structure):
         return out
 
 
-def v23_unified_scan(progress=None, max_workers=6):
-    """ONE market-wide scan. Every usable contract gets one plain-language answer.
+def v23_unified_scan(progress=None, max_workers=4):
+    """Reliable ONE-button market scan.
 
-    The same scan produces:
-      * 15m HH/HL/LH/LL structure
-      * 1H/4H trend confirmation
-      * yesterday-pump/today-fall context
-      * extreme multi-day context
-      * 15m/4H/1D/1W support and resistance
-      * LONG / SHORT / WATCH / WAIT classification
+    Phase 1: fetch only completed 15m candles for every active Futures contract.
+    This guarantees that the basic HH/HL/LH/LL answer is not blocked by the
+    much larger multi-timeframe request load.
+
+    Phase 2: enrich only the strongest LONG/SHORT/WATCH candidates with 1H,
+    4H, 1D and 1W data, including MTF S/R and extreme-move context.
     """
     instruments = active_instruments("USDT")
     try:
@@ -3998,159 +4005,148 @@ def v23_unified_scan(progress=None, max_workers=6):
         seen.add(canonical)
         live = v61_price_for_pair(prices, pair)
         symbol = v61_symbol(inst, pair)
-        if meme_only and not any(w in symbol or w in canonical for w in MEME_WORDS):
+        if meme_only and not any(w in symbol.upper() or w in canonical for w in MEME_WORDS):
             continue
         items.append((pair, symbol, live))
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
 
-    def _fetch(item):
+    def fetch_15m(item):
         pair, symbol, live = item
-        try:
-            # 1W is derived from 1D by the S/R engine when not supplied.
-            tf = {
-                "15m": get_tf(pair, "15m", 12),
-                "1H": get_tf(pair, "1H", 45),
-                "4H": get_tf(pair, "4H", 120),
-                "1D": get_tf(pair, "1D", 180),
-            }
-            price = live
-            if not np.isfinite(price) or price <= 0:
-                c = completed(tf["15m"])
-                if c is not None and not c.empty:
-                    price = v6_num(c.iloc[-1].get("close"), np.nan)
-            if not np.isfinite(price) or price <= 0:
-                return None
-
-            today = simple_today_structure(tf["15m"])
-            # Optional layers must never make the whole coin disappear. If one
-            # detector fails, the basic HH/HL/LH/LL result still survives.
+        last_err = ""
+        for attempt in range(3):
             try:
-                sr = v13_mtf_support_resistance(tf, price)
-                sr_summary = v14_sr_summary(sr, price)
-            except Exception:
-                sr, sr_summary = {}, {"nearest_support": None, "nearest_resistance": None,
-                                      "support_tf": None, "resistance_tf": None,
-                                      "support_dist_pct": None, "resistance_dist_pct": None}
-            try:
-                extreme = v10_extreme_move_signal(pair, symbol, tf, price)
-            except Exception:
-                extreme = None
-            try:
-                yesterday = v23_yesterday_pump_today_fall(tf["1D"], price, today)
-            except Exception:
-                yesterday = {"flag": False, "pump_pct": np.nan,
-                             "today_vs_yesterday_close_pct": np.nan, "reason": ""}
+                d15 = get_tf(pair, "15m", 10)
+                d15 = completed(d15)
+                if d15 is None or d15.empty or len(d15) < 12:
+                    raise RuntimeError("insufficient completed 15m candles")
+                price = live
+                if not np.isfinite(price) or price <= 0:
+                    price = v6_num(d15.iloc[-1].get("close"), np.nan)
+                if not np.isfinite(price) or price <= 0:
+                    raise RuntimeError("no valid current price")
+                today = simple_today_structure(d15)
+                return {"pair": pair, "symbol": symbol, "price": float(price),
+                        "d15": d15, "today": today, "error": ""}
+            except Exception as e:
+                last_err = f"{type(e).__name__}: {e}"
+                if attempt < 2:
+                    time.sleep(0.35 * (attempt + 1))
+        return {"pair": pair, "symbol": symbol, "price": live,
+                "d15": None, "today": {"label":"⚪ DATA UNAVAILABLE", "side":"DATA"},
+                "error": last_err}
 
-            # Higher-timeframe direction.  These are confirmations, not the
-            # primary structure signal.
-            try:
-                i4 = indicators(completed(tf["4H"]))
-            except Exception:
-                i4 = pd.DataFrame()
-            try:
-                i1 = indicators(completed(tf["1H"]))
-            except Exception:
-                i1 = pd.DataFrame()
-            four_bull = four_bear = one_bull = one_bear = False
-            if i4 is not None and not i4.empty:
-                q = i4.iloc[-1]
-                close, e20, e50 = v6_num(q.get("close"), np.nan), v6_num(q.get("ema20"), np.nan), v6_num(q.get("ema50"), np.nan)
-                four_bull = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close > e20 > e50)
-                four_bear = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close < e20 < e50)
-            if i1 is not None and not i1.empty:
-                q = i1.iloc[-1]
-                close, e20, e50 = v6_num(q.get("close"), np.nan), v6_num(q.get("ema20"), np.nan), v6_num(q.get("ema50"), np.nan)
-                one_bull = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close > e20 > e50)
-                one_bear = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close < e20 < e50)
-
-            side = today.get("side", "WAIT")
-            score = 0
-            reasons = []
-            if side == "LONG":
-                score = 70; reasons.append("15m Higher High + Higher Low")
-                if one_bull: score += 8; reasons.append("1H bullish")
-                if four_bull: score += 10; reasons.append("4H bullish")
-                if one_bear: score -= 8; reasons.append("1H bearish conflict")
-                if four_bear: score -= 12; reasons.append("4H bearish conflict")
-            elif side == "SHORT":
-                score = 70; reasons.append("15m Lower High + Lower Low")
-                if one_bear: score += 8; reasons.append("1H bearish")
-                if four_bear: score += 10; reasons.append("4H bearish")
-                if one_bull: score -= 8; reasons.append("1H bullish conflict")
-                if four_bull: score -= 12; reasons.append("4H bullish conflict")
-            elif side == "WATCH LONG":
-                score = 45; reasons.append("developing HH/HL")
-            elif side == "WATCH SHORT":
-                score = 45; reasons.append("developing LH/LL")
-            else:
-                score = 20; reasons.append("no clear 15m structure")
-
-            # Explicit yesterday-pump -> today-fall setup.  It can upgrade a
-            # bearish structure, but never creates a SHORT without LH+LL.
-            if yesterday.get("flag"):
-                reasons.append(yesterday["reason"])
-                if side == "SHORT":
-                    score += 15
-                elif side == "WATCH SHORT":
-                    score += 10
-
-            if extreme:
-                eside = str(extreme.get("side", "WAIT")).upper()
-                if extreme.get("valid") and eside == side:
-                    score += 12; reasons.append("extreme-move confirmation agrees")
-                elif extreme.get("valid") and eside in ("LONG", "SHORT") and eside != side:
-                    score -= 12; reasons.append("extreme-move direction conflict")
-
-            room = sr_summary.get("resistance_dist_pct") if side == "LONG" else sr_summary.get("support_dist_pct") if side == "SHORT" else None
-            if room is not None:
-                if room < 2:
-                    score -= 15; reasons.append("major level very close")
-                elif room >= 5:
-                    score += 3; reasons.append("reasonable room")
-
-            score = int(max(0, min(100, score)))
-            if side == "LONG" and score >= 70:
-                decision = "🟢 LONG TODAY"
-            elif side == "SHORT" and score >= 70:
-                decision = "🔴 SHORT TODAY"
-            elif side == "WATCH LONG":
-                decision = "🟡 WATCH LONG"
-            elif side == "WATCH SHORT":
-                decision = "🟠 WATCH SHORT"
-            else:
-                decision = "⚪ WAIT"
-
-            return {
-                "pair": pair, "symbol": symbol, "price": float(price),
-                "today": today, "decision": decision, "score": score,
-                "reasons": reasons[:10], "extreme": extreme, "sr": sr,
-                "sr_summary": sr_summary, "yesterday": yesterday,
-                "one_hour": "BULLISH" if one_bull else "BEARISH" if one_bear else "MIXED",
-                "four_hour": "BULLISH" if four_bull else "BEARISH" if four_bear else "MIXED",
-            }
-        except Exception:
-            return None
-
-    results, done = [], 0
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        futs = [ex.submit(_fetch, item) for item in items]
+    phase1, errors = [], []
+    done = 0
+    workers = max(2, min(int(max_workers), 4))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(fetch_15m, item) for item in items]
         for fut in as_completed(futs):
             done += 1
             if progress:
-                progress(done, len(items))
+                progress(done, len(items), f"Reading 15m structure {done}/{len(items)}…")
             try:
                 r = fut.result()
+            except Exception as e:
+                r = {"pair":"", "symbol":"", "price":np.nan, "d15":None,
+                     "today":{"label":"⚪ DATA UNAVAILABLE","side":"DATA"},
+                     "error":f"{type(e).__name__}: {e}"}
+            if r.get("d15") is not None:
+                phase1.append(r)
+            elif r.get("error"):
+                errors.append(f"{r.get('symbol')}: {r.get('error')}")
+
+    # Basic score from structure alone. This is deliberately simple and does
+    # not require the old 78/100 filter.
+    for r in phase1:
+        t = r["today"]
+        side = t.get("side", "WAIT")
+        score = 90 if side in ("LONG", "SHORT") else 55 if side in ("WATCH LONG", "WATCH SHORT") else 20
+        r["score"] = score
+        r["one_hour"] = "NOT CHECKED"
+        r["four_hour"] = "NOT CHECKED"
+        r["extreme"] = None
+        r["yesterday"] = {"flag":False,"pump_pct":np.nan,"today_vs_yesterday_close_pct":np.nan,"reason":""}
+        r["sr"] = {}
+        r["sr_summary"] = {"nearest_support":None,"nearest_resistance":None,
+                            "support_tf":None,"resistance_tf":None,
+                            "support_dist_pct":None,"resistance_dist_pct":None}
+        if side == "LONG": r["decision"] = "🟢 LONG TODAY"
+        elif side == "SHORT": r["decision"] = "🔴 SHORT TODAY"
+        elif side == "WATCH LONG": r["decision"] = "🟡 WATCH LONG"
+        elif side == "WATCH SHORT": r["decision"] = "🟠 WATCH SHORT"
+        else: r["decision"] = "⚪ WAIT"
+        r["reasons"] = [t.get("label", "No clear structure")]
+
+    # Enrich only the most useful candidates. This prevents 500 x 4 API calls
+    # from starving the primary 15m market scan.
+    priority = {"🟢 LONG TODAY":0,"🔴 SHORT TODAY":1,"🟡 WATCH LONG":2,"🟠 WATCH SHORT":3,"⚪ WAIT":4}
+    phase1.sort(key=lambda r:(priority.get(r["decision"],9), -r["score"]))
+    enrich = [r for r in phase1 if r["decision"] in ("🟢 LONG TODAY","🔴 SHORT TODAY","🟡 WATCH LONG","🟠 WATCH SHORT")][:40]
+
+    for r in enrich:
+        pair, symbol, price = r["pair"], r["symbol"], r["price"]
+        tf = {"15m": r["d15"]}
+        try: tf["1H"] = get_tf(pair,"1H",30)
+        except Exception: tf["1H"] = pd.DataFrame()
+        try: tf["4H"] = get_tf(pair,"4H",90)
+        except Exception: tf["4H"] = pd.DataFrame()
+        try: tf["1D"] = get_tf(pair,"1D",180)
+        except Exception: tf["1D"] = pd.DataFrame()
+        try:
+            tf["1W"] = resample_weekly(tf["1D"])
+        except Exception:
+            tf["1W"] = pd.DataFrame()
+
+        try:
+            sr = v13_mtf_support_resistance(tf, price)
+            r["sr"] = sr
+            r["sr_summary"] = v14_sr_summary(sr, price)
+        except Exception:
+            pass
+        try:
+            r["extreme"] = v10_extreme_move_signal(pair, symbol, tf, price)
+        except Exception:
+            pass
+        try:
+            r["yesterday"] = v23_yesterday_pump_today_fall(tf["1D"], price, r["today"])
+        except Exception:
+            pass
+
+        for key, label in (("1H","one_hour"),("4H","four_hour")):
+            try:
+                ind = indicators(completed(tf[key]))
+                if ind is not None and not ind.empty:
+                    q=ind.iloc[-1]
+                    c=v6_num(q.get("close"),np.nan); e20=v6_num(q.get("ema20"),np.nan); e50=v6_num(q.get("ema50"),np.nan)
+                    r[label] = "BULLISH" if np.isfinite(c) and np.isfinite(e20) and np.isfinite(e50) and c>e20>e50 else "BEARISH" if np.isfinite(c) and np.isfinite(e20) and np.isfinite(e50) and c<e20<e50 else "MIXED"
             except Exception:
-                r = None
-            if r:
-                results.append(r)
+                pass
 
-    order = {"🟢 LONG TODAY": 0, "🔴 SHORT TODAY": 1, "🟡 WATCH LONG": 2,
-             "🟠 WATCH SHORT": 3, "⚪ WAIT": 4}
-    results.sort(key=lambda r: (order.get(r.get("decision"), 9), -r.get("score", 0)))
-    return results, len(items)
+        # Confirmation is additive, never a reason to hide a valid HH/HL or LH/LL result.
+        if r["decision"] == "🟢 LONG TODAY":
+            if r["one_hour"] == "BULLISH": r["score"] += 5
+            if r["four_hour"] == "BULLISH": r["score"] += 5
+            if r["four_hour"] == "BEARISH": r["score"] -= 5
+        elif r["decision"] == "🔴 SHORT TODAY":
+            if r["one_hour"] == "BEARISH": r["score"] += 5
+            if r["four_hour"] == "BEARISH": r["score"] += 5
+            if r["four_hour"] == "BULLISH": r["score"] -= 5
+        if (r.get("yesterday") or {}).get("flag") and r["decision"] == "🔴 SHORT TODAY":
+            r["score"] += 10
+            r["reasons"].append("🔥 yesterday pump → today fall")
+        r["score"] = int(max(0,min(100,r["score"])))
 
+    phase1.sort(key=lambda r:(priority.get(r["decision"],9), -r["score"]))
+    # Always return every successfully-read 15m coin, including WAIT, so the
+    # user can see that the market was actually analyzed. Store diagnostics so
+    # a zero-result scan never hides the real API/data problem.
+    try:
+        st.session_state["v24_data_ok"] = len(phase1)
+        st.session_state["v24_scan_errors"] = errors[:12]
+    except Exception:
+        pass
+    return phase1, len(items)
 
 def v22_unified_scan(progress=None, max_workers=6):
     # Backward-compatible alias for the single-scan workflow.
@@ -4187,11 +4183,13 @@ def v22_render_market(results):
         if yp.get("flag"):
             st.success(f"🔥 YESTERDAY PUMP → TODAY FALL: +{yp.get('pump_pct', 0):.1f}% yesterday, {yp.get('today_vs_yesterday_close_pct', 0):.1f}% vs yesterday close")
         sm = r.get("sr_summary", {})
+        sdist = sm.get("support_dist_pct")
+        rdist = sm.get("resistance_dist_pct")
+        sdist_txt = f"{sdist:+.2f}%" if isinstance(sdist, (int, float)) and np.isfinite(sdist) else "—"
+        rdist_txt = f"{rdist:+.2f}%" if isinstance(rdist, (int, float)) and np.isfinite(rdist) else "—"
         st.write(
-            f"**Nearest support:** {v13_format_price(sm.get('nearest_support'))} "
-            f"({sm.get('support_dist_pct'):+.2f}% if available)  | "
-            f"**Nearest resistance:** {v13_format_price(sm.get('nearest_resistance'))} "
-            f"({sm.get('resistance_dist_pct'):+.2f}% if available)"
+            f"**Nearest support:** {v13_format_price(sm.get('nearest_support'))} ({sdist_txt})  | "
+            f"**Nearest resistance:** {v13_format_price(sm.get('nearest_resistance'))} ({rdist_txt})"
         )
         with st.expander("📐 15m / 4H / 1D / 1W Support & Resistance", expanded=False):
             st.dataframe(pd.DataFrame(v13_sr_columns(r.get("sr", {}))), use_container_width=True, hide_index=True)
@@ -4237,18 +4235,18 @@ def v22_render_market(results):
 # V22 — SINGLE BUTTON DAILY TRADING WORKFLOW
 # =============================================================================
 st.divider()
-st.subheader("⭐ TODAY'S TRADING OPPORTUNITIES — ONE MARKET SCAN")
+st.subheader("⭐ TODAY'S TRADING OPPORTUNITIES — ONE RELIABLE MARKET SCAN")
 st.caption(
     "ONE scan of the active CoinDCX USDT Futures market. It gives the simple answer first: "
     "HH + HL = bullish, LH + LL = bearish. It also attaches pump/dump context and "
     "15m/4H/1D/1W support and resistance to the same results. No second market scan is required."
 )
 
-v22_workers = st.slider("Concurrent workers", 2, 10, 6, 1, key="v22_workers")
-if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", type="primary", key="v22_market_scan_button"):
+v22_workers = st.slider("Concurrent workers", 2, 6, 4, 1, key="v24_workers")
+if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", type="primary", key="v24_market_scan_button"):
     bar = st.progress(0, text="Scanning all active CoinDCX Futures…")
-    def _v22_progress(done, total):
-        bar.progress(int(done / max(total,1) * 100), text=f"Analyzing {done}/{total} Futures…")
+    def _v22_progress(done, total, text=None):
+        bar.progress(int(done / max(total,1) * 100), text=text or f"Analyzing {done}/{total} Futures…")
     with st.spinner("Building today's structure + extreme-move + MTF S/R view…"):
         _v22_results, _v22_total = v23_unified_scan(_v22_progress, max_workers=v22_workers)
     st.session_state["v22_market_results"] = _v22_results
@@ -4258,10 +4256,19 @@ if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", t
 
 _v22_results = st.session_state.get("v22_market_results", [])
 if _v22_results:
-    st.caption(f"Last scan: {st.session_state.get('v22_market_time','—')} | Contracts scanned: {st.session_state.get('v22_market_total','—')}")
+    st.caption(f"Last scan: {st.session_state.get('v22_market_time','—')} | Contracts scanned: {st.session_state.get('v22_market_total','—')} | 15m data received: {st.session_state.get('v24_data_ok','—')}")
     v22_render_market(_v22_results)
 else:
-    st.info("Click **⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES** to scan the whole Futures market.")
+    if st.session_state.get("v24_data_ok") == 0 and st.session_state.get("v22_market_time"):
+        st.error("The market was discovered, but no usable 15m candle data was returned. This is a data/API issue, not a trading-signal issue.")
+        errs = st.session_state.get("v24_scan_errors", [])
+        if errs:
+            with st.expander("🔧 Show data errors", expanded=True):
+                for err in errs:
+                    st.write(err)
+        st.info("Run the scan again after a short pause. The scanner uses a low worker count and retries each 15m request.")
+    else:
+        st.info("Click **⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES** to scan the whole Futures market. The first pass uses 15m only for all contracts; higher timeframes are fetched only for the best candidates.")
 
 
 # -------------------------- ANY-COIN DEEP MTF S/R ------------------------------
