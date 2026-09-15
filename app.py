@@ -1,91 +1,23 @@
 import streamlit as st
+
 import pandas as pd
+
 import numpy as np
+
 import requests
+
 import time
+
 from datetime import datetime, timezone
 
-# =============================================================================
-# APP
-# =============================================================================
 st.set_page_config(page_title="CoinDCX Futures Trading Agent", page_icon="🎯", layout="wide")
 
-
-# =============================================================================
-# V33 PRIMARY UI — SYMMETRIC PULLBACK ENTRY AGENT
-# =============================================================================
-st.divider()
-st.header("🧠 V33 — Healthy Pullback / Structure Path Agent")
-st.caption(
-    "Primary strategy: do not chase extended moves. LONG waits for bullish HH/HL "
-    "structure + 15m EMA20 support + local-high break. SHORT is the exact reverse: "
-    "LH/LL + EMA20 rejection + local-low break. 4H and 1D levels are reaction zones."
-)
 v33_workers = st.slider("V33 scan workers", 2, 6, 4, 1, key="v33_workers")
-if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v33_scan_button"):
-    bar = st.progress(0, text="Loading active Futures…")
-    try:
-        instruments = active_instruments("USDT")
-        prices = futures_prices()
-        items=[]
-        for inst in instruments:
-            pair = inst.get("pair") if isinstance(inst,dict) else None
-            symbol = inst.get("symbol") if isinstance(inst,dict) else pair
-            if not pair: continue
-            price = None
-            if isinstance(prices,dict):
-                price = prices.get(pair) or prices.get(symbol)
-            if price is None: continue
-            try: price=float(price)
-            except: continue
-            items.append((pair,symbol,price))
-        results=[]
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        def scan15(item):
-            pair,symbol,price=item
-            try:
-                d15=get_tf(pair,"15m",3)
-                if d15 is None or d15.empty: return None
-                p=v33_pullback_signal(d15,price)
-                # Keep directional WATCH/READY states; mixed WAIT is not a trade candidate.
-                if p.get("signal")=="WAIT": return None
-                return {"pair":pair,"symbol":symbol,"price":price,"d15":d15,"v33_pullback":p}
-            except Exception:
-                return None
-        total=len(items)
-        with ThreadPoolExecutor(max_workers=v33_workers) as ex:
-            fs=[ex.submit(scan15,it) for it in items]
-            for i,f in enumerate(as_completed(fs),1):
-                try:
-                    rr=f.result()
-                    if rr: results.append(rr)
-                except Exception: pass
-                bar.progress(int(i/max(total,1)*100),text=f"15m structure {i}/{total}…")
-        # Enrich only the best directional candidates, keeping API load manageable.
-        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score",0)))
-        enrich=results[:30]
-        with ThreadPoolExecutor(max_workers=min(v33_workers,4)) as ex:
-            fs=[ex.submit(v33_attach_mtf_path,r) for r in enrich]
-            for f in as_completed(fs):
-                try: f.result()
-                except Exception: pass
-        results=v33_rank(enrich)
-        st.session_state["v33_results"]=results
-        st.session_state["v33_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        bar.progress(100,text=f"Complete — {total} Futures checked")
-    except Exception as e:
-        st.error(f"V33 scan failed: {e}")
 
 _v33_saved=st.session_state.get("v33_results",[])
-if _v33_saved:
-    st.caption(f"Last V33 scan: {st.session_state.get('v33_time','—')} | candidates: {len(_v33_saved)}")
-    v33_render_tables(_v33_saved)
-else:
-    st.info("Run the V33 market scan to find fresh pullback/retest entries.")
-st.title("🧠 CoinDCX Intraday Trading Agent — V33")
-st.caption("Simple daily trading workflow: find today's structure, check multi-timeframe support/resistance, and investigate extreme pump/dump reversals.")
 
 API = "https://api.coindcx.com"
+
 PUBLIC = "https://public.coindcx.com"
 
 MEME_WORDS = {
@@ -94,10 +26,6 @@ MEME_WORDS = {
     "1000LUNC","PONKE","MYRO","SLERF","LADYS","DEGEN","MOTHER","MAGA","TRUMP"
 }
 
-# =============================================================================
-# COINDCX DATA
-# =============================================================================
-@st.cache_data(ttl=30, show_spinner=False)
 def active_instruments(margin="USDT"):
     """Discover the complete active CoinDCX Futures universe robustly.
 
@@ -205,8 +133,6 @@ def active_instruments(margin="USDT"):
 
     raise RuntimeError("CoinDCX Futures universe discovery failed. " + " | ".join(errors[-5:]))
 
-
-@st.cache_data(ttl=5, show_spinner=False)
 def futures_prices():
     """Return current Futures prices normalized to {pair: price-record}."""
     r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
@@ -252,7 +178,6 @@ def futures_prices():
         raise RuntimeError(f"CoinDCX Futures price feed returned no usable prices (payload_type={type(feed).__name__})")
     return out
 
-@st.cache_data(ttl=60, show_spinner=False)
 def candles(pair, resolution, start_ts, end_ts):
     params = {"pair": pair, "from": int(start_ts), "to": int(end_ts), "resolution": resolution, "pcode": "f"}
     r = requests.get(f"{PUBLIC}/market_data/candlesticks", params=params, timeout=30)
@@ -271,7 +196,6 @@ def candles(pair, resolution, start_ts, end_ts):
     d["time"] = pd.to_datetime(d["time"], unit="ms", errors="coerce", utc=True)
     return d.dropna(subset=["time","open","high","low","close","volume"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_tf(pair, tf, days):
     now = int(time.time())
     if tf == "1W":
@@ -282,9 +206,6 @@ def get_tf(pair, tf, days):
     resolution = {"1m":"1", "5m":"5", "15m":"15", "1H":"60", "4H":"240", "1D":"1D"}[tf]
     return candles(pair, resolution, now - int(days * 86400), now)
 
-# =============================================================================
-# INDICATORS
-# =============================================================================
 def indicators(d):
     x = d.copy()
     if x.empty:
@@ -346,9 +267,6 @@ def structure(d):
         return "Bearish"
     return "Mixed"
 
-# =============================================================================
-# SIMPLE HELPERS
-# =============================================================================
 def fmt(v):
     try:
         if pd.isna(v): return "—"
@@ -389,15 +307,9 @@ def safe(v, default=np.nan):
     except Exception:
         return default
 
-# Backward-compatible numeric helper retained by the V5/V6/V7/V10 engines.
-# V24 cleanup accidentally removed this function, causing every market-candle
-# analysis to fail with NameError: v6_num is not defined.
 def v6_num(v, default=np.nan):
     return safe(v, default)
 
-# =============================================================================
-# MULTI-TIMEFRAME EMA ENGINE
-# =============================================================================
 TF_CONFIG = [("1m",2),("5m",3),("15m",5),("1H",14),("4H",60),("1D",260),("1W",1100)]
 
 def ema_alignment(tf_data):
@@ -422,10 +334,6 @@ def ema_alignment(tf_data):
         elif state == "BEARISH": bearish += 1
         total += 1
     return rows, bullish, bearish, total
-
-# =============================================================================
-# HISTORICAL EVENT / PATTERN ENGINE
-# =============================================================================
 
 def rolling_features(x, i):
     """
@@ -531,7 +439,6 @@ def rolling_features(x, i):
         "structure": structure(x.iloc[:i+1]),
     }
 
-
 def feature_vector(f):
     if f is None:
         return None
@@ -568,7 +475,6 @@ def feature_vector(f):
         dtype=float
     )
 
-
 def scaled_distance(a, b):
     # Feature-specific scales + weights.
     scales = np.array([
@@ -585,8 +491,6 @@ def scaled_distance(a, b):
 
     z = ((a - b) / scales) ** 2
     return float(np.sqrt(np.sum(z * weights) / np.sum(weights)))
-
-
 
 def event_outcome(x, i, horizon, direction="UP"):
     if i + 1 >= len(x):
@@ -654,7 +558,6 @@ def event_outcome(x, i, horizon, direction="UP"):
         "path": path,
     }
 
-
 def multi_horizon_outcomes(x, i, direction="UP"):
     """
     Measure the historical path at 4H, 8H, 12H and 24H.
@@ -707,7 +610,6 @@ def multi_horizon_outcomes(x, i, direction="UP"):
 
     return result
 
-
 def find_pump_events(d, horizon=6, min_pump=15):
     """Find completed pump setups without using future candles to define them."""
     if d is None or len(d) < 100:
@@ -740,7 +642,6 @@ def find_pump_events(d, horizon=6, min_pump=15):
                 last_event = i
 
     return events
-
 
 def find_breakout_events(d, mode="ATH", horizon=6):
     if d is None or len(d) < 100:
@@ -779,13 +680,11 @@ def find_breakout_events(d, mode="ATH", horizon=6):
 
     return events
 
-
 def current_pattern(d):
     x = indicators(completed(d))
     if len(x) < 55:
         return None
     return rolling_features(x, len(x)-1)
-
 
 def classify_current_event(d):
     x = completed(d)
@@ -816,8 +715,6 @@ def classify_current_event(d):
         return "FAST DUMP"
 
     return "NORMAL"
-
-
 
 def behavior_bucket(f):
     """Convert extreme numerical moves into comparable behavioral regimes."""
@@ -886,7 +783,6 @@ def behavior_bucket(f):
         volume_regime,
     ])
 
-
 def similarity_components(target_features, event_features):
     """Return interpretable similarity dimensions for the UI."""
     keys = [
@@ -918,7 +814,6 @@ def similarity_components(target_features, event_features):
             result[name] = 0
 
     return result
-
 
 def adaptive_similarity(target_features, event_features, event_type=None):
     """
@@ -975,7 +870,6 @@ def adaptive_similarity(target_features, event_features, event_type=None):
         "event_bucket": e_bucket,
     }
 
-
 def similar_events(target_features, event_pool, max_matches=50, min_similarity=None):
     if target_features is None:
         return []
@@ -1013,7 +907,6 @@ def similar_events(target_features, event_pool, max_matches=50, min_similarity=N
     scored.sort(key=lambda z: z[0], reverse=True)
     return scored[:max_matches]
 
-
 def _weighted_mean(values, weights):
     vals = np.asarray(values, dtype=float)
     w = np.asarray(weights, dtype=float)
@@ -1023,7 +916,6 @@ def _weighted_mean(values, weights):
         return np.nan
 
     return float(np.average(vals[mask], weights=w[mask]))
-
 
 def _weighted_percent(values, weights):
     if not values:
@@ -1037,8 +929,6 @@ def _weighted_percent(values, weights):
         return 0.0
 
     return float(np.average(vals[mask], weights=w[mask]))
-
-
 
 def outcome_summary(matches):
     if not matches:
@@ -1149,7 +1039,6 @@ def outcome_summary(matches):
         "min_similarity": float(min(sim for _, sim, _ in usable)),
     }
 
-
 def historical_edge(summary):
     if not summary or summary["total"] < 8:
         return 0
@@ -1162,7 +1051,6 @@ def historical_edge(summary):
             summary["side_pct"]
         )
     )
-
 
 def evidence_grade(summary):
     if not summary:
@@ -1178,8 +1066,6 @@ def evidence_grade(summary):
     if n >= 8 and median >= 50:
         return "MODERATE"
     return "LIMITED"
-
-
 
 def risk_profile(summary, current):
     """
@@ -1277,7 +1163,6 @@ def risk_profile(summary, current):
         "volatility": volatility,
     }
 
-
 def simple_path_conclusion(summary, current):
     if not summary or summary["total"] < 8:
         return (
@@ -1313,7 +1198,6 @@ def simple_path_conclusion(summary, current):
         "The historical paths are mixed. There is no strong enough directional "
         "edge to treat the setup as a reliable long or short signal."
     )
-
 
 def human_result(summary, current):
     if not summary or summary["total"] < 8:
@@ -1394,7 +1278,6 @@ def human_result(summary, current):
 
     return title, text
 
-
 def confirmation_text(current):
     last4 = current["4h"]
     last1 = current["1d"]
@@ -1422,7 +1305,6 @@ def confirmation_text(current):
         checks.append("1D price is below EMA20")
 
     return checks
-
 
 def setup_description(f):
     if not f:
@@ -1461,7 +1343,6 @@ def setup_description(f):
 
     return out
 
-
 def market_cap_bucket(pair, symbol):
     """
     We cannot reliably infer market cap from the public futures feed.
@@ -1477,10 +1358,8 @@ def market_cap_bucket(pair, symbol):
 
     return "GENERAL"
 
-
 def peer_group(pair, symbol):
     return market_cap_bucket(pair, symbol)
-
 
 def event_is_extreme(f):
     if not f:
@@ -1497,7 +1376,6 @@ def event_is_extreme(f):
         or (np.isfinite(rsi) and rsi >= 85)
         or (np.isfinite(ema) and abs(ema) >= 50)
     )
-
 
 def event_profile_score(target_features, event):
     """
@@ -1523,7 +1401,6 @@ def event_profile_score(target_features, event):
 
     return score
 
-
 def diversified_matches(matches, max_matches=50, per_coin=4):
     """Limit repeated examples from one contract so the model learns broadly."""
     selected = []
@@ -1542,9 +1419,6 @@ def diversified_matches(matches, max_matches=50, per_coin=4):
 
     return selected
 
-# =============================================================================
-# CURRENT COIN PROFILE
-# =============================================================================
 def simple_today_structure(d15, bars=96):
     """Simple trader-facing structure for the latest 24 hours of completed 15m candles.
 
@@ -1616,7 +1490,6 @@ def simple_today_structure(d15, bars=96):
         return out
     return out
 
-
 def analyze_current_coin(pair, price_info):
     tf_data={}
     # Enough history for EMA100 and meaningful structure, without requesting huge 1m history.
@@ -1642,9 +1515,6 @@ def analyze_current_coin(pair, price_info):
         "mtf_sr": v13_mtf_support_resistance(tf_data, current) if "v13_mtf_support_resistance" in globals() else {}
     }
 
-# =============================================================================
-# MARKET-WIDE LEARNING POOL
-# =============================================================================
 def universe_rows(margin, meme_only, max_coins):
     active=active_instruments(margin); prices=futures_prices(); rows=[]
     for pair in active:
@@ -1660,7 +1530,6 @@ def universe_rows(margin, meme_only, max_coins):
     rows.sort(key=lambda z:abs(z[3]),reverse=True)
     return rows[:max_coins]
 
-@st.cache_data(ttl=900, show_spinner=False)
 def build_learning_pool(pairs_signature, margin, max_coins, event_mode):
     """
     Build a broader learning universe.
@@ -1712,7 +1581,6 @@ def build_learning_pool(pairs_signature, margin, max_coins, event_mode):
 
     return pool, failures
 
-
 def build_same_coin_pool(pair, event_mode):
     """Learn from the target contract's own historical behavior."""
     try:
@@ -1737,14 +1605,12 @@ def build_same_coin_pool(pair, event_mode):
     except Exception:
         return []
 
-
 def build_extreme_pool(pool):
     """Extract the historical extreme-mover subset."""
     return [
         e for e in pool
         if event_is_extreme(e.get("features"))
     ]
-
 
 def merge_learning_pools(*pools):
     """Deduplicate examples by contract + historical timestamp."""
@@ -1771,10 +1637,6 @@ def merge_learning_pools(*pools):
             merged.append(e)
 
     return merged
-
-# =============================================================================
-# SIMPLE PREDICTION LANGUAGE
-# =============================================================================
 
 def risk_profile(summary, current):
     """
@@ -1872,7 +1734,6 @@ def risk_profile(summary, current):
         "volatility": volatility,
     }
 
-
 def simple_path_conclusion(summary, current):
     if not summary or summary["total"] < 8:
         return (
@@ -1908,7 +1769,6 @@ def simple_path_conclusion(summary, current):
         "The historical paths are mixed. There is no strong enough directional "
         "edge to treat the setup as a reliable long or short signal."
     )
-
 
 def human_result(summary, current):
     if not summary or summary["total"]<8:
@@ -1950,17 +1810,6 @@ def confirmation_text(current):
     if safe(last1.close)>safe(last1.ema20): checks.append("1D price is above EMA20")
     else: checks.append("1D price is below EMA20")
     return checks
-
-# =============================================================================
-
-# =============================================================================
-# V5: CONTINUATION vs REVERSAL ENGINE
-# =============================================================================
-# v5 keeps the historical-learning engine, but adds a critical distinction:
-# an extreme pump can remain bullish for a while before it actually reverses.
-# We therefore combine historical path behavior with CURRENT short-term
-# confirmation instead of treating overbought/extended as an immediate short.
-
 
 def v5_event_outcome(x, i, horizon, direction="UP"):
     if i + 1 >= len(x):
@@ -2023,7 +1872,6 @@ def v5_event_outcome(x, i, horizon, direction="UP"):
         },
     }
 
-
 def v5_multi_horizon_outcomes(x, i, direction="UP"):
     result = {}
     for name, bars in [("4H",1),("8H",2),("12H",3),("24H",6)]:
@@ -2078,11 +1926,9 @@ def v5_multi_horizon_outcomes(x, i, direction="UP"):
             result["path_type"] = "CHOP / MIXED"
     return result
 
-# Historical event creation calls the global function at runtime, so these
-# replacements automatically make the learning pool use the v5 path logic.
 event_outcome = v5_event_outcome
-multi_horizon_outcomes = v5_multi_horizon_outcomes
 
+multi_horizon_outcomes = v5_multi_horizon_outcomes
 
 def v5_outcome_summary(matches):
     if not matches:
@@ -2140,7 +1986,6 @@ def v5_outcome_summary(matches):
     }
 
 outcome_summary = v5_outcome_summary
-
 
 def short_term_state(current):
     d=current.get("tf_data",{}).get("15m")
@@ -2251,7 +2096,6 @@ def short_term_state(current):
         "ema_bear_stack":ema_bear_stack,"four_h_below20":four_h_below20,
     }
 
-
 def v5_decision(summary,current):
     st15=short_term_state(current)
     event=current.get("event","")
@@ -2294,7 +2138,6 @@ def v5_decision(summary,current):
 
     return "🟡 BULLISH BUT WAIT FOR CONFIRMATION", "The trend may continue, but the evidence is not strong enough to call the next move."
 
-
 def v5_simple_language(summary,current,decision_title):
     s15=short_term_state(current)
     target=current.get("target") or {}
@@ -2320,7 +2163,6 @@ def v5_simple_language(summary,current,decision_title):
     lines.append(f"Reversal score: {s15['reversal_score']}/100 ({s15['reversal_stage']}).")
     return lines
 
-
 def confirmation_text_v5(current):
     s=short_term_state(current); out=[]
     out.extend(s.get("reasons",[])[:4])
@@ -2339,14 +2181,8 @@ confirmation_text=confirmation_text_v5
 
 confirmation_text=confirmation_text_v5
 
-# =============================================================================
-# V6.1 MARKET-WIDE SIGNAL ENGINE — RANGE + BREAKOUT + PUMP/DUMP
-# =============================================================================
-# Purpose: turn the existing V5/V6 analysis into a "tell me when to trade"
-# scanner.  It keeps the original V5 code intact and adds a market-wide layer.
-# It is deliberately analysis/paper-only; it does not place live orders.
-
 V61_VERSION = "6.3-STRUCTURE-SIGNAL"
+
 V61_DEFAULTS = {
     "lookback_15m": 160,
     "lookback_1h": 120,
@@ -2359,7 +2195,6 @@ V61_DEFAULTS = {
     "max_scan_workers": 6,
 }
 
-
 def v61_instrument_pair(x):
     if isinstance(x, str) and x.strip():
         return x.strip()
@@ -2371,7 +2206,6 @@ def v61_instrument_pair(x):
             return v.strip()
     return None
 
-
 def v61_symbol(x, pair):
     if isinstance(x, dict):
         for k in ("symbol", "pair", "display_name", "market"):
@@ -2379,7 +2213,6 @@ def v61_symbol(x, pair):
             if isinstance(v, str) and v.strip():
                 return v.strip()
     return pair
-
 
 def v61_price_for_pair(prices, pair):
     if not isinstance(prices, dict):
@@ -2406,7 +2239,6 @@ def v61_price_for_pair(prices, pair):
                         if np.isfinite(q): return q
     return np.nan
 
-
 def v61_fetch_candidate(pair):
     """Fetch only the timeframes needed by the fast market-wide signal engine."""
     try:
@@ -2419,13 +2251,11 @@ def v61_fetch_candidate(pair):
     except Exception:
         return None
 
-
 def v61_atr(x):
     if x is None or len(x) < 20:
         return np.nan
     z = indicators(completed(x))
     return v6_num(z.iloc[-1].get("atr")) if not z.empty else np.nan
-
 
 def v61_cluster_levels(d, lookback=120, tolerance_pct=0.45):
     """Cluster swing highs/lows into practical zones rather than exact prices."""
@@ -2471,7 +2301,6 @@ def v61_cluster_levels(d, lookback=120, tolerance_pct=0.45):
 
     return cluster(hi_pts), cluster(lo_pts)
 
-
 def v61_nearest_levels(d15, d1h, d4h, price):
     """Build support/resistance from 15m, 1H and 4H swing clusters."""
     levels_hi, levels_lo = [], []
@@ -2502,7 +2331,6 @@ def v61_nearest_levels(d15, d1h, d4h, price):
     supports = sorted([z for z in lo if z["level"] < price], key=lambda z: price-z["level"])
     resistances = sorted([z for z in hi if z["level"] > price], key=lambda z: z["level"]-price)
     return supports, resistances
-
 
 def v61_range_state(d15, d1h, d4h, price):
     """Detect a range and return its practical support/resistance zones."""
@@ -2556,7 +2384,6 @@ def v61_range_state(d15, d1h, d4h, price):
         "ema_spread": ema_spread,
     }
 
-
 def v61_regime(d1h, d4h):
     x1 = indicators(completed(d1h))
     x4 = indicators(completed(d4h))
@@ -2581,7 +2408,6 @@ def v61_regime(d1h, d4h):
     if bear >= 4: return "BEAR TREND", bear*20
     return "MIXED", 50
 
-
 def v61_momentum(d15):
     x = indicators(completed(d15))
     if len(x) < 30:
@@ -2603,7 +2429,6 @@ def v61_momentum(d15):
         "close_open": v6_pct(close, x.iloc[-1].open),
     }
 
-
 def v61_breakout_status(d15, support, resistance):
     x = completed(d15).tail(12)
     if x.empty or not support or not resistance:
@@ -2615,7 +2440,6 @@ def v61_breakout_status(d15, support, resistance):
     if prev <= r and close > r + buf: return "BREAKOUT_UP"
     if prev >= s and close < s - buf: return "BREAKDOWN_DOWN"
     return "NONE"
-
 
 def v61_trade_from_setup(pair, side, price, support, resistance, atr, score, reason):
     """Return entry/SL/TP levels.  Entry is a zone; trade is valid only after trigger."""
@@ -2650,7 +2474,6 @@ def v61_trade_from_setup(pair, side, price, support, resistance, atr, score, rea
         "tp1": target1, "tp2": target2, "rr1": rr1, "rr2": rr2,
         "score": score, "reason": reason,
     }
-
 
 def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
     m = v61_momentum(d15)
@@ -2822,7 +2645,6 @@ def v61_analyze_candidate(pair, symbol, price, d15, d1h, d4h):
             "momentum": m, "support": support, "resistance": resistance, "structure": structure,
             "ema_cross": ema_cross, "early_structure": early_structure}
 
-
 def v61_scan_all(progress=None, max_workers=6):
     """Scan every active USDT Futures contract.
 
@@ -2899,7 +2721,6 @@ def v61_scan_all(progress=None, max_workers=6):
                 continue
     return results, len(items)
 
-
 def v61_fmt_price(v):
     v = v6_num(v)
     if not np.isfinite(v): return "—"
@@ -2907,7 +2728,6 @@ def v61_fmt_price(v):
     if abs(v) >= 1: return f"{v:,.4f}"
     if abs(v) >= .01: return f"{v:,.6f}"
     return f"{v:,.8f}"
-
 
 def v61_signal_card(t):
     side = t.get("side", "")
@@ -2917,246 +2737,13 @@ def v61_signal_card(t):
     st.write(f"**Entry:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
     st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
 
-
-
-
-# =============================================================================
-# V5 UI
-# =============================================================================
-st.title("🧠 CoinDCX Futures Trading Agent — Simple Daily Dashboard")
-st.caption("Simple daily workflow: Analyze a coin • See today's HH/HL/LH/LL • Check 15m/4H/1D/1W S/R • Hunt extreme pump/dump reversals. Analysis only — no live orders.")
-
 margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
+
 meme_only=st.checkbox("Use meme-focused learning universe",value=False)
+
 peer_limit=st.slider("Historical comparison universe",20,150,100,10,help="More contracts provide more historical examples but require more CoinDCX API calls.")
-st.info("V5 rule: an extreme pump is NOT treated as an immediate short. Reversal now requires multiple confirmations; EMA weakness alone moves the setup to REVERSAL DEVELOPING, not REVERSAL CONFIRMED.")
 
-st.success("Daily workflow: ⭐ TODAY scan → 📐 MTF S/R → 🎯 Confirmed signals. Use 🧨 Extreme Move Hunter only when hunting large pump/dump reversals.")
-
-st.divider()
-st.header("🔎 Analyze a Coin")
 coin=st.text_input("Coin / Futures pair",placeholder="USELESS, DOGE, PEPE, B-DOGE_USDT")
-
-if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
-    try:
-        with st.spinner("Fetching CoinDCX history and studying continuation vs reversal..."):
-            prices=futures_prices(); req=normalize(coin); found=[]
-
-            # CoinDCX can expose the same Futures contract under slightly
-            # different casing/key fields in the active-instruments endpoint
-            # and the real-time price feed.  Resolve the pair through the
-            # normalized helper instead of doing a fragile exact dictionary
-            # lookup.  This keeps the legacy V5 analyzer compatible with the
-            # V6/V6.2 market-discovery layer.
-            def price_record_for_pair(price_map, target_pair):
-                if not isinstance(price_map, dict):
-                    return None
-                target = str(target_pair).strip().upper()
-                for key in (target_pair, str(target_pair).upper(), str(target_pair).lower()):
-                    rec = price_map.get(key)
-                    if isinstance(rec, dict):
-                        return rec
-                for key, rec in price_map.items():
-                    if not isinstance(rec, dict):
-                        continue
-                    ident = str(rec.get("pair") or rec.get("symbol") or rec.get("mkt") or rec.get("market") or key).strip().upper()
-                    if ident == target:
-                        return rec
-                return None
-
-            for q in [margin]+[x for x in ("USDT","INR") if x!=margin]:
-                for raw_pair in active_instruments(q):
-                    pair = v61_instrument_pair(raw_pair)
-                    if not pair:
-                        continue
-
-                    # Match against the active Futures universe first. The live
-                    # price feed may use a different key/field spelling, so it
-                    # must not decide whether the contract exists.
-                    active_symbol = pair
-                    if isinstance(raw_pair, dict):
-                        active_symbol = str(raw_pair.get("symbol") or raw_pair.get("display_name") or raw_pair.get("market") or raw_pair.get("pair") or pair)
-                    if not coin_matches(pair, active_symbol, req, q):
-                        continue
-
-                    p = price_record_for_pair(prices, pair)
-
-                    # Fuzzy price-feed lookup for B-LSK_USDT / LSK_USDT / LSKUSDT.
-                    if p is None:
-                        target = str(pair).upper().replace("-", "").replace("_", "")
-                        for key, rec in prices.items():
-                            ident = str(key).upper().replace("-", "").replace("_", "")
-                            if ident == target or (ident.startswith("B") and ident[1:] == target):
-                                p = rec if isinstance(rec, dict) else {"pair": key, "price": rec}
-                                break
-
-                    # Last-resort price from the latest completed 15m candle.
-                    if p is None:
-                        try:
-                            probe = completed(get_tf(pair, "15m", 2))
-                            if not probe.empty:
-                                last_close = float(probe.iloc[-1]["close"])
-                                p = {"pair": pair, "price": last_close, "ls": last_close}
-                        except Exception:
-                            p = None
-                    if p is None:
-                        continue
-
-                    symbol = str(p.get("mkt") or p.get("symbol") or p.get("pair") or active_symbol or pair).upper()
-                    found.append((pair, p, symbol, q))
-            if not found:
-                st.error(f"No active CoinDCX Futures contract found for '{coin}'. Active Futures were discovered, but the requested coin did not match. Try the exact pair shown by CoinDCX, e.g. B-LSK_USDT."); st.stop()
-            found.sort(key=lambda z:(0 if z[3]==margin else 1,len(z[0])))
-            pair,p,symbol,_=found[0]
-            current=analyze_current_coin(pair,p)
-            mode="ATH" if current["event"]=="ATH BREAKOUT" else "ATL" if current["event"]=="ATL BREAKDOWN" else "PUMP"
-            universe=universe_rows(margin,meme_only,peer_limit)
-            pairs_sig=tuple((z[0],z[2]) for z in universe if z[0]!=pair)
-            pool,failures=build_learning_pool(pairs_sig,margin,peer_limit,mode)
-            same_coin_pool=build_same_coin_pool(pair,mode)
-            extreme_pool=build_extreme_pool(pool)
-            combined_pool=merge_learning_pools(pool,same_coin_pool,extreme_pool)
-            raw_matches=similar_events(current["target"],combined_pool,max_matches=100)
-            matches=diversified_matches(raw_matches,max_matches=60,per_coin=4)
-            summary=outcome_summary(matches)
-            decision_title,decision_text=v5_decision(summary,current)
-
-            st.subheader(f"{symbol} — V5 Simple Prediction")
-            st.write(f"**Event:** {current['event']}")
-            a,b,c,d=st.columns(4)
-            a.metric("Current",fmt(current["current"]))
-            b.metric("24h",f"{safe(p.get('pc',0),0):+.2f}%")
-            b4=current["4h"]
-            c.metric("4H RSI",f"{safe(b4.rsi):.1f}" if pd.notna(b4.rsi) else "—")
-            d.metric("4H Volume",f"{safe(b4.vol_ratio):.1f}x" if pd.notna(b4.vol_ratio) else "—")
-
-            if decision_title.startswith("🚀") or decision_title.startswith("🟢"):
-                st.success(decision_title)
-            elif decision_title.startswith("🔴"):
-                st.error(decision_title)
-            else:
-                st.warning(decision_title)
-            st.markdown(f"### {decision_title}")
-            st.write(decision_text)
-
-            s15=short_term_state(current)
-            st.markdown("### 📱 What is happening RIGHT NOW? (15-minute)")
-            q1,q2,q3,q4,q5,q6=st.columns(6)
-            q1.metric("15m state",s15["state"])
-            q2.metric("Trend score",f"{s15['score']}/100")
-            q3.metric("Reversal score",f"{s15['reversal_score']}/100")
-            q4.metric("ADX",f"{s15['adx']:.1f}" if np.isfinite(s15['adx']) else "—")
-            q5.metric("EMA20 slope",f"{s15['ema20_slope']:+.2f}%" if np.isfinite(s15['ema20_slope']) else "—")
-            q6.metric("Pullback from 24-bar high",f"{s15['pullback']:+.1f}%" if np.isfinite(s15['pullback']) else "—")
-
-            _today_struct = current.get("today_structure", {}) or {}
-            st.markdown("### ⭐ Simple answer — what is happening today?")
-            st.write(f"**{_today_struct.get('label','⚪ NO CLEAR STRUCTURE')}**")
-            _ts1,_ts2,_ts3,_ts4=st.columns(4)
-            _ts1.metric("Higher High", "YES" if _today_struct.get("hh") else "NO")
-            _ts2.metric("Higher Low", "YES" if _today_struct.get("hl") else "NO")
-            _ts3.metric("Lower High", "YES" if _today_struct.get("lh") else "NO")
-            _ts4.metric("Lower Low", "YES" if _today_struct.get("ll") else "NO")
-            st.caption("🟢 HH + HL = bullish structure / LONG bias | 🔴 LH + LL = bearish structure / SHORT bias | ⚪ otherwise WAIT. Uses the latest completed 15m candles over roughly 24 hours.")
-
-            st.markdown("### 🧭 Trend vs. reversal")
-            t1,t2,t3,t4=st.columns(4)
-            t1.metric("Current trend", "BULLISH" if current["bull"]>=current["bear"] else "MIXED")
-            t2.metric("Momentum", "EXTREME" if event_is_extreme(current["target"]) else "NORMAL")
-            t3.metric("Reversal stage",s15["reversal_stage"])
-            t4.metric("15m structure",current.get("structure15","Mixed"))
-
-            # V14: Support/resistance is shown for EVERY coin analyzed,
-            # regardless of whether the final decision is LONG, SHORT or WAIT.
-            st.markdown("### 📐 Multi-Timeframe Support & Resistance")
-            _coin_sr = current.get("mtf_sr", {}) or {}
-            _sr_summary = v14_sr_summary(_coin_sr, current.get("current")) if _coin_sr else {}
-            if _coin_sr:
-                st.dataframe(
-                    pd.DataFrame(v13_sr_columns(_coin_sr)),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-                if _sr_summary:
-                    sr1,sr2,sr3,sr4=st.columns(4)
-                    sr1.metric("Nearest Support", v13_format_price(_sr_summary.get("nearest_support")))
-                    sr2.metric("Support distance", f"{_sr_summary.get('support_dist_pct'):.2f}%" if _sr_summary.get('support_dist_pct') is not None else "—")
-                    sr3.metric("Nearest Resistance", v13_format_price(_sr_summary.get("nearest_resistance")))
-                    sr4.metric("Resistance distance", f"+{_sr_summary.get('resistance_dist_pct'):.2f}%" if _sr_summary.get('resistance_dist_pct') is not None else "—")
-                    st.caption(
-                        f"Nearest support: {_sr_summary.get('support_tf','—')} | "
-                        f"Nearest resistance: {_sr_summary.get('resistance_tf','—')}"
-                    )
-            else:
-                st.warning("Support/resistance data could not be calculated for this coin from the available completed candles.")
-
-            if summary:
-                st.markdown("### 📚 What happened to similar coins AFTER the setup?")
-                h1,h2,h3,h4=st.columns(4)
-                for col,label,key in [(h1,"4H later","4H"),(h2,"8H later","8H"),(h3,"12H later","12H"),(h4,"24H later","24H")]:
-                    val=summary[key]["end"]
-                    col.metric(label,f"{val:+.1f}%" if np.isfinite(val) else "—")
-
-                a,b,c,d=st.columns(4)
-                a.metric("Continued",f"{summary['continue_pct']:.0f}%")
-                b.metric("Dumped",f"{summary['dump_pct']:.0f}%")
-                c.metric("Sideways",f"{summary['side_pct']:.0f}%")
-                d.metric("Strong bounce",f"{summary['reverse_pct']:.0f}%")
-
-                st.markdown("### 🛣️ The sequence the engine learned")
-                p1,p2,p3,p4=st.columns(4)
-                p1.metric("Another leg → reversal",f"{summary['second_leg_pct']:.0f}%")
-                p2.metric("Clean continuation",f"{summary['clean_continuation_pct']:.0f}%")
-                p3.metric("Early rejection",f"{summary['early_rejection_pct']:.0f}%")
-                p4.metric("Typical reversal time",f"{summary['reversal_timing_hours']:.0f}H" if np.isfinite(summary['reversal_timing_hours']) else "—")
-
-                st.write(f"**Sample:** {summary['total']} historical cases | median similarity {summary['median_similarity']:.0f}% | strongest {summary['max_similarity']:.0f}% | evidence: **{evidence_grade(summary)}**")
-                if np.isfinite(summary.get("second_leg_gain",np.nan)):
-                    st.write(f"**When the second-leg pattern occurred, the typical maximum move before the reversal was about +{summary['second_leg_gain']:.0f}%.**")
-
-            st.markdown("### 📌 Simple explanation")
-            for line in v5_simple_language(summary,current,decision_title):
-                st.write("• "+line)
-
-            st.markdown("### 👀 What should be watched now?")
-            for line in confirmation_text(current):
-                st.write("• "+line)
-
-            st.markdown("### 📊 7-Timeframe EMA picture")
-            ema_table=[]
-            for tf in ["1m","5m","15m","1H","4H","1D","1W"]:
-                r=current["ema_rows"].get(tf,{})
-                ema_table.append({"Timeframe":tf,"EMA20/50/100":r.get("state","NO DATA"),"Alignment":f"{r.get('count',0)}/3"})
-            st.dataframe(pd.DataFrame(ema_table),use_container_width=True,hide_index=True)
-            st.write(f"**Full EMA alignment:** {current['bull']*3}/21 bullish conditions | {current['bear']*3}/21 bearish conditions.")
-
-            if matches:
-                st.markdown("### 🔎 Closest historical examples")
-                rows=[]
-                for sim,e in matches[:20]:
-                    f=e["features"]; o=e["outcome"]
-                    rows.append({
-                        "Similarity":f"{sim:.0f}%","Coin":e.get("pair","—"),"Date":str(e.get("time","—"))[:16],
-                        "Regime":e.get("behavior_bucket","—"),"24-bar move":f"{safe(f.get('ret24')):+.1f}%",
-                        "RSI":f"{safe(f.get('rsi')):.0f}","Volume":f"{safe(f.get('vol_ratio')):.1f}x",
-                        "4H":f"{o['4H']['end']:+.1f}%" if o.get("4H") else "—",
-                        "12H":f"{o['12H']['end']:+.1f}%" if o.get("12H") else "—",
-                        "24H":f"{o['24H']['end']:+.1f}%" if o.get("24H") else "—",
-                        "Path":o.get("path_type","—"),"Best":f"{o['24H']['best']:+.1f}%" if o.get("24H") else "—",
-                        "Worst":f"{o['24H']['worst']:+.1f}%" if o.get("24H") else "—",
-                    })
-                st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
-
-            with st.expander("Advanced details"):
-                st.write(f"**4H structure:** {current['structure4']} | **1D:** {current['structure1']} | **15m:** {current['structure15']}")
-                st.write(f"**15m:** ADX {s15['adx']:.1f} | MACD {'Bullish' if s15['macd']>s15['signal'] else 'Bearish'} | EMA20 slope {s15['ema20_slope']:+.2f}% | Trend score {s15['score']}/100 | Reversal score {s15['reversal_score']}/100" if np.isfinite(s15['adx']) else "15m indicators unavailable")
-                st.write(f"**Learning pool:** {len(pool)} events from {len(pairs_sig)} comparison contracts + {len(same_coin_pool)} same-coin events + {len(extreme_pool)} extreme events.")
-                st.write("V5 learns both the historical outcome and the sequence: continuation first, delayed reversal, early rejection or mixed behavior. Current 15m structure is used to decide whether a reversal is actually confirmed.")
-                if failures: st.code("\n".join(failures[:50]))
-
-            st.session_state["last_analysis"]={"symbol":symbol,"pair":pair,"current":current,"summary":summary,"matches":matches}
-    except Exception as e:
-        st.error(f"Analysis failed: {type(e).__name__}: {e}")
 
 def v71_early_structure_transition(d15, d1h=None):
     """Detect the *chronological* start of a trend reversal, not just the
@@ -3271,7 +2858,6 @@ def v71_early_structure_transition(d15, d1h=None):
             out["state"] += " / 1H CONFLICT"
     return out
 
-
 def v71_pivots(d, left=2, right=2, lookback=160):
     """Confirmed swing pivots from completed candles only."""
     if d is None or d.empty:
@@ -3290,7 +2876,6 @@ def v71_pivots(d, left=2, right=2, lookback=160):
         if np.isfinite(l[i]) and l[i] <= np.nanmin(ls) and l[i] < l[i-1] and l[i] <= l[i+1]:
             lows.append({"idx": i, "price": float(l[i])})
     return highs, lows
-
 
 def v71_structure_tf(d, tf_name):
     """Classify the latest swing sequence on one timeframe."""
@@ -3337,7 +2922,6 @@ def v71_structure_tf(d, tf_name):
         out["state"] = "MIXED STRUCTURE"
     return out
 
-
 def v71_ema_transition(d, recent_bars):
     """Fresh EMA20/EMA100 transition using completed candles only."""
     if d is None or d.empty:
@@ -3372,7 +2956,6 @@ def v71_ema_transition(d, recent_bars):
     return {"state":state, "bearish":bool(diff[-1] < 0), "bullish":bool(diff[-1] > 0),
             "fresh_bearish":fresh_bear, "fresh_bullish":fresh_bull,
             "age":bear_age if fresh_bear else bull_age, "spread_pct":spread}
-
 
 def v71_structure_trade_score(struct15, struct4, ema15, ema4, r15, r4, vol_ratio, price):
     """Score a structure-led directional setup; score is not a guarantee."""
@@ -3417,7 +3000,6 @@ def v71_structure_trade_score(struct15, struct4, ema15, ema4, r15, r4, vol_ratio
         results.append((side, min(100, int(score)), reasons, confirmations, blockers))
     return results
 
-
 def v71_build_radar(a):
     """Convert an existing V6.1 market result into a compact V7 radar row."""
     pair = a.get("pair") or ""
@@ -3426,7 +3008,6 @@ def v71_build_radar(a):
     price = v6_num(a.get("price"))
     s15 = v71_structure_tf((a.get("_d15") if a.get("_d15") is not None else pd.DataFrame()), "15m")
     return {"pair":pair, "symbol":symbol, "price":price, "structure15":s15}
-
 
 def v71_scan_from_existing(scan):
     # Keep the V7 probability calculation self-contained in Streamlit Cloud.
@@ -3536,9 +3117,6 @@ def v71_scan_from_existing(scan):
         })
     return rows
 
-
-
-# -------------------- V13 MULTI-TIMEFRAME SUPPORT / RESISTANCE -----------------
 V13_SR_TIMEFRAMES = ("15m", "4H", "1D", "1W")
 
 def v13_sr_pivots(df, left=3, right=3):
@@ -3678,7 +3256,6 @@ def v13_attach_sr_to_records(records):
         enriched.append(rr)
     return enriched
 
-
 def v14_sr_distance(current, level):
     try:
         current = float(current); level = float(level)
@@ -3714,25 +3291,27 @@ def v14_sr_summary(sr, current):
             out.update(nearest_resistance=v,resistance_tf=f"{tf} {k}",resistance_dist_pct=v14_sr_distance(current,v))
     return out
 
-
-# =============================================================================
-# V10 EXTREME MOVE REVERSAL + NEXT-LEG RADAR
-# =============================================================================
-# This strategy is intentionally independent of ATH/ATL.  It hunts coins that
-# have been repriced violently over several days and then classifies the next
-# opportunity as: LONG next-leg, SHORT reversal, or WAIT.
 V10_EXTREME_PUMP_3D = 150.0
-V10_EXTREME_PUMP_5D = 250.0
-V10_EXTREME_PUMP_7D = 400.0
-V10_EXTREME_DUMP_3D = -65.0
-V10_EXTREME_DUMP_5D = -75.0
-V10_EXTREME_DUMP_7D = -85.0
-V10_MIN_SCORE = 72
-V10_MAX_SHORT_FROM_PEAK = 22.0       # don't chase a mature dump
-V10_MAX_LONG_FROM_LOW = 22.0         # don't chase a mature rebound
-V10_NEAR_HIGH_PULLBACK = 18.0
-V10_NEAR_LOW_REBOUND = 18.0
 
+V10_EXTREME_PUMP_5D = 250.0
+
+V10_EXTREME_PUMP_7D = 400.0
+
+V10_EXTREME_DUMP_3D = -65.0
+
+V10_EXTREME_DUMP_5D = -75.0
+
+V10_EXTREME_DUMP_7D = -85.0
+
+V10_MIN_SCORE = 72
+
+V10_MAX_SHORT_FROM_PEAK = 22.0
+
+V10_MAX_LONG_FROM_LOW = 22.0
+
+V10_NEAR_HIGH_PULLBACK = 18.0
+
+V10_NEAR_LOW_REBOUND = 18.0
 
 def _v10_pct(a, b):
     try:
@@ -3740,7 +3319,6 @@ def _v10_pct(a, b):
         return (a / b - 1.0) * 100.0 if b else np.nan
     except Exception:
         return np.nan
-
 
 def v10_extreme_move_signal(pair, symbol, tf_data, current):
     """Detect massive multi-day pumps/dumps and trade the next phase.
@@ -3924,7 +3502,6 @@ def v10_extreme_move_signal(pair, symbol, tf_data, current):
     except Exception:
         return None
 
-
 def v10_extreme_record(x):
     if not x:
         return None
@@ -3944,7 +3521,6 @@ def v10_extreme_record(x):
         "From Low %": x.get("from_low_pct"), "source": "V10 EXTREME MOVE",
         "setup": x,
     }
-
 
 def v10_scan_all_extreme(progress=None, max_workers=6):
     """Scan the ENTIRE active USDT Futures universe for V10 extreme-move setups.
@@ -4019,13 +3595,6 @@ def v10_scan_all_extreme(progress=None, max_workers=6):
                                 -float(r.get("Score", 0))))
     return results, len(items)
 
-
-
-
-
-# =============================================================================
-# V26 — ONE-SCAN TABLE MARKET DASHBOARD
-# =============================================================================
 def v23_yesterday_pump_today_fall(d1, current, today_structure):
     """Simple detector for: strong completed daily pump -> current session falling.
     Uses completed daily candles only and does not call a pump alone a short.
@@ -4055,8 +3624,6 @@ def v23_yesterday_pump_today_fall(d1, current, today_structure):
         return out
     except Exception:
         return out
-
-
 
 def v28_basic_sr_from_df(df, current):
     """Robust S/R fallback so the table never shows blank levels unnecessarily."""
@@ -4101,7 +3668,6 @@ def v28_attach_15m_sr(r):
         pass
     return r
 
-
 def v28_full_mtf_top5(records):
     """Attach complete MTF S/R only to the final freshness-filtered Top 5 each side."""
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -4145,8 +3711,6 @@ def v28_full_mtf_top5(records):
             try: f.result()
             except Exception: pass
     return records
-
-
 
 def v23_unified_scan(progress=None, max_workers=4):
     """Reliable ONE-button market scan.
@@ -4344,8 +3908,6 @@ def v22_unified_scan(progress=None, max_workers=6):
     # Backward-compatible alias for the single-scan workflow.
     return v23_unified_scan(progress=progress, max_workers=max_workers)
 
-
-
 def v27_pre_rank_score(r):
     """Deterministic first-pass quality score from the already-fetched 15m structure."""
     t = r.get("today") or {}
@@ -4365,7 +3927,6 @@ def v27_pre_rank_score(r):
     if (side == "LONG" and t.get("hl")) or (side == "SHORT" and t.get("ll")):
         score += 5
     return float(score)
-
 
 def v27_final_rank_score(r):
     """Rank actionable setups using structure + HTF alignment + S/R room + pump/fall context."""
@@ -4422,7 +3983,6 @@ def v27_final_rank_score(r):
 
     return int(max(0, min(100, round(score))))
 
-
 def v27_top5(records, side):
     """Return the five highest-quality actionable records for the requested side."""
     key = "🟢 LONG TODAY" if side == "LONG" else "🔴 SHORT TODAY"
@@ -4437,7 +3997,6 @@ def v27_top5(records, side):
             r.get("symbol", "")
         )
     )[:5]
-
 
 def v27_top5_table_rows(records):
     rows = []
@@ -4468,7 +4027,6 @@ def v27_top5_table_rows(records):
             "Pump→Fall": "YES" if yp.get("flag") else "—",
         })
     return rows
-
 
 def v26_table_mtf_sr_enrich(results, progress=None, max_workers=4):
     """Add compact MTF S/R to every LONG/SHORT result for the trader tables.
@@ -4545,7 +4103,6 @@ def v26_table_mtf_sr_enrich(results, progress=None, max_workers=4):
 
     return results
 
-
 def v26_compact_sr_table_rows(records):
     """Create a compact, trader-friendly table with S/R on all four timeframes."""
     rows = []
@@ -4575,21 +4132,17 @@ def v26_compact_sr_table_rows(records):
         })
     return rows
 
-
-
-# =============================================================================
-# V30 — FRESHNESS / NO-CHASE FILTER
-# =============================================================================
-# The market can be bullish while the LONG entry is already late, or bearish
-# while the SHORT has already traveled too far. V30 ranks "tradeable now",
-# not merely "directionally correct".
 V30_LONG_MAX_3D_EXTENDED = 50.0
-V30_LONG_MAX_FROM_PEAK_FRESH = -15.0
-V30_LONG_TOO_LATE_FROM_PEAK = -20.0
-V30_SHORT_FRESH_FROM_PEAK = -12.0
-V30_SHORT_TOO_LATE_FROM_PEAK = -22.0
-V30_YESTERDAY_PUMP_MIN = 15.0
 
+V30_LONG_MAX_FROM_PEAK_FRESH = -15.0
+
+V30_LONG_TOO_LATE_FROM_PEAK = -20.0
+
+V30_SHORT_FRESH_FROM_PEAK = -12.0
+
+V30_SHORT_TOO_LATE_FROM_PEAK = -22.0
+
+V30_YESTERDAY_PUMP_MIN = 15.0
 
 def v29_freshness_metrics(d1, current, side, today=None, yesterday=None):
     out = {
@@ -4691,7 +4244,6 @@ def v29_freshness_metrics(d1, current, side, today=None, yesterday=None):
     except Exception:
         return out
 
-
 def v29_apply_freshness(r):
     try:
         t = r.get("today") or {}
@@ -4713,11 +4265,9 @@ def v29_apply_freshness(r):
         pass
     return r
 
-
 def v29_rank_score(r):
     base = v27_final_rank_score(r)
     return int(max(0, min(100, base + int(r.get("freshness_score", 0) or 0))))
-
 
 def v29_top5(records, side):
     key = "🟢 LONG TODAY" if side == "LONG" else "🔴 SHORT TODAY"
@@ -4735,7 +4285,6 @@ def v29_top5(records, side):
             r.get("symbol", "")
         )
     )[:5]
-
 
 def v29_top5_table_rows(records):
     rows = []
@@ -4760,7 +4309,6 @@ def v29_top5_table_rows(records):
             "Pump→Fall": "YES" if (r.get("yesterday") or {}).get("flag") else "—",
         })
     return rows
-
 
 def v22_render_market(results):
     """Render the daily market answer primarily as compact LONG/SHORT tables."""
@@ -4875,84 +4423,23 @@ def v22_render_market(results):
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-
-# =============================================================================
-# V22 — SINGLE BUTTON DAILY TRADING WORKFLOW
-# =============================================================================
-st.divider()
-st.subheader("⭐ TODAY'S TRADING OPPORTUNITIES — ONE RELIABLE MARKET SCAN")
-st.caption(
-    "ONE scan of the active CoinDCX USDT Futures market. It gives the simple answer first: "
-    "HH + HL = bullish, LH + LL = bearish. It also attaches pump/dump context and "
-    "15m/4H/1D/1W support and resistance to the same results. No second market scan is required."
-)
-
 v22_workers = st.slider("Concurrent workers", 2, 6, 4, 1, key="v24_workers")
-if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", type="primary", key="v24_market_scan_button"):
-    bar = st.progress(0, text="Scanning all active CoinDCX Futures…")
-    def _v22_progress(done, total, text=None):
-        bar.progress(int(done / max(total,1) * 100), text=text or f"Analyzing {done}/{total} Futures…")
-    with st.spinner("Building today's structure + extreme-move + MTF S/R view…"):
-        _v22_results, _v22_total = v23_unified_scan(_v22_progress, max_workers=v22_workers)
-        # Populate MTF S/R for EVERY actionable LONG/SHORT row so the trader
-        # does not have to open hundreds of individual cards.
-        def _sr_progress(done, total, text=None):
-            # Keep the same progress bar, but reserve the final phase for S/R.
-            pct = 50 + int(done / max(total, 1) * 50)
-            bar.progress(min(pct, 100), text=text or f"Building MTF S/R {done}/{total}…")
-        _v22_results = v28_full_mtf_top5(_v22_results)
-    st.session_state["v22_market_results"] = _v22_results
-    st.session_state["v22_market_total"] = _v22_total
-    st.session_state["v22_market_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bar.progress(100, text=f"Complete — {_v22_total} Futures contracts scanned")
 
 _v22_results = st.session_state.get("v22_market_results", [])
-if _v22_results:
-    st.caption(f"Last scan: {st.session_state.get('v22_market_time','—')} | Contracts scanned: {st.session_state.get('v22_market_total','—')} | 15m data received: {st.session_state.get('v24_data_ok','—')}")
-    v22_render_market(_v22_results)
-else:
-    if st.session_state.get("v24_data_ok") == 0 and st.session_state.get("v22_market_time"):
-        st.error("The market was discovered, but no usable 15m candle data was returned. This is a data/API issue, not a trading-signal issue.")
-        errs = st.session_state.get("v24_scan_errors", [])
-        if errs:
-            with st.expander("🔧 Show data errors", expanded=True):
-                for err in errs:
-                    st.write(err)
-        st.info("Run the scan again after a short pause. The scanner uses a low worker count and retries each 15m request.")
-    else:
-        st.info("Click **⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES** to scan the whole Futures market. The first pass uses 15m only for all contracts; higher timeframes are fetched only for the best candidates.")
-
-
-
-# =============================================================================
-# =============================================================================
-# V31 — EMA20 + MTF STRUCTURE PATH AGENT
-# =============================================================================
-# This is a state-machine style scanner based on the user's observed dump/recovery
-# path.  It does NOT assume that support/resistance must hold or break.  It waits
-# for price/structure confirmation at each decision zone.
-#
-# SHORT path:
-#   15m EMA20 break -> LH/LL -> EMA20 retest/rejection -> new LL
-#   -> 4H support reaction -> possible bounce -> EMA20 rejection + LH/LL
-#   -> 4H support break -> 1D support target
-#
-# LONG is the exact mirror:
-#   15m EMA20 reclaim -> HH/HL -> EMA20 pullback/hold -> new HH
-#   -> 4H resistance reaction -> possible pullback -> EMA20 hold + HH/HL
-#   -> 4H resistance break -> 1D resistance target
-#
-# The scanner uses completed candles only. It is a signal/research engine, not an
-# automatic live-order executor.
 
 V31_LOOKBACK_15M = 192
-V31_LOOKBACK_4H = 180
-V31_LOOKBACK_1D = 220
-V31_EMA_TOUCH_PCT = 0.75
-V31_SR_ZONE_PCT = 0.80
-V31_MIN_PATH_SCORE = 58
-V31_MAX_RESULTS = 20
 
+V31_LOOKBACK_4H = 180
+
+V31_LOOKBACK_1D = 220
+
+V31_EMA_TOUCH_PCT = 0.75
+
+V31_SR_ZONE_PCT = 0.80
+
+V31_MIN_PATH_SCORE = 58
+
+V31_MAX_RESULTS = 20
 
 def v31_pct(a, b):
     try:
@@ -4960,7 +4447,6 @@ def v31_pct(a, b):
         return (a / b - 1.0) * 100.0 if b > 0 else np.nan
     except Exception:
         return np.nan
-
 
 def v31_ema20_cross(df, direction, lookback=96):
     """Most recent completed close cross through EMA20.
@@ -4995,7 +4481,6 @@ def v31_ema20_cross(df, direction, lookback=96):
     except Exception:
         pass
     return out
-
 
 def v31_retest_failures(df, side, lookback=120, touch_pct=V31_EMA_TOUCH_PCT):
     """Count EMA20 retests followed by directional rejection and a new local extreme.
@@ -5058,7 +4543,6 @@ def v31_retest_failures(df, side, lookback=120, touch_pct=V31_EMA_TOUCH_PCT):
         pass
     return out
 
-
 def v31_recent_structure(df, side, lookback=100):
     """Use V7 confirmed pivots to test whether the recent sequence supports the side."""
     try:
@@ -5084,7 +4568,6 @@ def v31_recent_structure(df, side, lookback=100):
     except Exception:
         return {"ok": False, "partial": False, "state": "—", "score": 0}
 
-
 def v31_levels(tf_df, price):
     """Return robust S1/S2/S3 and R1/R2/R3 for a timeframe."""
     try:
@@ -5092,7 +4575,6 @@ def v31_levels(tf_df, price):
         return sr if isinstance(sr, dict) else {}
     except Exception:
         return {}
-
 
 def v31_nearest_below(sr, price, key_prefix="S"):
     vals = []
@@ -5105,7 +4587,6 @@ def v31_nearest_below(sr, price, key_prefix="S"):
             pass
     return max(vals, key=lambda z:z[0]) if vals else (np.nan, "—")
 
-
 def v31_nearest_above(sr, price, key_prefix="R"):
     vals = []
     for k in ("R1","R2","R3"):
@@ -5116,7 +4597,6 @@ def v31_nearest_above(sr, price, key_prefix="R"):
         except Exception:
             pass
     return min(vals, key=lambda z:z[0]) if vals else (np.nan, "—")
-
 
 def v31_path_analyze(pair, symbol, current, d15, d4h, d1d):
     """Classify the current location in the bearish/bullish path."""
@@ -5316,7 +4796,6 @@ def v31_path_analyze(pair, symbol, current, d15, d4h, d1d):
         result["reason"] = f"Analysis error: {type(e).__name__}: {e}"
         return result
 
-
 def v31_scan_structure_paths(progress=None, max_workers=4, candidate_limit=40):
     """Two-phase all-market scan: 15m discovery first, MTF path analysis second."""
     instruments = active_instruments("USDT")
@@ -5398,7 +4877,6 @@ def v31_scan_structure_paths(progress=None, max_workers=4, candidate_limit=40):
     results.sort(key=lambda r:(-int(r.get("score",0)), r.get("symbol","")))
     return results, len(items), len(phase1)
 
-
 def v31_render_path_table(results):
     if not results:
         st.info("No qualifying EMA20 + HH/HL/LH/LL path candidates found in the current scan.")
@@ -5417,9 +4895,6 @@ def v31_render_path_table(results):
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     st.caption("LONG and SHORT use the same structure logic in opposite directions. Support/resistance is treated as a reaction/decision zone, not a guaranteed reversal or breakout.")
 
-
-# V30 — EMA20 BREAKDOWN SCANNER FOR SHORT ENTRIES
-# =============================================================================
 def v30_find_downward_ema20_break(df, timeframe, lookback_bars):
     """Find a completed-candle close crossing from ABOVE EMA20 to BELOW EMA20.
 
@@ -5482,7 +4957,6 @@ def v30_find_downward_ema20_break(df, timeframe, lookback_bars):
     except Exception:
         pass
     return out
-
 
 def v30_scan_ema20_breakdowns(progress=None, max_workers=4):
     """Scan all active USDT Futures for downward EMA20 breaks in the last 24h.
@@ -5577,7 +5051,6 @@ def v30_scan_ema20_breakdowns(progress=None, max_workers=4):
     rows.sort(key=age_key)
     return rows, len(items), errors
 
-
 def v30_render_ema20_break_table(rows):
     """Trader-facing EMA20 breakdown table for short-entry hunting."""
     if not rows:
@@ -5633,28 +5106,12 @@ def v30_render_ema20_break_table(rows):
         "within the last 24 hours. This is a short-entry candidate list, not an automatic trade."
     )
 
-
-
-
-
-# =============================================================================
-# V33 — SYMMETRIC HEALTHY-PULLBACK / STRUCTURE-REVERSAL ENGINE
-# =============================================================================
-# Core idea:
-# LONG:
-#   bullish HH/HL structure -> price pulls toward 15m EMA20
-#   -> EMA20 holds -> higher low -> local bounce high breaks -> LONG
-#
-# SHORT:
-#   bearish LH/LL structure -> price bounces toward 15m EMA20
-#   -> EMA20 rejects -> lower high -> local bounce low breaks -> SHORT
-#
-# The engine deliberately does NOT chase an extended HH/LL. 4H and 1D
-# support/resistance are decision zones, not automatic exits/reversals.
-
 V33_EMA_NEAR_PCT = 1.25
+
 V33_MIN_SWING_PCT = 0.25
+
 V33_LOOKBACK_15M = 160
+
 V33_MAX_RETESTS = 6
 
 def v33_pct(a, b):
@@ -5919,136 +5376,175 @@ def v33_render_tables(records):
         if rows: st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
         else: st.info("No fresh candidates on this side.")
 
-
-# -------------------------- V31 STRUCTURE PATH SCANNER -------------------------
-st.divider()
-st.subheader("🧭 V31 DUMP / RECOVERY PATH — EMA20 + HH/HL/LH/LL + MTF")
-st.caption(
-    "Finds coins that are actually progressing through the path: 15m EMA20 break/reclaim → "
-    "LH/LL or HH/HL → EMA20 retest rejection/hold → 4H support/resistance reaction → "
-    "possible second entry → 4H break → 1D target. LONG is the mirror image of SHORT."
-)
 v31_workers = st.slider("V31 path scanner workers", 2, 6, 4, 1, key="v31_path_workers")
-v31_candidates = st.slider("V31 MTF candidates", 20, 80, 40, 5, key="v31_path_candidates")
-if st.button("🧭 SCAN ALL COINS — DUMP / RECOVERY PATH", type="primary", key="v31_path_scan_button"):
-    v31_bar = st.progress(0, text="Scanning 15m structure paths across all Futures…")
-    def _v31_progress(done, total, text=None):
-        v31_bar.progress(min(100, int(done / max(total, 1) * 100)), text=text or f"Checking {done}/{total}…")
-    with st.spinner("Finding bearish dump paths and bullish recovery paths…"):
-        _v31_results, _v31_total, _v31_phase1 = v31_scan_structure_paths(
-            _v31_progress, max_workers=v31_workers, candidate_limit=v31_candidates
-        )
-    st.session_state["v31_path_results"] = _v31_results
-    st.session_state["v31_path_total"] = _v31_total
-    st.session_state["v31_path_phase1"] = _v31_phase1
-    st.session_state["v31_path_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    v31_bar.progress(100, text=f"Complete — {_v31_total} Futures checked")
-_v31_saved = st.session_state.get("v31_path_results", [])
-if _v31_saved:
-    st.caption(f"Last scan: {st.session_state.get('v31_path_time','—')} | Futures: {st.session_state.get('v31_path_total','—')} | MTF candidates: {st.session_state.get('v31_path_phase1','—')}")
-    _v31_long = [r for r in _v31_saved if str(r.get("side","")).startswith("LONG")]
-    _v31_short = [r for r in _v31_saved if str(r.get("side","")).startswith("SHORT")]
-    st.markdown("### 🟢 LONG — Recovery / continuation path")
-    v31_render_path_table(_v31_long[:10])
-    st.markdown("### 🔴 SHORT — Dump / continuation path")
-    v31_render_path_table(_v31_short[:10])
-    st.markdown("### 👀 WATCH / reaction zones")
-    _v31_watch = [r for r in _v31_saved if r.get("side") in ("WAIT","WATCH LONG","WATCH SHORT")]
-    v31_render_path_table(_v31_watch[:10])
-else:
-    st.info("Click **🧭 SCAN ALL COINS — DUMP / RECOVERY PATH** to run the new symmetric structure-path scanner.")
 
-# -------------------------- EMA20 BREAKDOWN SHORT SCANNER -----------------------
-st.divider()
-st.subheader("🔧 Legacy EMA20 breakdown engine (internal)")
-st.caption(
-    "Finds every active Futures coin whose completed 15m close crossed BELOW EMA20 "
-    "within the last 24 hours, or whose completed 4H close crossed BELOW EMA20 within "
-    "the last 24 hours. A coin being below EMA20 without a fresh cross is NOT enough."
-)
+v31_candidates = st.slider("V31 MTF candidates", 20, 80, 40, 5, key="v31_path_candidates")
+
+_v31_saved = st.session_state.get("v31_path_results", [])
 
 v30_workers = st.slider("EMA20 scanner workers", 2, 6, 4, 1, key="v30_ema_workers")
+
 v30_filter = st.radio(
     "Show",
     ["15m OR 4H", "15m only", "4H only", "15m AND 4H"],
     horizontal=True,
     key="v30_ema_filter"
 )
-if st.button("📉 SCAN ALL COINS — EMA20 BREAKS IN LAST 24H", type="secondary", key="v30_ema_scan_button"):
-    v30_bar = st.progress(0, text="Scanning EMA20 breakdowns across all Futures…")
-    def _v30_progress(done, total, text=None):
-        v30_bar.progress(int(done / max(total, 1) * 100), text=text or f"Checking {done}/{total}…")
-    with st.spinner("Checking 15m and 4H EMA20 breakdowns…"):
-        _v30_rows, _v30_total, _v30_errors = v30_scan_ema20_breakdowns(
-            _v30_progress, max_workers=v30_workers
-        )
-    st.session_state["v30_ema_rows"] = _v30_rows
-    st.session_state["v30_ema_total"] = _v30_total
-    st.session_state["v30_ema_errors"] = _v30_errors
-    st.session_state["v30_ema_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    v30_bar.progress(100, text=f"Complete — {_v30_total} Futures contracts checked")
 
 _v30_rows = st.session_state.get("v30_ema_rows", [])
-if _v30_rows:
-    if v30_filter == "15m only":
-        _v30_show = [r for r in _v30_rows if (r.get("break15") or {}).get("broken")]
-    elif v30_filter == "4H only":
-        _v30_show = [r for r in _v30_rows if (r.get("break4h") or {}).get("broken")]
-    elif v30_filter == "15m AND 4H":
-        _v30_show = [
-            r for r in _v30_rows
-            if (r.get("break15") or {}).get("broken") and (r.get("break4h") or {}).get("broken")
-        ]
-    else:
-        _v30_show = _v30_rows
 
-    st.caption(
-        f"Last EMA20 scan: {st.session_state.get('v30_ema_time','—')} | "
-        f"{len(_v30_show)} matching coins | {st.session_state.get('v30_ema_total','—')} contracts checked"
-    )
-    v30_render_ema20_break_table(_v30_show)
-else:
-    st.info("Click **📉 SCAN ALL COINS — EMA20 BREAKS IN LAST 24H** to find fresh bearish EMA20 crosses.")
-
-if st.session_state.get("v30_ema_errors"):
-    with st.expander("🔧 EMA20 scan data errors", expanded=False):
-        for err in st.session_state["v30_ema_errors"][:50]:
-            st.write(err)
-
-
-# -------------------------- ANY-COIN DEEP MTF S/R ------------------------------
-st.divider()
-st.subheader("📐 MTF SUPPORT & RESISTANCE — MANUAL LOOKUP")
-st.caption("Optional: use this when you want to inspect S/R for a coin that is not already in the market results.")
 _v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK_USDT, DOGE_USDT", key="v22_mtf_sr_coin")
-if st.button("📐 SHOW 15m / 4H / 1D / 1W SUPPORT & RESISTANCE", key="v22_mtf_sr_button"):
+
+# =============================================================================
+# V34 PRIMARY UI — CLEAN SYMMETRIC HEALTHY-PULLBACK / STRUCTURE PATH AGENT
+# =============================================================================
+st.divider()
+st.header("🧠 V34 — Healthy Pullback / Structure Path Agent")
+st.caption(
+    "One core model for both directions: LONG = HH → HL → EMA20 test → hold → local-high break. "
+    "SHORT = LH → LL → EMA20 test → reject → local-low break. Do not chase extended moves. "
+    "4H and 1D levels are reaction/target zones, not automatic reversals."
+)
+
+v34_workers = st.slider("V34 scan workers", 2, 6, 4, 1, key="v34_workers")
+
+if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v34_scan_button"):
+    bar = st.progress(0, text="Loading active Futures…")
     try:
-        _req = normalize(_v22_sr_coin)
-        if not _req:
-            st.error("Enter a coin or Futures pair first.")
-        else:
-            _prices = futures_prices(); _match=None
-            for raw in active_instruments("USDT"):
-                pair=v61_instrument_pair(raw)
-                if not pair: continue
-                sym=v61_symbol(raw,pair)
-                if coin_matches(pair,sym,_req,"USDT"):
-                    p=v61_price_for_pair(_prices,pair)
-                    if not np.isfinite(p) or p<=0:
-                        c=completed(get_tf(pair,"15m",2))
-                        if c is not None and not c.empty: p=v6_num(c.iloc[-1].get("close"),np.nan)
-                    if np.isfinite(p) and p>0: _match=(pair,sym,p); break
-            if not _match:
-                st.error(f"Could not find an active CoinDCX Futures contract matching '{_v22_sr_coin}'.")
-            else:
-                pair,sym,p=_match
-                tf={"15m":get_tf(pair,"15m",12),"4H":get_tf(pair,"4H",120),"1D":get_tf(pair,"1D",180),"1W":get_tf(pair,"1W",365)}
-                sr=v13_mtf_support_resistance(tf,p); sm=v14_sr_summary(sr,p)
-                st.markdown(f"### {sym}")
-                a,b,c=st.columns(3); a.metric("Current",v13_format_price(p)); b.metric("Nearest Support",v13_format_price(sm.get("nearest_support")),f"{sm.get('support_dist_pct'):+.2f}%" if sm.get('support_dist_pct') is not None else "—"); c.metric("Nearest Resistance",v13_format_price(sm.get("nearest_resistance")),f"{sm.get('resistance_dist_pct'):+.2f}%" if sm.get('resistance_dist_pct') is not None else "—")
-                st.dataframe(pd.DataFrame(v13_sr_columns(sr)),use_container_width=True,hide_index=True)
+        instruments = active_instruments("USDT")
+        prices = futures_prices()
+        items = []
+
+        for raw in instruments:
+            pair = v61_instrument_pair(raw)
+            if not pair:
+                continue
+            symbol = v61_symbol(raw, pair)
+            price = v61_price_for_pair(prices, pair)
+            if not np.isfinite(price) or price <= 0:
+                try:
+                    d = completed(get_tf(pair, "15m", 2))
+                    if d is not None and not d.empty:
+                        price = v6_num(d.iloc[-1].get("close"), np.nan)
+                except Exception:
+                    price = np.nan
+            if np.isfinite(price) and price > 0:
+                items.append((pair, symbol, float(price)))
+
+        results = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def scan15(item):
+            pair, symbol, price = item
+            try:
+                d15 = get_tf(pair, "15m", 4)
+                if d15 is None or d15.empty:
+                    return None
+                p = v33_pullback_signal(d15, price)
+                if p.get("signal") == "WAIT":
+                    return None
+                return {
+                    "pair": pair,
+                    "symbol": symbol,
+                    "price": price,
+                    "d15": d15,
+                    "v33_pullback": p,
+                }
+            except Exception:
+                return None
+
+        total = len(items)
+        with ThreadPoolExecutor(max_workers=v34_workers) as ex:
+            fs = [ex.submit(scan15, item) for item in items]
+            for i, f in enumerate(as_completed(fs), 1):
+                try:
+                    rr = f.result()
+                    if rr:
+                        results.append(rr)
+                except Exception:
+                    pass
+                bar.progress(int(i / max(total, 1) * 100), text=f"15m structure {i}/{total}…")
+
+        # Enrich only the strongest directional candidates with 4H / 1D context.
+        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score", 0)))
+        enrich = results[:30]
+        with ThreadPoolExecutor(max_workers=min(v34_workers, 4)) as ex:
+            fs = [ex.submit(v33_attach_mtf_path, r) for r in enrich]
+            for f in as_completed(fs):
+                try:
+                    f.result()
+                except Exception:
+                    pass
+
+        results = v33_rank(enrich)
+        st.session_state["v34_results"] = results
+        st.session_state["v34_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["v34_total"] = total
+        bar.progress(100, text=f"Complete — {total} Futures checked")
     except Exception as e:
-        st.error(f"MTF S/R calculation failed: {e}")
+        st.error(f"V34 scan failed: {e}")
+
+_saved = st.session_state.get("v34_results", [])
+if _saved:
+    st.caption(
+        f"Last V34 scan: {st.session_state.get('v34_time', '—')} | "
+        f"Futures checked: {st.session_state.get('v34_total', '—')} | candidates: {len(_saved)}"
+    )
+
+    for side, title, emoji in (
+        ("LONG", "🟢 LONG — FRESH PULLBACK / NEXT-LEG ENTRIES", "🟢"),
+        ("SHORT", "🔴 SHORT — FRESH RETEST / NEXT-LEG ENTRIES", "🔴"),
+    ):
+        side_rows = []
+        for r in _saved:
+            if r.get("v33_side") != side:
+                continue
+            p = r.get("v33_pullback") or {}
+            sr = r.get("v33_sr") or {}
+            h4 = sr.get("4H") or {}
+            d1 = sr.get("1D") or {}
+            if side == "LONG":
+                zone4 = h4.get("R1")
+                zone1 = d1.get("R1")
+                sequence = "HH → HL → EMA20 TEST → HOLD → LOCAL HIGH BREAK"
+            else:
+                zone4 = h4.get("S1")
+                zone1 = d1.get("S1")
+                sequence = "LH → LL → EMA20 TEST → REJECT → LOCAL LOW BREAK"
+
+            stage = p.get("stage", "—")
+            if stage == "WAIT":
+                continue
+            ema_dist = p.get("ema_distance_pct", np.nan)
+            room4 = r.get("v33_room_4h_pct", np.nan)
+            side_rows.append({
+                "Coin": r.get("symbol", "—"),
+                "Signal": p.get("signal", "WAIT"),
+                "Stage": stage,
+                "Score": r.get("v33_score", 0),
+                "Current": v13_format_price(r.get("price")),
+                "EMA20": v13_format_price(p.get("ema20")),
+                "EMA dist": f"{ema_dist:.2f}%" if np.isfinite(ema_dist) else "—",
+                "Retests": p.get("retests", 0),
+                "SETUP SEQUENCE": sequence,
+                "Entry trigger": v13_format_price(p.get("local_trigger")),
+                "Invalidation": v13_format_price(p.get("invalidation")),
+                "4H next zone": v13_format_price(zone4),
+                "1D target": v13_format_price(zone1),
+                "4H room": f"{room4:.2f}%" if np.isfinite(room4) else "—",
+            })
+
+        st.subheader(f"{emoji} {title}")
+        if side_rows:
+            st.dataframe(pd.DataFrame(side_rows[:5]), use_container_width=True, hide_index=True)
+        else:
+            st.info("No fresh candidates on this side.")
+else:
+    st.info("Run the V34 market scan to find fresh pullback/retest entries.")
 
 st.divider()
-st.caption("Core engines retained internally for the remaining workflows. Legacy V6/V6.1/V6.2/V7/Hot-ATH scanner panels have been removed from the visible app to keep the trading workflow simple.")
+st.caption(
+    "Trading rule: READY = trigger is present; WATCH = wait for the EMA20 pullback/retest and confirmation; "
+    "WAIT = no clean structure. Never chase a stretched move. A 4H support/resistance touch is a reaction zone, "
+    "not an automatic entry or reversal. Manual signals are analysis-only; no live orders are placed."
+)
