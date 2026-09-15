@@ -9,7 +9,80 @@ from datetime import datetime, timezone
 # APP
 # =============================================================================
 st.set_page_config(page_title="CoinDCX Futures Trading Agent", page_icon="🎯", layout="wide")
-st.title("🎯 CoinDCX Futures Trading Agent")
+
+
+# =============================================================================
+# V33 PRIMARY UI — SYMMETRIC PULLBACK ENTRY AGENT
+# =============================================================================
+st.divider()
+st.header("🧠 V33 — Healthy Pullback / Structure Path Agent")
+st.caption(
+    "Primary strategy: do not chase extended moves. LONG waits for bullish HH/HL "
+    "structure + 15m EMA20 support + local-high break. SHORT is the exact reverse: "
+    "LH/LL + EMA20 rejection + local-low break. 4H and 1D levels are reaction zones."
+)
+v33_workers = st.slider("V33 scan workers", 2, 6, 4, 1, key="v33_workers")
+if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v33_scan_button"):
+    bar = st.progress(0, text="Loading active Futures…")
+    try:
+        instruments = active_instruments("USDT")
+        prices = futures_prices()
+        items=[]
+        for inst in instruments:
+            pair = inst.get("pair") if isinstance(inst,dict) else None
+            symbol = inst.get("symbol") if isinstance(inst,dict) else pair
+            if not pair: continue
+            price = None
+            if isinstance(prices,dict):
+                price = prices.get(pair) or prices.get(symbol)
+            if price is None: continue
+            try: price=float(price)
+            except: continue
+            items.append((pair,symbol,price))
+        results=[]
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def scan15(item):
+            pair,symbol,price=item
+            try:
+                d15=get_tf(pair,"15m",3)
+                if d15 is None or d15.empty: return None
+                p=v33_pullback_signal(d15,price)
+                # Keep directional WATCH/READY states; mixed WAIT is not a trade candidate.
+                if p.get("signal")=="WAIT": return None
+                return {"pair":pair,"symbol":symbol,"price":price,"d15":d15,"v33_pullback":p}
+            except Exception:
+                return None
+        total=len(items)
+        with ThreadPoolExecutor(max_workers=v33_workers) as ex:
+            fs=[ex.submit(scan15,it) for it in items]
+            for i,f in enumerate(as_completed(fs),1):
+                try:
+                    rr=f.result()
+                    if rr: results.append(rr)
+                except Exception: pass
+                bar.progress(int(i/max(total,1)*100),text=f"15m structure {i}/{total}…")
+        # Enrich only the best directional candidates, keeping API load manageable.
+        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score",0)))
+        enrich=results[:30]
+        with ThreadPoolExecutor(max_workers=min(v33_workers,4)) as ex:
+            fs=[ex.submit(v33_attach_mtf_path,r) for r in enrich]
+            for f in as_completed(fs):
+                try: f.result()
+                except Exception: pass
+        results=v33_rank(enrich)
+        st.session_state["v33_results"]=results
+        st.session_state["v33_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        bar.progress(100,text=f"Complete — {total} Futures checked")
+    except Exception as e:
+        st.error(f"V33 scan failed: {e}")
+
+_v33_saved=st.session_state.get("v33_results",[])
+if _v33_saved:
+    st.caption(f"Last V33 scan: {st.session_state.get('v33_time','—')} | candidates: {len(_v33_saved)}")
+    v33_render_tables(_v33_saved)
+else:
+    st.info("Run the V33 market scan to find fresh pullback/retest entries.")
+st.title("🧠 CoinDCX Intraday Trading Agent — V33")
 st.caption("Simple daily trading workflow: find today's structure, check multi-timeframe support/resistance, and investigate extreme pump/dump reversals.")
 
 API = "https://api.coindcx.com"
@@ -4505,17 +4578,17 @@ def v26_compact_sr_table_rows(records):
 
 
 # =============================================================================
-# V29 — FRESHNESS / NO-CHASE FILTER
+# V30 — FRESHNESS / NO-CHASE FILTER
 # =============================================================================
 # The market can be bullish while the LONG entry is already late, or bearish
-# while the SHORT has already traveled too far. V29 ranks "tradeable now",
+# while the SHORT has already traveled too far. V30 ranks "tradeable now",
 # not merely "directionally correct".
-V29_LONG_MAX_3D_EXTENDED = 50.0
-V29_LONG_MAX_FROM_PEAK_FRESH = -15.0
-V29_LONG_TOO_LATE_FROM_PEAK = -20.0
-V29_SHORT_FRESH_FROM_PEAK = -12.0
-V29_SHORT_TOO_LATE_FROM_PEAK = -22.0
-V29_YESTERDAY_PUMP_MIN = 15.0
+V30_LONG_MAX_3D_EXTENDED = 50.0
+V30_LONG_MAX_FROM_PEAK_FRESH = -15.0
+V30_LONG_TOO_LATE_FROM_PEAK = -20.0
+V30_SHORT_FRESH_FROM_PEAK = -12.0
+V30_SHORT_TOO_LATE_FROM_PEAK = -22.0
+V30_YESTERDAY_PUMP_MIN = 15.0
 
 
 def v29_freshness_metrics(d1, current, side, today=None, yesterday=None):
@@ -4558,10 +4631,10 @@ def v29_freshness_metrics(d1, current, side, today=None, yesterday=None):
 
         if side == "SHORT":
             fp = out["from_peak_pct"]
-            pump_flag = bool(y.get("flag")) and float(y.get("pump_pct", 0) or 0) >= V29_YESTERDAY_PUMP_MIN
+            pump_flag = bool(y.get("flag")) and float(y.get("pump_pct", 0) or 0) >= V30_YESTERDAY_PUMP_MIN
             fall = float(y.get("today_vs_yesterday_close_pct", 0) or 0)
 
-            if np.isfinite(fp) and fp <= V29_SHORT_TOO_LATE_FROM_PEAK:
+            if np.isfinite(fp) and fp <= V30_SHORT_TOO_LATE_FROM_PEAK:
                 out.update(freshness="🔴 TOO LATE — DUMP ALREADY TRAVELED",
                            freshness_score=-35, trade_eligible=False)
                 out["freshness_reason"] = f"{fp:.1f}% from recent peak"
@@ -4848,6 +4921,1099 @@ else:
         st.info("Run the scan again after a short pause. The scanner uses a low worker count and retries each 15m request.")
     else:
         st.info("Click **⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES** to scan the whole Futures market. The first pass uses 15m only for all contracts; higher timeframes are fetched only for the best candidates.")
+
+
+
+# =============================================================================
+# =============================================================================
+# V31 — EMA20 + MTF STRUCTURE PATH AGENT
+# =============================================================================
+# This is a state-machine style scanner based on the user's observed dump/recovery
+# path.  It does NOT assume that support/resistance must hold or break.  It waits
+# for price/structure confirmation at each decision zone.
+#
+# SHORT path:
+#   15m EMA20 break -> LH/LL -> EMA20 retest/rejection -> new LL
+#   -> 4H support reaction -> possible bounce -> EMA20 rejection + LH/LL
+#   -> 4H support break -> 1D support target
+#
+# LONG is the exact mirror:
+#   15m EMA20 reclaim -> HH/HL -> EMA20 pullback/hold -> new HH
+#   -> 4H resistance reaction -> possible pullback -> EMA20 hold + HH/HL
+#   -> 4H resistance break -> 1D resistance target
+#
+# The scanner uses completed candles only. It is a signal/research engine, not an
+# automatic live-order executor.
+
+V31_LOOKBACK_15M = 192
+V31_LOOKBACK_4H = 180
+V31_LOOKBACK_1D = 220
+V31_EMA_TOUCH_PCT = 0.75
+V31_SR_ZONE_PCT = 0.80
+V31_MIN_PATH_SCORE = 58
+V31_MAX_RESULTS = 20
+
+
+def v31_pct(a, b):
+    try:
+        a, b = float(a), float(b)
+        return (a / b - 1.0) * 100.0 if b > 0 else np.nan
+    except Exception:
+        return np.nan
+
+
+def v31_ema20_cross(df, direction, lookback=96):
+    """Most recent completed close cross through EMA20.
+
+    direction='DOWN': previous close >= previous EMA20 and current close < EMA20.
+    direction='UP':   previous close <= previous EMA20 and current close > EMA20.
+    """
+    out = {"found": False, "bars_ago": None, "price": np.nan, "ema": np.nan,
+           "index": None, "time": None}
+    try:
+        x = indicators(completed(df))
+        if x is None or x.empty:
+            return out
+        x = x.dropna(subset=["close", "ema20"]).reset_index(drop=True)
+        if len(x) < 25:
+            return out
+        start = max(1, len(x) - int(lookback))
+        hits = []
+        for i in range(start, len(x)):
+            pc, pe = float(x.iloc[i-1].close), float(x.iloc[i-1].ema20)
+            c, e = float(x.iloc[i].close), float(x.iloc[i].ema20)
+            ok = (pc >= pe and c < e) if direction == "DOWN" else (pc <= pe and c > e)
+            if ok:
+                hits.append(i)
+        if not hits:
+            return out
+        i = hits[-1]
+        row = x.iloc[i]
+        out.update({"found": True, "bars_ago": int(len(x)-1-i),
+                    "price": float(row.close), "ema": float(row.ema20),
+                    "index": i, "time": str(row.get("timestamp", row.name))})
+    except Exception:
+        pass
+    return out
+
+
+def v31_retest_failures(df, side, lookback=120, touch_pct=V31_EMA_TOUCH_PCT):
+    """Count EMA20 retests followed by directional rejection and a new local extreme.
+
+    SHORT: high gets near/through EMA20, then a later close falls below the retest
+    candle low; bonus if price also makes a new low relative to the pre-retest range.
+    LONG: mirror image using low/EMA20 and a later close above the retest candle high.
+    """
+    out = {"count": 0, "new_extremes": 0, "last_retest_bars_ago": None,
+           "last_retest_index": None, "rejections": []}
+    try:
+        x = indicators(completed(df))
+        if x is None or x.empty:
+            return out
+        x = x.dropna(subset=["open","high","low","close","ema20"]).reset_index(drop=True)
+        if len(x) < 35:
+            return out
+        start = max(20, len(x) - int(lookback))
+        n = len(x)
+        for i in range(start, n-3):
+            c = float(x.iloc[i].close); e = float(x.iloc[i].ema20)
+            h = float(x.iloc[i].high); l = float(x.iloc[i].low)
+            if side == "SHORT":
+                touch = h >= e * (1.0 - touch_pct/100.0) and abs(h/e-1.0)*100 <= touch_pct*1.8
+                # Permit a wick through EMA20: rejection is still bearish if close is below it.
+                touch = touch and c <= e * 1.002
+                if not touch:
+                    continue
+                future = x.iloc[i+1:min(n, i+7)]
+                if future.empty:
+                    continue
+                rej = future[future["close"] < l]
+                if rej.empty:
+                    continue
+                j = int(rej.index[0])
+                pre_low = float(x.iloc[max(start, i-12):i]["low"].min())
+                new_ext = float(x.iloc[j].low) < pre_low
+            else:
+                touch = l <= e * (1.0 + touch_pct/100.0) and abs(l/e-1.0)*100 <= touch_pct*1.8
+                touch = touch and c >= e * 0.998
+                if not touch:
+                    continue
+                future = x.iloc[i+1:min(n, i+7)]
+                if future.empty:
+                    continue
+                rej = future[future["close"] > h]
+                if rej.empty:
+                    continue
+                j = int(rej.index[0])
+                pre_high = float(x.iloc[max(start, i-12):i]["high"].max())
+                new_ext = float(x.iloc[j].high) > pre_high
+            out["count"] += 1
+            if new_ext:
+                out["new_extremes"] += 1
+            out["last_retest_bars_ago"] = int(n-1-i)
+            out["last_retest_index"] = i
+            out["rejections"].append({"index": i, "bars_ago": int(n-1-i), "new_extreme": bool(new_ext)})
+        out["rejections"] = out["rejections"][-5:]
+    except Exception:
+        pass
+    return out
+
+
+def v31_recent_structure(df, side, lookback=100):
+    """Use V7 confirmed pivots to test whether the recent sequence supports the side."""
+    try:
+        s = v71_structure_tf(df, "15m")
+        # v71 already uses confirmed pivots and completed candles.
+        if side == "SHORT":
+            return {
+                "ok": bool(s.get("lh") and s.get("ll")),
+                "partial": bool(s.get("lh") or s.get("ll")),
+                "state": s.get("state", "—"),
+                "score": int(s.get("score", 0)),
+                "lh": bool(s.get("lh")), "ll": bool(s.get("ll")),
+                "last_high": s.get("last_high", np.nan), "last_low": s.get("last_low", np.nan),
+            }
+        return {
+            "ok": bool(s.get("hh") and s.get("hl")),
+            "partial": bool(s.get("hh") or s.get("hl")),
+            "state": s.get("state", "—"),
+            "score": int(s.get("score", 0)),
+            "hh": bool(s.get("hh")), "hl": bool(s.get("hl")),
+            "last_high": s.get("last_high", np.nan), "last_low": s.get("last_low", np.nan),
+        }
+    except Exception:
+        return {"ok": False, "partial": False, "state": "—", "score": 0}
+
+
+def v31_levels(tf_df, price):
+    """Return robust S1/S2/S3 and R1/R2/R3 for a timeframe."""
+    try:
+        sr = v28_basic_sr_from_df(tf_df, price)
+        return sr if isinstance(sr, dict) else {}
+    except Exception:
+        return {}
+
+
+def v31_nearest_below(sr, price, key_prefix="S"):
+    vals = []
+    for k in ("S1","S2","S3"):
+        try:
+            v = float(sr.get(k))
+            if np.isfinite(v) and v < price:
+                vals.append((v, k))
+        except Exception:
+            pass
+    return max(vals, key=lambda z:z[0]) if vals else (np.nan, "—")
+
+
+def v31_nearest_above(sr, price, key_prefix="R"):
+    vals = []
+    for k in ("R1","R2","R3"):
+        try:
+            v = float(sr.get(k))
+            if np.isfinite(v) and v > price:
+                vals.append((v, k))
+        except Exception:
+            pass
+    return min(vals, key=lambda z:z[0]) if vals else (np.nan, "—")
+
+
+def v31_path_analyze(pair, symbol, current, d15, d4h, d1d):
+    """Classify the current location in the bearish/bullish path."""
+    result = {
+        "pair": pair, "symbol": symbol, "current": float(current) if np.isfinite(current) else np.nan,
+        "side": "WAIT", "state": "WAIT", "score": 0, "trigger": "—", "invalidation": "—",
+        "ema15": np.nan, "ema4h": np.nan, "ema15_distance_pct": np.nan,
+        "sr4h": {}, "sr1d": {}, "support4h": np.nan, "resistance4h": np.nan,
+        "target1d": np.nan, "room_pct": np.nan, "retests": 0, "new_extremes": 0,
+        "break_age_15m": None, "reason": "", "structure": "—", "path_stage": "WAIT"
+    }
+    try:
+        c = float(current)
+        if not np.isfinite(c) or c <= 0:
+            return result
+        x15 = indicators(completed(d15)); x4 = indicators(completed(d4h))
+        if x15 is None or x15.empty or x4 is None or x4.empty:
+            return result
+        q15, q4 = x15.iloc[-1], x4.iloc[-1]
+        e15, e4 = float(q15.ema20), float(q4.ema20)
+        result["ema15"], result["ema4h"] = e15, e4
+        result["ema15_distance_pct"] = v31_pct(c, e15)
+
+        sr4 = v31_levels(d4h, c); sr1 = v31_levels(d1d, c)
+        result["sr4h"], result["sr1d"] = sr4, sr1
+        s4, s4name = v31_nearest_below(sr4, c)
+        r4, r4name = v31_nearest_above(sr4, c)
+        s1, s1name = v31_nearest_below(sr1, c)
+        r1, r1name = v31_nearest_above(sr1, c)
+        result["support4h"], result["resistance4h"] = s4, r4
+
+        # Bearish path -------------------------------------------------------
+        bd = v31_ema20_cross(d15, "DOWN", 96)
+        bs = v31_recent_structure(d15, "SHORT")
+        br = v31_retest_failures(d15, "SHORT", 120)
+        near_s4 = np.isfinite(s4) and abs(v31_pct(c, s4)) <= V31_SR_ZONE_PCT
+        s4_broken = np.isfinite(s4) and c < s4 * (1.0 - 0.003)
+        bounce_after_s4 = False
+        if np.isfinite(s4):
+            d = completed(d15).tail(96)
+            try:
+                lows = pd.to_numeric(d["low"], errors="coerce")
+                highs = pd.to_numeric(d["high"], errors="coerce")
+                touched = lows <= s4 * (1.0 + V31_SR_ZONE_PCT/100.0)
+                if touched.any():
+                    first = int(np.where(touched.to_numpy())[0][-1])
+                    post = d.iloc[first:]
+                    bounce_after_s4 = len(post) >= 3 and float(post["high"].max()) >= s4 * (1.0 + 0.5/100.0)
+            except Exception:
+                pass
+
+        short_score = 0; short_reasons = []
+        if bd["found"]:
+            short_score += 22; short_reasons.append("15m EMA20 broke down")
+            result["break_age_15m"] = bd["bars_ago"]
+        if bs.get("ok"):
+            short_score += 28; short_reasons.append("15m LH + LL")
+        elif bs.get("partial"):
+            short_score += 12; short_reasons.append("15m bearish structure developing")
+        if br["count"]:
+            short_score += min(20, br["count"]*7); short_reasons.append(f'{br["count"]} EMA20 retest rejection(s)')
+        if br["new_extremes"]:
+            short_score += min(12, br["new_extremes"]*6); short_reasons.append(f'{br["new_extremes"]} rejection(s) made new LL')
+        if np.isfinite(e15) and c < e15:
+            short_score += 5; short_reasons.append("price below 15m EMA20")
+        if np.isfinite(e4) and c < e4:
+            short_score += 8; short_reasons.append("price below 4H EMA20")
+        if np.isfinite(s4):
+            result["target1d"] = s1
+            if np.isfinite(s1) and c > s1:
+                result["room_pct"] = abs(v31_pct(s1, c))
+        if s4_broken:
+            short_score += 14; short_reasons.append("4H support broken")
+        if bounce_after_s4:
+            short_score += 6; short_reasons.append("4H support produced a bounce")
+
+        # A fresh 4H support reaction is a WAIT zone unless the bounce has
+        # subsequently failed. This prevents chasing directly into support.
+        if near_s4 and not s4_broken and not (bounce_after_s4 and br["count"]):
+            short_score = min(short_score, 54)
+            result["state"] = "🟡 4H SUPPORT — EXPECT REACTION"
+            result["path_stage"] = "4H SUPPORT REACTION"
+        elif s4_broken and short_score >= V31_MIN_PATH_SCORE:
+            result["state"] = "🔥 SHORT CONTINUATION — 4H SUPPORT BROKEN"
+            result["path_stage"] = "4H BREAK → 1D SUPPORT"
+        elif bounce_after_s4 and br["count"] and bs.get("ok") and short_score >= V31_MIN_PATH_SCORE:
+            result["state"] = "🟢 SHORT RE-ENTRY — BOUNCE FAILED"
+            result["path_stage"] = "4H BOUNCE → EMA20 REJECTION"
+        elif short_score >= V31_MIN_PATH_SCORE and bd["found"]:
+            result["state"] = "🟢 SHORT SETUP — EMA20 RETEST PATH"
+            result["path_stage"] = "EMA20 BREAK → LH/LL → RETEST"
+
+        # Bullish mirror -----------------------------------------------------
+        bu = v31_ema20_cross(d15, "UP", 96)
+        ls = v31_recent_structure(d15, "LONG")
+        lr = v31_retest_failures(d15, "LONG", 120)
+        near_r4 = np.isfinite(r4) and abs(v31_pct(c, r4)) <= V31_SR_ZONE_PCT
+        r4_broken = np.isfinite(r4) and c > r4 * (1.0 + 0.003)
+        pullback_after_r4 = False
+        if np.isfinite(r4):
+            d = completed(d15).tail(96)
+            try:
+                highs = pd.to_numeric(d["high"], errors="coerce")
+                touched = highs >= r4 * (1.0 - V31_SR_ZONE_PCT/100.0)
+                if touched.any():
+                    first = int(np.where(touched.to_numpy())[0][-1])
+                    post = d.iloc[first:]
+                    pullback_after_r4 = len(post) >= 3 and float(post["low"].min()) <= r4 * (1.0 - 0.5/100.0)
+            except Exception:
+                pass
+        long_score = 0; long_reasons = []
+        if bu["found"]:
+            long_score += 22; long_reasons.append("15m EMA20 broke upward")
+        if ls.get("ok"):
+            long_score += 28; long_reasons.append("15m HH + HL")
+        elif ls.get("partial"):
+            long_score += 12; long_reasons.append("15m bullish structure developing")
+        if lr["count"]:
+            long_score += min(20, lr["count"]*7); long_reasons.append(f'{lr["count"]} EMA20 retest hold(s)')
+        if lr["new_extremes"]:
+            long_score += min(12, lr["new_extremes"]*6); long_reasons.append(f'{lr["new_extremes"]} hold(s) made new HH')
+        if np.isfinite(e15) and c > e15:
+            long_score += 5; long_reasons.append("price above 15m EMA20")
+        if np.isfinite(e4) and c > e4:
+            long_score += 8; long_reasons.append("price above 4H EMA20")
+        if np.isfinite(r1) and c < r1:
+            result["target1d"] = r1
+            result["room_pct"] = abs(v31_pct(r1, c))
+        if r4_broken:
+            long_score += 14; long_reasons.append("4H resistance broken")
+        if pullback_after_r4:
+            long_score += 6; long_reasons.append("4H resistance produced a pullback")
+
+        # Select the stronger side, but keep support/resistance reaction zones
+        # as WAIT rather than forcing a direction.
+        if near_r4 and not r4_broken and not (pullback_after_r4 and lr["count"]):
+            long_score = min(long_score, 54)
+        if long_score > short_score and long_score >= V31_MIN_PATH_SCORE:
+            if r4_broken:
+                result["state"] = "🔥 LONG CONTINUATION — 4H RESISTANCE BROKEN"
+                result["path_stage"] = "4H BREAK → 1D RESISTANCE"
+            elif pullback_after_r4 and lr["count"] and ls.get("ok"):
+                result["state"] = "🟢 LONG RE-ENTRY — PULLBACK HELD"
+                result["path_stage"] = "4H PULLBACK → EMA20 HOLD"
+            elif bu["found"]:
+                result["state"] = "🟢 LONG SETUP — EMA20 RETEST PATH"
+                result["path_stage"] = "EMA20 RECLAIM → HH/HL → RETEST"
+            else:
+                result["state"] = "🟡 LONG DEVELOPING"
+                result["path_stage"] = "HH/HL DEVELOPING"
+            result["side"], result["score"] = "LONG", min(100, int(long_score))
+            result["reason"] = " | ".join(long_reasons)
+            result["structure"] = ls.get("state", "—")
+            result["retests"], result["new_extremes"] = lr["count"], lr["new_extremes"]
+            result["resistance4h"] = r4
+            result["target1d"] = r1
+            result["trigger"] = f"Close above {v13_format_price(r4)} then HH" if np.isfinite(r4) and not r4_broken else "Retest hold + break latest HH"
+            result["invalidation"] = f"Below 4H R1 / latest HL" if np.isfinite(r4) else "Below latest HL"
+        elif short_score >= V31_MIN_PATH_SCORE:
+            result["side"], result["score"] = "SHORT", min(100, int(short_score))
+            result["reason"] = " | ".join(short_reasons)
+            result["structure"] = bs.get("state", "—")
+            result["retests"], result["new_extremes"] = br["count"], br["new_extremes"]
+            result["support4h"] = s4
+            result["target1d"] = s1
+            result["trigger"] = f"Retest {v13_format_price(e15)} and reject" if np.isfinite(e15) and not s4_broken else f"Break/retest below {v13_format_price(s4)}" if np.isfinite(s4) else "Break latest 15m LL"
+            result["invalidation"] = f"Above latest LH / 4H S1" if np.isfinite(s4) else "Above latest LH"
+        elif near_s4:
+            result["side"] = "WAIT" if result["state"].startswith("🟡") else "SHORT"
+            result["score"] = int(short_score)
+            result["reason"] = " | ".join(short_reasons) or "At 4H support; wait for bounce/rejection or breakdown"
+            result["structure"] = bs.get("state", "—")
+            result["retests"], result["new_extremes"] = br["count"], br["new_extremes"]
+        elif near_r4:
+            result["side"] = "WAIT"
+            result["score"] = int(long_score)
+            result["state"] = "🟡 4H RESISTANCE — EXPECT REACTION"
+            result["path_stage"] = "4H RESISTANCE REACTION"
+            result["reason"] = " | ".join(long_reasons) or "At 4H resistance; wait for pullback/hold or breakout"
+            result["structure"] = ls.get("state", "—")
+        else:
+            # Give the user a useful WATCH state without inventing a trade.
+            if long_score > short_score and long_score >= 35:
+                result["side"], result["score"] = "WATCH LONG", int(long_score)
+                result["state"] = "🟡 WATCH — WAIT FOR HH/HL CONFIRMATION"
+                result["reason"] = " | ".join(long_reasons)
+                result["structure"] = ls.get("state", "—")
+            elif short_score >= 35:
+                result["side"], result["score"] = "WATCH SHORT", int(short_score)
+                result["state"] = "🟡 WATCH — WAIT FOR LH/LL CONFIRMATION"
+                result["reason"] = " | ".join(short_reasons)
+                result["structure"] = bs.get("state", "—")
+        result["sr4h_name"] = s4name if np.isfinite(s4) else r4name
+        result["sr1d_name"] = s1name if np.isfinite(s1) else r1name
+        return result
+    except Exception as e:
+        result["reason"] = f"Analysis error: {type(e).__name__}: {e}"
+        return result
+
+
+def v31_scan_structure_paths(progress=None, max_workers=4, candidate_limit=40):
+    """Two-phase all-market scan: 15m discovery first, MTF path analysis second."""
+    instruments = active_instruments("USDT")
+    try:
+        prices = futures_prices()
+    except Exception:
+        prices = {}
+    items, seen = [], set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair:
+            continue
+        pair = str(pair).strip().upper()
+        if pair in seen:
+            continue
+        seen.add(pair)
+        items.append((pair, v61_symbol(inst, pair), v61_price_for_pair(prices, pair)))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    phase1 = []
+    def discover(item):
+        pair, symbol, live = item
+        try:
+            d15 = completed(get_tf(pair, "15m", 4))
+            if d15 is None or d15.empty or len(d15) < 40:
+                return None
+            current = float(live) if np.isfinite(live) and live > 0 else float(d15.iloc[-1].close)
+            ind = indicators(d15)
+            if ind is None or ind.empty:
+                return None
+            q = ind.iloc[-1]
+            c, e = float(q.close), float(q.ema20)
+            down = v31_ema20_cross(d15, "DOWN", 96)
+            up = v31_ema20_cross(d15, "UP", 96)
+            st_short = v31_recent_structure(d15, "SHORT")
+            st_long = v31_recent_structure(d15, "LONG")
+            # Candidate if it has a fresh cross, structure, or is currently in a
+            # meaningful EMA20 relationship. This keeps MTF calls manageable.
+            score = max(
+                (22 if down["found"] else 0) + (28 if st_short["ok"] else 12 if st_short["partial"] else 0),
+                (22 if up["found"] else 0) + (28 if st_long["ok"] else 12 if st_long["partial"] else 0),
+            )
+            if down["found"] or up["found"] or st_short["ok"] or st_long["ok"]:
+                return {"pair":pair,"symbol":symbol,"current":current,"d15":d15,"pre_score":score}
+        except Exception:
+            return None
+        return None
+    done = 0
+    workers = max(2, min(int(max_workers), 4))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fs = [ex.submit(discover, it) for it in items]
+        for f in as_completed(fs):
+            done += 1
+            if progress: progress(done, len(items), f"15m path discovery {done}/{len(items)}…")
+            try:
+                r = f.result()
+                if r: phase1.append(r)
+            except Exception: pass
+    phase1.sort(key=lambda r:(-r.get("pre_score",0), r.get("symbol","")))
+    targets = phase1[:max(10, int(candidate_limit))]
+
+    results = []
+    done2 = 0
+    def enrich(r):
+        try:
+            pair, c = r["pair"], float(r["current"])
+            d4 = completed(get_tf(pair, "4H", 120))
+            d1 = completed(get_tf(pair, "1D", 300))
+            return v31_path_analyze(pair, r["symbol"], c, r["d15"], d4, d1)
+        except Exception as e:
+            return {"pair":r.get("pair"),"symbol":r.get("symbol"),"current":r.get("current"),"side":"WAIT","score":0,"state":"DATA ERROR","reason":f"{type(e).__name__}: {e}"}
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fs = [ex.submit(enrich, r) for r in targets]
+        for f in as_completed(fs):
+            done2 += 1
+            if progress: progress(done + done2, len(items)+len(targets), f"MTF path analysis {done2}/{len(targets)}…")
+            try: results.append(f.result())
+            except Exception: pass
+    results.sort(key=lambda r:(-int(r.get("score",0)), r.get("symbol","")))
+    return results, len(items), len(phase1)
+
+
+def v31_render_path_table(results):
+    if not results:
+        st.info("No qualifying EMA20 + HH/HL/LH/LL path candidates found in the current scan.")
+        return
+    rows=[]
+    for r in results:
+        side=r.get("side","WAIT")
+        rows.append({
+            "Coin":r.get("symbol","—"), "Side":side, "Score":r.get("score",0),
+            "State":r.get("state","—"), "Current":v13_format_price(r.get("current")),
+            "4H S1":v13_format_price(r.get("support4h")), "4H R1":v13_format_price(r.get("resistance4h")),
+            "1D Target":v13_format_price(r.get("target1d")), "Room":f'{r.get("room_pct",np.nan):.2f}%' if np.isfinite(r.get("room_pct",np.nan)) else "—",
+            "EMA20 Retests":r.get("retests",0), "New HH/LL":r.get("new_extremes",0),
+            "Stage":r.get("path_stage","—")
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    st.caption("LONG and SHORT use the same structure logic in opposite directions. Support/resistance is treated as a reaction/decision zone, not a guaranteed reversal or breakout.")
+
+
+# V30 — EMA20 BREAKDOWN SCANNER FOR SHORT ENTRIES
+# =============================================================================
+def v30_find_downward_ema20_break(df, timeframe, lookback_bars):
+    """Find a completed-candle close crossing from ABOVE EMA20 to BELOW EMA20.
+
+    This is deliberately a CROSS, not merely "price is below EMA20".
+    The scan uses only completed candles and returns the most recent qualifying
+    break within the requested lookback.
+    """
+    out = {
+        "broken": False, "timeframe": timeframe, "bars_ago": None,
+        "break_time": None, "break_price": np.nan, "ema20_at_break": np.nan,
+        "current_price": np.nan, "current_ema20": np.nan,
+        "below_now_pct": np.nan, "description": ""
+    }
+    try:
+        d = completed(df)
+        if d is None or d.empty or len(d) < 25:
+            return out
+        x = indicators(d)
+        if x is None or x.empty or "ema20" not in x.columns:
+            return out
+        x = x.dropna(subset=["close", "ema20"]).reset_index(drop=True)
+        if len(x) < 25:
+            return out
+
+        start = max(1, len(x) - int(lookback_bars))
+        hits = []
+        for i in range(start, len(x)):
+            prev_close = float(x.iloc[i-1]["close"])
+            prev_ema = float(x.iloc[i-1]["ema20"])
+            cur_close = float(x.iloc[i]["close"])
+            cur_ema = float(x.iloc[i]["ema20"])
+            if (prev_close >= prev_ema) and (cur_close < cur_ema):
+                hits.append(i)
+
+        if not hits:
+            # Also report the current relation for diagnostics.
+            cur = x.iloc[-1]
+            cp, ce = float(cur["close"]), float(cur["ema20"])
+            out["current_price"] = cp
+            out["current_ema20"] = ce
+            out["below_now_pct"] = (cp / ce - 1.0) * 100.0 if ce > 0 else np.nan
+            return out
+
+        i = hits[-1]
+        row = x.iloc[i]
+        cp, ce = float(x.iloc[-1]["close"]), float(x.iloc[-1]["ema20"])
+        break_price, break_ema = float(row["close"]), float(row["ema20"])
+        ts = row.get("timestamp", row.name)
+        out.update({
+            "broken": True,
+            "bars_ago": int(len(x) - 1 - i),
+            "break_time": str(ts),
+            "break_price": break_price,
+            "ema20_at_break": break_ema,
+            "current_price": cp,
+            "current_ema20": ce,
+            "below_now_pct": (cp / ce - 1.0) * 100.0 if ce > 0 else np.nan,
+            "description": f"{timeframe} close crossed BELOW EMA20"
+        })
+    except Exception:
+        pass
+    return out
+
+
+def v30_scan_ema20_breakdowns(progress=None, max_workers=4):
+    """Scan all active USDT Futures for downward EMA20 breaks in the last 24h.
+
+    15m: any downward close/EMA20 cross among the last 96 completed candles.
+    4H: any downward close/EMA20 cross among the last 6 completed candles.
+    A coin appears if either condition is true.
+    """
+    instruments = active_instruments("USDT")
+    try:
+        prices = futures_prices()
+    except Exception:
+        prices = {}
+
+    items, seen = [], set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair:
+            continue
+        pair = str(pair).strip().upper()
+        if pair in seen:
+            continue
+        seen.add(pair)
+        symbol = v61_symbol(inst, pair)
+        live = v61_price_for_pair(prices, pair)
+        items.append((pair, symbol, live))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def scan_one(item):
+        pair, symbol, live = item
+        err = ""
+        try:
+            d15 = get_tf(pair, "15m", 5)
+            d15 = completed(d15)
+            b15 = v30_find_downward_ema20_break(d15, "15m", 96)
+            d4 = get_tf(pair, "4H", 30)
+            d4 = completed(d4)
+            b4 = v30_find_downward_ema20_break(d4, "4H", 6)
+
+            current = live
+            if not np.isfinite(current) or current <= 0:
+                current = v6_num(d15.iloc[-1].get("close"), np.nan) if d15 is not None and not d15.empty else np.nan
+
+            # Use the live price for the "below EMA20 now" field when available.
+            if np.isfinite(current) and current > 0:
+                if b15.get("current_ema20") and np.isfinite(b15["current_ema20"]):
+                    b15["below_now_pct"] = (current / float(b15["current_ema20"]) - 1.0) * 100.0
+                if b4.get("current_ema20") and np.isfinite(b4["current_ema20"]):
+                    b4["below_now_pct"] = (current / float(b4["current_ema20"]) - 1.0) * 100.0
+
+            return {
+                "pair": pair, "symbol": symbol,
+                "current": float(current) if np.isfinite(current) else np.nan,
+                "break15": b15, "break4h": b4, "error": ""
+            }
+        except Exception as e:
+            err = f"{type(e).__name__}: {e}"
+            return {"pair": pair, "symbol": symbol, "current": live,
+                    "break15": {"broken": False}, "break4h": {"broken": False},
+                    "error": err}
+
+    rows, errors = [], []
+    done = 0
+    workers = max(2, min(int(max_workers), 4))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = [ex.submit(scan_one, item) for item in items]
+        for fut in as_completed(futs):
+            done += 1
+            if progress:
+                progress(done, len(items), f"Checking EMA20 breaks {done}/{len(items)}…")
+            try:
+                r = fut.result()
+            except Exception as e:
+                r = {"pair":"", "symbol":"", "current":np.nan,
+                     "break15":{"broken":False}, "break4h":{"broken":False},
+                     "error":f"{type(e).__name__}: {e}"}
+            if r["break15"].get("broken") or r["break4h"].get("broken"):
+                rows.append(r)
+            if r.get("error"):
+                errors.append(f'{r.get("symbol","—")}: {r["error"]}')
+
+    def age_key(r):
+        ages = []
+        for b in (r.get("break15") or {}, r.get("break4h") or {}):
+            if b.get("broken") and b.get("bars_ago") is not None:
+                # Convert bar age approximately to minutes: 15m or 4h.
+                mult = 15 if b.get("timeframe") == "15m" else 240
+                ages.append(b["bars_ago"] * mult)
+        return min(ages) if ages else 999999
+
+    rows.sort(key=age_key)
+    return rows, len(items), errors
+
+
+def v30_render_ema20_break_table(rows):
+    """Trader-facing EMA20 breakdown table for short-entry hunting."""
+    if not rows:
+        st.info("No downward EMA20 breaks found in the last 24 hours.")
+        return
+
+    table = []
+    for r in rows:
+        b15 = r.get("break15") or {}
+        b4 = r.get("break4h") or {}
+        if b15.get("broken") and b4.get("broken"):
+            source = "15m + 4H"
+            latest = min(
+                f"15m {b15.get('bars_ago', '—')} bars ago",
+                f"4H {b4.get('bars_ago', '—')} bars ago",
+                key=lambda s: 0 if s.startswith("15m") else 1
+            )
+        elif b15.get("broken"):
+            source = "15m"
+            latest = f'{b15.get("bars_ago","—")} × 15m bars ago'
+        else:
+            source = "4H"
+            latest = f'{b4.get("bars_ago","—")} × 4H bars ago'
+
+        # Prefer the most recent break for display.
+        candidates = [b for b in (b15, b4) if b.get("broken")]
+        latest_b = min(candidates, key=lambda b: (b.get("bars_ago", 999999) * (15 if b.get("timeframe")=="15m" else 240)))
+        table.append({
+            "Coin": r.get("symbol", "—"),
+            "Current": v13_format_price(r.get("current")),
+            "Break": source,
+            "Most recent": latest,
+            "Break price": v13_format_price(latest_b.get("break_price")),
+            "EMA20 at break": v13_format_price(latest_b.get("ema20_at_break")),
+            "Now vs EMA20": f'{latest_b.get("below_now_pct", np.nan):.2f}%' if np.isfinite(latest_b.get("below_now_pct", np.nan)) else "—",
+            "15m break": "YES" if b15.get("broken") else "—",
+            "4H break": "YES" if b4.get("broken") else "—",
+            "Short check": "🟢 BREAKDOWN" if latest_b.get("below_now_pct", 0) < 0 else "🟡 RECLAIMED",
+        })
+
+    st.dataframe(
+        pd.DataFrame(table),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Now vs EMA20": st.column_config.TextColumn(
+                "Now vs EMA20", help="Negative means current price is below the EMA20."
+            )
+        }
+    )
+    st.caption(
+        "A result means the completed candle CLOSE crossed from above EMA20 to below EMA20 "
+        "within the last 24 hours. This is a short-entry candidate list, not an automatic trade."
+    )
+
+
+
+
+
+# =============================================================================
+# V33 — SYMMETRIC HEALTHY-PULLBACK / STRUCTURE-REVERSAL ENGINE
+# =============================================================================
+# Core idea:
+# LONG:
+#   bullish HH/HL structure -> price pulls toward 15m EMA20
+#   -> EMA20 holds -> higher low -> local bounce high breaks -> LONG
+#
+# SHORT:
+#   bearish LH/LL structure -> price bounces toward 15m EMA20
+#   -> EMA20 rejects -> lower high -> local bounce low breaks -> SHORT
+#
+# The engine deliberately does NOT chase an extended HH/LL. 4H and 1D
+# support/resistance are decision zones, not automatic exits/reversals.
+
+V33_EMA_NEAR_PCT = 1.25
+V33_MIN_SWING_PCT = 0.25
+V33_LOOKBACK_15M = 160
+V33_MAX_RETESTS = 6
+
+def v33_pct(a, b):
+    try:
+        a, b = float(a), float(b)
+        return (a / b - 1.0) * 100.0 if b else np.nan
+    except Exception:
+        return np.nan
+
+def v33_pivots(df, left=2, right=2):
+    """Confirmed swing highs/lows; only pivots with right-side confirmation."""
+    out = {"highs": [], "lows": []}
+    if df is None or len(df) < left + right + 5:
+        return out
+    h = pd.to_numeric(df["high"], errors="coerce").to_numpy()
+    l = pd.to_numeric(df["low"], errors="coerce").to_numpy()
+    for i in range(left, len(df)-right):
+        if np.isfinite(h[i]) and h[i] == np.max(h[i-left:i+right+1]):
+            if h[i] > np.max(h[i-left:i]) and h[i] >= np.max(h[i+1:i+right+1]):
+                out["highs"].append(i)
+        if np.isfinite(l[i]) and l[i] == np.min(l[i-left:i+right+1]):
+            if l[i] < np.min(l[i-left:i]) and l[i] <= np.min(l[i+1:i+right+1]):
+                out["lows"].append(i)
+    return out
+
+def v33_structure(df):
+    d = completed(df)
+    if d is None or d.empty:
+        return {"trend":"DATA LIMITED","hh":0,"hl":0,"lh":0,"ll":0,"pivots":{}}
+    p = v33_pivots(d)
+    highs, lows = p["highs"], p["lows"]
+    hh = lh = 0
+    hl = ll = 0
+    for a,b in zip(highs[:-1], highs[1:]):
+        if float(d.iloc[b]["high"]) > float(d.iloc[a]["high"]):
+            hh += 1
+        elif float(d.iloc[b]["high"]) < float(d.iloc[a]["high"]):
+            lh += 1
+    for a,b in zip(lows[:-1], lows[1:]):
+        if float(d.iloc[b]["low"]) > float(d.iloc[a]["low"]):
+            hl += 1
+        elif float(d.iloc[b]["low"]) < float(d.iloc[a]["low"]):
+            ll += 1
+    if hh > 0 and hl > 0 and hh + hl >= lh + ll:
+        trend = "BULLISH"
+    elif lh > 0 and ll > 0 and lh + ll > hh + hl:
+        trend = "BEARISH"
+    else:
+        trend = "MIXED"
+    return {"trend":trend, "hh":hh, "hl":hl, "lh":lh, "ll":ll, "pivots":p}
+
+def v33_pullback_signal(df15, current_price=None):
+    """
+    Classifies the latest completed 15m state:
+      LONG READY / LONG WATCH / SHORT READY / SHORT WATCH / WAIT
+    based on structure + EMA20 retest + confirmation break.
+    """
+    result = {
+        "signal":"WAIT", "stage":"NO SETUP", "score":0,
+        "reason":"", "ema20":np.nan, "ema_distance_pct":np.nan,
+        "retests":0, "holds_or_rejections":0, "local_trigger":np.nan,
+        "invalidation":np.nan, "structure":"MIXED",
+        "hh":0, "hl":0, "lh":0, "ll":0,
+    }
+    try:
+        d = completed(df15)
+        if d is None or len(d) < 40:
+            result["reason"] = "Not enough completed 15m candles"
+            return result
+        x = indicators(d)
+        if x is None or x.empty or "ema20" not in x:
+            result["reason"] = "EMA20 unavailable"
+            return result
+        x = x.dropna(subset=["close","high","low","ema20"]).reset_index(drop=True)
+        if len(x) < 40:
+            return result
+
+        cur = float(current_price) if current_price is not None else float(x.iloc[-1]["close"])
+        s = v33_structure(x)
+        result.update({k:s[k] for k in ("structure","hh","hl","lh","ll")})
+        e20 = float(x.iloc[-1]["ema20"])
+        result["ema20"] = e20
+        result["ema_distance_pct"] = v33_pct(cur, e20)
+
+        # Recent structure points.
+        p = s["pivots"]
+        highs, lows = p.get("highs", []), p.get("lows", [])
+        recent_highs = highs[-8:]
+        recent_lows = lows[-8:]
+        last_high = float(x.iloc[recent_highs[-1]]["high"]) if recent_highs else np.nan
+        last_low = float(x.iloc[recent_lows[-1]]["low"]) if recent_lows else np.nan
+
+        # Count recent EMA20 interactions and classify whether they held/rejected.
+        start = max(2, len(x) - V33_LOOKBACK_15M)
+        retests = []
+        for i in range(start, len(x)):
+            e = float(x.iloc[i]["ema20"])
+            hi, lo, cl = map(float, (x.iloc[i]["high"], x.iloc[i]["low"], x.iloc[i]["close"]))
+            near = min(abs(hi/e-1), abs(lo/e-1))*100 <= V33_EMA_NEAR_PCT
+            if near:
+                retests.append(i)
+        retests = retests[-V33_MAX_RETESTS:]
+        result["retests"] = len(retests)
+
+        # A local bounce trigger is the most recent confirmed pivot opposite
+        # the pullback direction.
+        if s["trend"] == "BULLISH":
+            # LONG: latest meaningful low near/below EMA20, then close above
+            # the most recent post-retest local high.
+            near_lows = [i for i in recent_lows if i >= start and
+                         abs(float(x.iloc[i]["low"])/float(x.iloc[i]["ema20"])-1)*100 <= V33_EMA_NEAR_PCT*1.8]
+            if near_lows:
+                li = near_lows[-1]
+                following_highs = [i for i in recent_highs if i > li]
+                trigger = float(x.iloc[following_highs[-1]]["high"]) if following_highs else float(x.iloc[-1]["high"])
+                inv = float(x.iloc[li]["low"])
+                result["local_trigger"], result["invalidation"] = trigger, inv
+
+                # Current bullish continuation confirmation.
+                close_now = float(x.iloc[-1]["close"])
+                ema_hold = close_now >= e20
+                hl_confirm = len(near_lows) > 0
+                if ema_hold and close_now > trigger and hl_confirm:
+                    result["signal"] = "LONG READY"
+                    result["stage"] = "EMA20 HOLD → LOCAL HIGH BREAK"
+                    result["score"] = 85 + min(10, result["retests"]*2)
+                    result["reason"] = "Bullish HH/HL structure, EMA20 pullback held, local bounce high broken."
+                elif abs(v33_pct(cur,e20)) <= V33_EMA_NEAR_PCT*1.8 and ema_hold:
+                    result["signal"] = "LONG WATCH"
+                    result["stage"] = "EMA20 SUPPORT TEST"
+                    result["score"] = 70 + min(10, result["retests"]*2)
+                    result["reason"] = "Bullish structure; price is testing EMA20. Wait for bounce/local-high break."
+                else:
+                    result["signal"] = "LONG WATCH"
+                    result["stage"] = "BULLISH — WAIT FOR EMA20 RETEST"
+                    result["score"] = 55
+                    result["reason"] = "Bullish structure exists but entry is extended; do not chase."
+        elif s["trend"] == "BEARISH":
+            near_highs = [i for i in recent_highs if i >= start and
+                          abs(float(x.iloc[i]["high"])/float(x.iloc[i]["ema20"])-1)*100 <= V33_EMA_NEAR_PCT*1.8]
+            if near_highs:
+                hi_i = near_highs[-1]
+                following_lows = [i for i in recent_lows if i > hi_i]
+                trigger = float(x.iloc[following_lows[-1]]["low"]) if following_lows else float(x.iloc[-1]["low"])
+                inv = float(x.iloc[hi_i]["high"])
+                result["local_trigger"], result["invalidation"] = trigger, inv
+
+                close_now = float(x.iloc[-1]["close"])
+                ema_reject = close_now <= e20
+                if ema_reject and close_now < trigger:
+                    result["signal"] = "SHORT READY"
+                    result["stage"] = "EMA20 REJECTION → LOCAL LOW BREAK"
+                    result["score"] = 85 + min(10, result["retests"]*2)
+                    result["reason"] = "Bearish LH/LL structure, EMA20 bounce rejected, local bounce low broken."
+                elif abs(v33_pct(cur,e20)) <= V33_EMA_NEAR_PCT*1.8 and ema_reject:
+                    result["signal"] = "SHORT WATCH"
+                    result["stage"] = "EMA20 RESISTANCE TEST"
+                    result["score"] = 70 + min(10, result["retests"]*2)
+                    result["reason"] = "Bearish structure; price is testing EMA20 from below. Wait for rejection/local-low break."
+                else:
+                    result["signal"] = "SHORT WATCH"
+                    result["stage"] = "BEARISH — WAIT FOR EMA20 RETEST"
+                    result["score"] = 55
+                    result["reason"] = "Bearish structure exists but entry is extended; do not chase."
+        else:
+            result["signal"] = "WAIT"
+            result["stage"] = "MIXED STRUCTURE"
+            result["score"] = 35
+            result["reason"] = "HH/HL and LH/LL are mixed; wait for structure to resolve."
+    except Exception as e:
+        result["reason"] = f"Analysis error: {e}"
+    return result
+
+def v33_attach_mtf_path(r, max_days=180):
+    """Enrich one candidate with 4H/1D S/R and path-room context."""
+    try:
+        pair = r["pair"]
+        price = float(r["price"])
+        tf = {"15m": r.get("d15", pd.DataFrame())}
+        for name, days in (("4H",90),("1D",max_days)):
+            try: tf[name] = get_tf(pair,name,days)
+            except Exception: tf[name] = pd.DataFrame()
+        try: tf["1W"] = resample_weekly(tf["1D"])
+        except Exception: tf["1W"] = pd.DataFrame()
+
+        sr = v13_mtf_support_resistance(tf, price)
+        r["v33_sr"] = sr
+        r["v33_pullback"] = v33_pullback_signal(tf["15m"], price)
+
+        # Target/room depends on direction.
+        sig = r["v33_pullback"]
+        side = "LONG" if sig["signal"].startswith("LONG") else "SHORT" if sig["signal"].startswith("SHORT") else None
+        r["v33_side"] = side
+        if side == "SHORT":
+            s4 = (sr.get("4H") or {}).get("S1")
+            s1d = (sr.get("1D") or {}).get("S1")
+            r["v33_next_zone"] = s4
+            r["v33_1d_zone"] = s1d
+            r["v33_room_4h_pct"] = v33_pct(price,s4) if s4 and s4 < price else np.nan
+            r["v33_room_1d_pct"] = v33_pct(price,s1d) if s1d and s1d < price else np.nan
+        elif side == "LONG":
+            r4 = (sr.get("4H") or {}).get("R1")
+            r1d = (sr.get("1D") or {}).get("R1")
+            r["v33_next_zone"] = r4
+            r["v33_1d_zone"] = r1d
+            r["v33_room_4h_pct"] = v33_pct(r4,price) if r4 and r4 > price else np.nan
+            r["v33_room_1d_pct"] = v33_pct(r1d,price) if r1d and r1d > price else np.nan
+    except Exception as e:
+        r["v33_error"] = str(e)
+    return r
+
+def v33_rank(records):
+    """Rank fresh READY/WATCH setups while penalizing extended entries."""
+    scored=[]
+    for r in records:
+        p=r.get("v33_pullback") or {}
+        sig=p.get("signal","WAIT")
+        score=float(p.get("score",0))
+        room=float(r.get("v33_room_4h_pct",np.nan))
+        if np.isfinite(room):
+            if room >= 5: score += 10
+            elif room >= 2: score += 5
+            elif room < 1: score -= 15
+        dist=abs(float(p.get("ema_distance_pct",np.nan))) if np.isfinite(p.get("ema_distance_pct",np.nan)) else 99
+        if dist > 5: score -= 20
+        if sig in ("LONG READY","SHORT READY"): score += 10
+        r["v33_score"]=max(0, min(100, int(round(score))))
+        scored.append(r)
+    return sorted(scored,key=lambda r:(-r.get("v33_score",0),r.get("symbol","")))
+
+def v33_render_tables(records):
+    if not records:
+        st.info("No V33 setups found.")
+        return
+    for side, title, emoji in (("LONG","🟢 LONG — FRESH PULLBACK ENTRIES","🟢"),
+                               ("SHORT","🔴 SHORT — FRESH RETEST ENTRIES","🔴")):
+        rows=[]
+        for r in records:
+            if r.get("v33_side") != side: continue
+            p=r.get("v33_pullback") or {}
+            sr=r.get("v33_sr") or {}
+            tf="4H" if side=="SHORT" else "4H"
+            zone=(sr.get(tf) or {}).get("S1" if side=="SHORT" else "R1")
+            zone1=(sr.get("1D") or {}).get("S1" if side=="SHORT" else "R1")
+            rows.append({
+                "Coin":r.get("symbol","—"),
+                "Signal":p.get("signal","WAIT"),
+                "Stage":p.get("stage","—"),
+                "Score":r.get("v33_score",0),
+                "Current":v13_format_price(r.get("price")),
+                "EMA20":v13_format_price(p.get("ema20")),
+                "EMA dist":f'{p.get("ema_distance_pct",np.nan):.2f}%' if np.isfinite(p.get("ema_distance_pct",np.nan)) else "—",
+                "Retests":p.get("retests",0),
+                "Trigger":v13_format_price(p.get("local_trigger")),
+                "Invalidation":v13_format_price(p.get("invalidation")),
+                "4H S/R":v13_format_price(zone),
+                "1D S/R":v13_format_price(zone1),
+                "4H room":f'{r.get("v33_room_4h_pct",np.nan):.2f}%' if np.isfinite(r.get("v33_room_4h_pct",np.nan)) else "—",
+            })
+        rows=rows[:5]
+        st.subheader(f"{emoji} {title}")
+        if rows: st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+        else: st.info("No fresh candidates on this side.")
+
+
+# -------------------------- V31 STRUCTURE PATH SCANNER -------------------------
+st.divider()
+st.subheader("🧭 V31 DUMP / RECOVERY PATH — EMA20 + HH/HL/LH/LL + MTF")
+st.caption(
+    "Finds coins that are actually progressing through the path: 15m EMA20 break/reclaim → "
+    "LH/LL or HH/HL → EMA20 retest rejection/hold → 4H support/resistance reaction → "
+    "possible second entry → 4H break → 1D target. LONG is the mirror image of SHORT."
+)
+v31_workers = st.slider("V31 path scanner workers", 2, 6, 4, 1, key="v31_path_workers")
+v31_candidates = st.slider("V31 MTF candidates", 20, 80, 40, 5, key="v31_path_candidates")
+if st.button("🧭 SCAN ALL COINS — DUMP / RECOVERY PATH", type="primary", key="v31_path_scan_button"):
+    v31_bar = st.progress(0, text="Scanning 15m structure paths across all Futures…")
+    def _v31_progress(done, total, text=None):
+        v31_bar.progress(min(100, int(done / max(total, 1) * 100)), text=text or f"Checking {done}/{total}…")
+    with st.spinner("Finding bearish dump paths and bullish recovery paths…"):
+        _v31_results, _v31_total, _v31_phase1 = v31_scan_structure_paths(
+            _v31_progress, max_workers=v31_workers, candidate_limit=v31_candidates
+        )
+    st.session_state["v31_path_results"] = _v31_results
+    st.session_state["v31_path_total"] = _v31_total
+    st.session_state["v31_path_phase1"] = _v31_phase1
+    st.session_state["v31_path_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    v31_bar.progress(100, text=f"Complete — {_v31_total} Futures checked")
+_v31_saved = st.session_state.get("v31_path_results", [])
+if _v31_saved:
+    st.caption(f"Last scan: {st.session_state.get('v31_path_time','—')} | Futures: {st.session_state.get('v31_path_total','—')} | MTF candidates: {st.session_state.get('v31_path_phase1','—')}")
+    _v31_long = [r for r in _v31_saved if str(r.get("side","")).startswith("LONG")]
+    _v31_short = [r for r in _v31_saved if str(r.get("side","")).startswith("SHORT")]
+    st.markdown("### 🟢 LONG — Recovery / continuation path")
+    v31_render_path_table(_v31_long[:10])
+    st.markdown("### 🔴 SHORT — Dump / continuation path")
+    v31_render_path_table(_v31_short[:10])
+    st.markdown("### 👀 WATCH / reaction zones")
+    _v31_watch = [r for r in _v31_saved if r.get("side") in ("WAIT","WATCH LONG","WATCH SHORT")]
+    v31_render_path_table(_v31_watch[:10])
+else:
+    st.info("Click **🧭 SCAN ALL COINS — DUMP / RECOVERY PATH** to run the new symmetric structure-path scanner.")
+
+# -------------------------- EMA20 BREAKDOWN SHORT SCANNER -----------------------
+st.divider()
+st.subheader("🔧 Legacy EMA20 breakdown engine (internal)")
+st.caption(
+    "Finds every active Futures coin whose completed 15m close crossed BELOW EMA20 "
+    "within the last 24 hours, or whose completed 4H close crossed BELOW EMA20 within "
+    "the last 24 hours. A coin being below EMA20 without a fresh cross is NOT enough."
+)
+
+v30_workers = st.slider("EMA20 scanner workers", 2, 6, 4, 1, key="v30_ema_workers")
+v30_filter = st.radio(
+    "Show",
+    ["15m OR 4H", "15m only", "4H only", "15m AND 4H"],
+    horizontal=True,
+    key="v30_ema_filter"
+)
+if st.button("📉 SCAN ALL COINS — EMA20 BREAKS IN LAST 24H", type="secondary", key="v30_ema_scan_button"):
+    v30_bar = st.progress(0, text="Scanning EMA20 breakdowns across all Futures…")
+    def _v30_progress(done, total, text=None):
+        v30_bar.progress(int(done / max(total, 1) * 100), text=text or f"Checking {done}/{total}…")
+    with st.spinner("Checking 15m and 4H EMA20 breakdowns…"):
+        _v30_rows, _v30_total, _v30_errors = v30_scan_ema20_breakdowns(
+            _v30_progress, max_workers=v30_workers
+        )
+    st.session_state["v30_ema_rows"] = _v30_rows
+    st.session_state["v30_ema_total"] = _v30_total
+    st.session_state["v30_ema_errors"] = _v30_errors
+    st.session_state["v30_ema_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    v30_bar.progress(100, text=f"Complete — {_v30_total} Futures contracts checked")
+
+_v30_rows = st.session_state.get("v30_ema_rows", [])
+if _v30_rows:
+    if v30_filter == "15m only":
+        _v30_show = [r for r in _v30_rows if (r.get("break15") or {}).get("broken")]
+    elif v30_filter == "4H only":
+        _v30_show = [r for r in _v30_rows if (r.get("break4h") or {}).get("broken")]
+    elif v30_filter == "15m AND 4H":
+        _v30_show = [
+            r for r in _v30_rows
+            if (r.get("break15") or {}).get("broken") and (r.get("break4h") or {}).get("broken")
+        ]
+    else:
+        _v30_show = _v30_rows
+
+    st.caption(
+        f"Last EMA20 scan: {st.session_state.get('v30_ema_time','—')} | "
+        f"{len(_v30_show)} matching coins | {st.session_state.get('v30_ema_total','—')} contracts checked"
+    )
+    v30_render_ema20_break_table(_v30_show)
+else:
+    st.info("Click **📉 SCAN ALL COINS — EMA20 BREAKS IN LAST 24H** to find fresh bearish EMA20 crosses.")
+
+if st.session_state.get("v30_ema_errors"):
+    with st.expander("🔧 EMA20 scan data errors", expanded=False):
+        for err in st.session_state["v30_ema_errors"][:50]:
+            st.write(err)
 
 
 # -------------------------- ANY-COIN DEEP MTF S/R ------------------------------
