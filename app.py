@@ -12,10 +12,6 @@ from datetime import datetime, timezone
 
 st.set_page_config(page_title="CoinDCX Futures Trading Agent", page_icon="🎯", layout="wide")
 
-v33_workers = st.slider("V33 scan workers", 2, 6, 4, 1, key="v33_workers")
-
-_v33_saved=st.session_state.get("v33_results",[])
-
 API = "https://api.coindcx.com"
 
 PUBLIC = "https://public.coindcx.com"
@@ -5399,95 +5395,194 @@ _v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK
 # V34 PRIMARY UI — CLEAN SYMMETRIC HEALTHY-PULLBACK / STRUCTURE PATH AGENT
 # =============================================================================
 st.divider()
-st.header("🧠 V34 — Healthy Pullback / Structure Path Agent")
+st.header("🧠 V35 — Healthy Pullback / Structure Path Agent")
 st.caption(
     "One core model for both directions: LONG = HH → HL → EMA20 test → hold → local-high break. "
     "SHORT = LH → LL → EMA20 test → reject → local-low break. Do not chase extended moves. "
     "4H and 1D levels are reaction/target zones, not automatic reversals."
 )
 
-v34_workers = st.slider("V34 scan workers", 2, 6, 4, 1, key="v34_workers")
+v34_workers = st.slider("V35 scan workers", 2, 8, 6, 1, key="v35_workers")
 
-if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v34_scan_button"):
+if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v35_scan_button"):
     bar = st.progress(0, text="Loading active Futures…")
     try:
         instruments = active_instruments("USDT")
         prices = futures_prices()
+
         items = []
+        universe_failures = 0
 
         for raw in instruments:
-            pair = v61_instrument_pair(raw)
-            if not pair:
-                continue
-            symbol = v61_symbol(raw, pair)
-            price = v61_price_for_pair(prices, pair)
-            if not np.isfinite(price) or price <= 0:
-                try:
-                    d = completed(get_tf(pair, "15m", 2))
-                    if d is not None and not d.empty:
-                        price = v6_num(d.iloc[-1].get("close"), np.nan)
-                except Exception:
-                    price = np.nan
-            if np.isfinite(price) and price > 0:
-                items.append((pair, symbol, float(price)))
+            try:
+                pair = v61_instrument_pair(raw)
+                if not pair:
+                    universe_failures += 1
+                    continue
+                symbol = v61_symbol(raw, pair)
+                price = v61_price_for_pair(prices, pair)
+
+                if not np.isfinite(price) or price <= 0:
+                    try:
+                        d = completed(get_tf(pair, "15m", 2))
+                        if d is not None and not d.empty:
+                            price = v6_num(d.iloc[-1].get("close"), np.nan)
+                    except Exception:
+                        price = np.nan
+
+                if np.isfinite(price) and price > 0:
+                    items.append((pair, symbol, float(price)))
+                else:
+                    universe_failures += 1
+            except Exception:
+                universe_failures += 1
 
         results = []
+        errors = []
+        stats = {
+            "universe": len(items), "data_ok": 0, "directional": 0,
+            "ready": 0, "watch": 0, "wait": 0, "errors": universe_failures
+        }
+
         from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def scan15(item):
             pair, symbol, price = item
             try:
-                d15 = get_tf(pair, "15m", 4)
+                # More history = more confirmed 15m pivots and fewer false
+                # "no structure" results across newer/volatile Futures contracts.
+                d15 = get_tf(pair, "15m", 10)
                 if d15 is None or d15.empty:
-                    return None
+                    return {"status": "WAIT", "error": f"{pair}: no 15m candles"}
+
                 p = v33_pullback_signal(d15, price)
-                if p.get("signal") == "WAIT":
-                    return None
+                sig = p.get("signal", "WAIT")
+                status = "LONG" if sig.startswith("LONG") else "SHORT" if sig.startswith("SHORT") else "WAIT"
+
                 return {
-                    "pair": pair,
-                    "symbol": symbol,
-                    "price": price,
-                    "d15": d15,
-                    "v33_pullback": p,
+                    "status": status, "pair": pair, "symbol": symbol, "price": price,
+                    "d15": d15, "v33_pullback": p, "error": None
                 }
-            except Exception:
-                return None
+            except Exception as exc:
+                return {
+                    "status": "ERROR", "pair": pair, "symbol": symbol, "price": price,
+                    "d15": pd.DataFrame(),
+                    "v33_pullback": {"signal": "WAIT", "score": 0},
+                    "error": f"{pair}: {type(exc).__name__}: {exc}"
+                }
 
         total = len(items)
         with ThreadPoolExecutor(max_workers=v34_workers) as ex:
-            fs = [ex.submit(scan15, item) for item in items]
-            for i, f in enumerate(as_completed(fs), 1):
-                try:
-                    rr = f.result()
-                    if rr:
-                        results.append(rr)
-                except Exception:
-                    pass
-                bar.progress(int(i / max(total, 1) * 100), text=f"15m structure {i}/{total}…")
+            futures = [ex.submit(scan15, item) for item in items]
+            for i, future in enumerate(as_completed(futures), 1):
+                rr = future.result()
 
-        # Enrich only the strongest directional candidates with 4H / 1D context.
-        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score", 0)))
-        enrich = results[:30]
-        with ThreadPoolExecutor(max_workers=min(v34_workers, 4)) as ex:
-            fs = [ex.submit(v33_attach_mtf_path, r) for r in enrich]
-            for f in as_completed(fs):
+                if rr.get("status") == "ERROR":
+                    stats["errors"] += 1
+                    if len(errors) < 25:
+                        errors.append(rr.get("error", "unknown error"))
+                else:
+                    stats["data_ok"] += 1
+                    sig = (rr.get("v33_pullback") or {}).get("signal", "WAIT")
+                    if sig.startswith("LONG"):
+                        stats["directional"] += 1
+                        stats["ready" if sig == "LONG READY" else "watch"] += 1
+                        results.append(rr)
+                    elif sig.startswith("SHORT"):
+                        stats["directional"] += 1
+                        stats["ready" if sig == "SHORT READY" else "watch"] += 1
+                        results.append(rr)
+                    else:
+                        stats["wait"] += 1
+
+                bar.progress(
+                    int(i / max(total, 1) * 100),
+                    text=f"15m structure {i}/{total}…"
+                )
+
+        # If strict EMA20 pullback logic produces no candidates, expose the
+        # strongest confirmed HH/HL or LH/LL structures as WATCH instead of
+        # leaving the user with an apparently broken blank result.
+        if not results:
+            fallback = []
+            for item in items:
+                pair, symbol, price = item
                 try:
-                    f.result()
+                    d15 = get_tf(pair, "15m", 10)
+                    stx = simple_today_structure(d15, bars=96)
+
+                    if stx.get("side") in ("LONG", "WATCH LONG"):
+                        p = v33_pullback_signal(d15, price)
+                        p.update({
+                            "signal": "LONG WATCH",
+                            "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
+                            "score": max(float(p.get("score", 0)), 55),
+                            "reason": "Recent 15m HH/HL structure detected. Wait for EMA20 pullback, hold, and local-high break."
+                        })
+                        fallback.append({"pair": pair, "symbol": symbol, "price": price, "d15": d15, "v33_pullback": p})
+
+                    elif stx.get("side") in ("SHORT", "WATCH SHORT"):
+                        p = v33_pullback_signal(d15, price)
+                        p.update({
+                            "signal": "SHORT WATCH",
+                            "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
+                            "score": max(float(p.get("score", 0)), 55),
+                            "reason": "Recent 15m LH/LL structure detected. Wait for EMA20 retest, rejection, and local-low break."
+                        })
+                        fallback.append({"pair": pair, "symbol": symbol, "price": price, "d15": d15, "v33_pullback": p})
                 except Exception:
-                    pass
+                    continue
+            results = fallback
+
+        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score", 0)))
+        enrich = results[:40]
+
+        with ThreadPoolExecutor(max_workers=min(v34_workers, 4)) as ex:
+            futures = [ex.submit(v33_attach_mtf_path, r) for r in enrich]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    if len(errors) < 25:
+                        errors.append(f"MTF enrichment: {type(exc).__name__}: {exc}")
 
         results = v33_rank(enrich)
+
         st.session_state["v34_results"] = results
         st.session_state["v34_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.session_state["v34_total"] = total
+        st.session_state["v34_stats"] = stats
+        st.session_state["v34_errors"] = errors
+
         bar.progress(100, text=f"Complete — {total} Futures checked")
+
     except Exception as e:
-        st.error(f"V34 scan failed: {e}")
+        st.error(f"V35 scan failed: {type(e).__name__}: {e}")
 
 _saved = st.session_state.get("v34_results", [])
+_stats = st.session_state.get("v34_stats", {})
+_scan_errors = st.session_state.get("v34_errors", [])
+
+if _stats:
+    st.caption(
+        f"Scan diagnostics — Futures discovered: {_stats.get('universe', 0)} | "
+        f"15m data OK: {_stats.get('data_ok', 0)} | "
+        f"Directional: {_stats.get('directional', 0)} | "
+        f"READY: {_stats.get('ready', 0)} | "
+        f"WATCH: {_stats.get('watch', 0)} | "
+        f"WAIT: {_stats.get('wait', 0)} | "
+        f"Errors: {_stats.get('errors', 0)}"
+    )
+
+if _scan_errors:
+    with st.expander("Scan diagnostics / first errors", expanded=False):
+        for msg in _scan_errors[:25]:
+            st.write(msg)
+
+
 if _saved:
     st.caption(
-        f"Last V34 scan: {st.session_state.get('v34_time', '—')} | "
+        f"Last V35 scan: {st.session_state.get('v34_time', '—')} | "
         f"Futures checked: {st.session_state.get('v34_total', '—')} | candidates: {len(_saved)}"
     )
 
@@ -5540,7 +5635,7 @@ if _saved:
         else:
             st.info("No fresh candidates on this side.")
 else:
-    st.info("Run the V34 market scan to find fresh pullback/retest entries.")
+    st.info("Run the V35 market scan to find fresh pullback/retest entries.")
 
 st.divider()
 st.caption(
