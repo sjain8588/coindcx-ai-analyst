@@ -316,6 +316,12 @@ def safe(v, default=np.nan):
     except Exception:
         return default
 
+# Backward-compatible numeric helper retained by the V5/V6/V7/V10 engines.
+# V24 cleanup accidentally removed this function, causing every market-candle
+# analysis to fail with NameError: v6_num is not defined.
+def v6_num(v, default=np.nan):
+    return safe(v, default)
+
 # =============================================================================
 # MULTI-TIMEFRAME EMA ENGINE
 # =============================================================================
