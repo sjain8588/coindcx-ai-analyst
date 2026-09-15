@@ -3451,36 +3451,6 @@ def v71_scan_from_existing(scan):
 
 
 
-# --------------------------- V8 EXTREME EDGE UI -------------------------------
-if st.session_state.get("v6_scan_results"):
-    _all_v8 = st.session_state.get("v6_scan_results", [])
-    _extreme_watch = [r for r in _all_v8 if r.get("source") == "V8 EXTREME EDGE"]
-    if _extreme_watch:
-        st.subheader("🎯 ATH / ATL Extreme Edge Radar")
-        st.caption(
-            "ATH is not automatically a SHORT and ATL is not automatically a LONG. "
-            "The agent waits for breakout/continuation or rejection/breakdown structure."
-        )
-        _ew = []
-        for r in _extreme_watch:
-            _ew.append({
-                "Coin": r.get("Coin"),
-                "Extreme": r.get("Extreme"),
-                "Side": r.get("Direction"),
-                "Score": r.get("Score"),
-                "Price": r.get("Entry"),
-                "Distance ATH %": r.get("Distance ATH %"),
-                "Distance ATL %": r.get("Distance ATL %"),
-                "15m Structure": r.get("15m Structure"),
-                "Decision": "PAPER TRADE" if r.get("Valid") == "✅ TRADE CANDIDATE" else "WAIT",
-                "Why": r.get("Reasons"),
-                "Blockers": r.get("Blockers"),
-            })
-        st.dataframe(pd.DataFrame(_ew), use_container_width=True, hide_index=True)
-
-
-
-
 # -------------------- V13 MULTI-TIMEFRAME SUPPORT / RESISTANCE -----------------
 V13_SR_TIMEFRAMES = ("15m", "4H", "1D", "1W")
 
@@ -3969,12 +3939,47 @@ def v10_scan_all_extreme(progress=None, max_workers=6):
 # =============================================================================
 # V22 — ONE-BUTTON DAILY MARKET DECISION ENGINE
 # =============================================================================
-def v22_unified_scan(progress=None, max_workers=6):
-    """One market-wide scan for the trader-facing dashboard.
+def v23_yesterday_pump_today_fall(d1, current, today_structure):
+    """Simple detector for: strong completed daily pump -> current session falling.
+    Uses completed daily candles only and does not call a pump alone a short.
+    """
+    out = {"flag": False, "pump_pct": np.nan, "today_vs_yesterday_close_pct": np.nan,
+           "reason": ""}
+    try:
+        d = completed(d1)
+        if d is None or d.empty or len(d) < 3:
+            return out
+        prev = d.iloc[-1]
+        before = d.iloc[-2]
+        prev_close = float(prev.get("close"))
+        before_close = float(before.get("close"))
+        prev_open = float(prev.get("open"))
+        if prev_close <= 0 or before_close <= 0:
+            return out
+        pump = (prev_close / before_close - 1.0) * 100.0
+        fall = (float(current) / prev_close - 1.0) * 100.0
+        out["pump_pct"] = pump
+        out["today_vs_yesterday_close_pct"] = fall
+        # Strong previous-day pump + current weakness.  LH+LL makes it a much
+        # stronger reversal candidate; without structure it remains WATCH.
+        if pump >= 15.0 and fall <= -2.0:
+            out["flag"] = True
+            out["reason"] = f"yesterday +{pump:.1f}% pump, now {fall:.1f}% vs yesterday close"
+        return out
+    except Exception:
+        return out
 
-    Fetches the candle sets once per contract and produces, for every usable
-    contract: simple 15m structure, extreme-move context, MTF S/R and a plain
-    LONG/SHORT/WATCH/WAIT classification. No separate scanner is required.
+
+def v23_unified_scan(progress=None, max_workers=6):
+    """ONE market-wide scan. Every usable contract gets one plain-language answer.
+
+    The same scan produces:
+      * 15m HH/HL/LH/LL structure
+      * 1H/4H trend confirmation
+      * yesterday-pump/today-fall context
+      * extreme multi-day context
+      * 15m/4H/1D/1W support and resistance
+      * LONG / SHORT / WATCH / WAIT classification
     """
     instruments = active_instruments("USDT")
     try:
@@ -4002,6 +4007,7 @@ def v22_unified_scan(progress=None, max_workers=6):
     def _fetch(item):
         pair, symbol, live = item
         try:
+            # 1W is derived from 1D by the S/R engine when not supplied.
             tf = {
                 "15m": get_tf(pair, "15m", 12),
                 "1H": get_tf(pair, "1H", 45),
@@ -4017,44 +4023,60 @@ def v22_unified_scan(progress=None, max_workers=6):
                 return None
 
             today = simple_today_structure(tf["15m"])
-            sr = v13_mtf_support_resistance(tf, price)
-            sr_summary = v14_sr_summary(sr, price)
+            # Optional layers must never make the whole coin disappear. If one
+            # detector fails, the basic HH/HL/LH/LL result still survives.
+            try:
+                sr = v13_mtf_support_resistance(tf, price)
+                sr_summary = v14_sr_summary(sr, price)
+            except Exception:
+                sr, sr_summary = {}, {"nearest_support": None, "nearest_resistance": None,
+                                      "support_tf": None, "resistance_tf": None,
+                                      "support_dist_pct": None, "resistance_dist_pct": None}
+            try:
+                extreme = v10_extreme_move_signal(pair, symbol, tf, price)
+            except Exception:
+                extreme = None
+            try:
+                yesterday = v23_yesterday_pump_today_fall(tf["1D"], price, today)
+            except Exception:
+                yesterday = {"flag": False, "pump_pct": np.nan,
+                             "today_vs_yesterday_close_pct": np.nan, "reason": ""}
 
-            # Existing V10 logic is used as an additional confirmation layer,
-            # but it never replaces the simple daily structure result.
-            extreme = v10_extreme_move_signal(pair, symbol, tf, price)
-            v61 = v61_analyze_candidate(pair, symbol, price, tf["15m"], tf["1H"], tf["4H"])
-
-            i4 = indicators(completed(tf["4H"]))
-            i1 = indicators(completed(tf["1H"]))
-            four_bull = four_bear = False
-            one_bull = one_bear = False
+            # Higher-timeframe direction.  These are confirmations, not the
+            # primary structure signal.
+            try:
+                i4 = indicators(completed(tf["4H"]))
+            except Exception:
+                i4 = pd.DataFrame()
+            try:
+                i1 = indicators(completed(tf["1H"]))
+            except Exception:
+                i1 = pd.DataFrame()
+            four_bull = four_bear = one_bull = one_bear = False
             if i4 is not None and not i4.empty:
                 q = i4.iloc[-1]
-                four_bull = bool(v6_num(q.get("close"), np.nan) > v6_num(q.get("ema20"), np.nan) > v6_num(q.get("ema50"), np.nan))
-                four_bear = bool(v6_num(q.get("close"), np.nan) < v6_num(q.get("ema20"), np.nan) < v6_num(q.get("ema50"), np.nan))
+                close, e20, e50 = v6_num(q.get("close"), np.nan), v6_num(q.get("ema20"), np.nan), v6_num(q.get("ema50"), np.nan)
+                four_bull = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close > e20 > e50)
+                four_bear = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close < e20 < e50)
             if i1 is not None and not i1.empty:
                 q = i1.iloc[-1]
-                one_bull = bool(v6_num(q.get("close"), np.nan) > v6_num(q.get("ema20"), np.nan) > v6_num(q.get("ema50"), np.nan))
-                one_bear = bool(v6_num(q.get("close"), np.nan) < v6_num(q.get("ema20"), np.nan) < v6_num(q.get("ema50"), np.nan))
+                close, e20, e50 = v6_num(q.get("close"), np.nan), v6_num(q.get("ema20"), np.nan), v6_num(q.get("ema50"), np.nan)
+                one_bull = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close > e20 > e50)
+                one_bear = bool(np.isfinite(close) and np.isfinite(e20) and np.isfinite(e50) and close < e20 < e50)
 
             side = today.get("side", "WAIT")
-            label = today.get("label", "⚪ MIXED / NO CLEAR STRUCTURE")
             score = 0
             reasons = []
-
             if side == "LONG":
-                score = 70
-                reasons.append("15m Higher High + Higher Low")
-                if one_bull: score += 8; reasons.append("1H bullish structure")
-                if four_bull: score += 10; reasons.append("4H bullish structure")
+                score = 70; reasons.append("15m Higher High + Higher Low")
+                if one_bull: score += 8; reasons.append("1H bullish")
+                if four_bull: score += 10; reasons.append("4H bullish")
                 if one_bear: score -= 8; reasons.append("1H bearish conflict")
                 if four_bear: score -= 12; reasons.append("4H bearish conflict")
             elif side == "SHORT":
-                score = 70
-                reasons.append("15m Lower High + Lower Low")
-                if one_bear: score += 8; reasons.append("1H bearish structure")
-                if four_bear: score += 10; reasons.append("4H bearish structure")
+                score = 70; reasons.append("15m Lower High + Lower Low")
+                if one_bear: score += 8; reasons.append("1H bearish")
+                if four_bear: score += 10; reasons.append("4H bearish")
                 if one_bull: score -= 8; reasons.append("1H bullish conflict")
                 if four_bull: score -= 12; reasons.append("4H bullish conflict")
             elif side == "WATCH LONG":
@@ -4064,37 +4086,30 @@ def v22_unified_scan(progress=None, max_workers=6):
             else:
                 score = 20; reasons.append("no clear 15m structure")
 
-            # Extreme-move confirmation upgrades/downgrades the same direction.
+            # Explicit yesterday-pump -> today-fall setup.  It can upgrade a
+            # bearish structure, but never creates a SHORT without LH+LL.
+            if yesterday.get("flag"):
+                reasons.append(yesterday["reason"])
+                if side == "SHORT":
+                    score += 15
+                elif side == "WATCH SHORT":
+                    score += 10
+
             if extreme:
                 eside = str(extreme.get("side", "WAIT")).upper()
-                if extreme.get("valid") and eside == "LONG" and side == "LONG":
-                    score += 12; reasons.append("extreme-move LONG confirmation")
-                elif extreme.get("valid") and eside == "SHORT" and side == "SHORT":
-                    score += 12; reasons.append("extreme-move SHORT confirmation")
+                if extreme.get("valid") and eside == side:
+                    score += 12; reasons.append("extreme-move confirmation agrees")
                 elif extreme.get("valid") and eside in ("LONG", "SHORT") and eside != side:
                     score -= 12; reasons.append("extreme-move direction conflict")
 
-            # Existing V61 candidates can add confirmation without becoming a
-            # second scanner in the UI.
-            if v61 and v61.get("candidates"):
-                same = [c for c in v61["candidates"] if c.get("side") == ("LONG" if side == "LONG" else "SHORT" if side == "SHORT" else "")]
-                if same:
-                    best = max(same, key=lambda x: float(x.get("score", 0)))
-                    score += min(10, max(0, int(float(best.get("score", 0)) - 70) // 3))
-                    reasons.append("existing confirmation engine agrees")
-
-            score = int(max(0, min(100, score)))
-
-            # A simple trade-room warning from MTF S/R.
             room = sr_summary.get("resistance_dist_pct") if side == "LONG" else sr_summary.get("support_dist_pct") if side == "SHORT" else None
             if room is not None:
                 if room < 2:
-                    score = max(0, score - 15)
-                    reasons.append("major level is very close")
+                    score -= 15; reasons.append("major level very close")
                 elif room >= 5:
-                    score += 3
-                    reasons.append("reasonable room to nearest major level")
+                    score += 3; reasons.append("reasonable room")
 
+            score = int(max(0, min(100, score)))
             if side == "LONG" and score >= 70:
                 decision = "🟢 LONG TODAY"
             elif side == "SHORT" and score >= 70:
@@ -4109,8 +4124,8 @@ def v22_unified_scan(progress=None, max_workers=6):
             return {
                 "pair": pair, "symbol": symbol, "price": float(price),
                 "today": today, "decision": decision, "score": score,
-                "reasons": reasons[:8], "extreme": extreme, "sr": sr,
-                "sr_summary": sr_summary,
+                "reasons": reasons[:10], "extreme": extreme, "sr": sr,
+                "sr_summary": sr_summary, "yesterday": yesterday,
                 "one_hour": "BULLISH" if one_bull else "BEARISH" if one_bear else "MIXED",
                 "four_hour": "BULLISH" if four_bull else "BEARISH" if four_bear else "MIXED",
             }
@@ -4124,7 +4139,10 @@ def v22_unified_scan(progress=None, max_workers=6):
             done += 1
             if progress:
                 progress(done, len(items))
-            r = fut.result()
+            try:
+                r = fut.result()
+            except Exception:
+                r = None
             if r:
                 results.append(r)
 
@@ -4133,6 +4151,10 @@ def v22_unified_scan(progress=None, max_workers=6):
     results.sort(key=lambda r: (order.get(r.get("decision"), 9), -r.get("score", 0)))
     return results, len(items)
 
+
+def v22_unified_scan(progress=None, max_workers=6):
+    # Backward-compatible alias for the single-scan workflow.
+    return v23_unified_scan(progress=progress, max_workers=max_workers)
 
 def v22_render_market(results):
     """Render only the simple trader-facing answer; technical detail stays in expanders."""
@@ -4161,6 +4183,9 @@ def v22_render_market(results):
         x4.metric("4H", r.get("four_hour", "—"))
         st.write(f"**Simple answer:** {r['today'].get('label','—')}  |  **Score:** {r.get('score',0)}/100")
         st.write("**Why:** " + " • ".join(r.get("reasons", [])))
+        yp = r.get("yesterday") or {}
+        if yp.get("flag"):
+            st.success(f"🔥 YESTERDAY PUMP → TODAY FALL: +{yp.get('pump_pct', 0):.1f}% yesterday, {yp.get('today_vs_yesterday_close_pct', 0):.1f}% vs yesterday close")
         sm = r.get("sr_summary", {})
         st.write(
             f"**Nearest support:** {v13_format_price(sm.get('nearest_support'))} "
@@ -4214,9 +4239,9 @@ def v22_render_market(results):
 st.divider()
 st.subheader("⭐ TODAY'S TRADING OPPORTUNITIES — ONE MARKET SCAN")
 st.caption(
-    "One scan of the active CoinDCX USDT Futures market. The result is intentionally simple: "
-    "HH + HL = bullish, LH + LL = bearish. Extreme pump/dump context and 15m/4H/1D/1W S/R "
-    "are used as confirmation, not as separate scanners."
+    "ONE scan of the active CoinDCX USDT Futures market. It gives the simple answer first: "
+    "HH + HL = bullish, LH + LL = bearish. It also attaches pump/dump context and "
+    "15m/4H/1D/1W support and resistance to the same results. No second market scan is required."
 )
 
 v22_workers = st.slider("Concurrent workers", 2, 10, 6, 1, key="v22_workers")
@@ -4225,7 +4250,7 @@ if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", t
     def _v22_progress(done, total):
         bar.progress(int(done / max(total,1) * 100), text=f"Analyzing {done}/{total} Futures…")
     with st.spinner("Building today's structure + extreme-move + MTF S/R view…"):
-        _v22_results, _v22_total = v22_unified_scan(_v22_progress, max_workers=v22_workers)
+        _v22_results, _v22_total = v23_unified_scan(_v22_progress, max_workers=v22_workers)
     st.session_state["v22_market_results"] = _v22_results
     st.session_state["v22_market_total"] = _v22_total
     st.session_state["v22_market_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4241,8 +4266,8 @@ else:
 
 # -------------------------- ANY-COIN DEEP MTF S/R ------------------------------
 st.divider()
-st.subheader("📐 MTF SUPPORT & RESISTANCE — ANY COIN")
-st.caption("Use this only when you want a dedicated 15m / 4H / 1D / 1W S/R view for a specific coin.")
+st.subheader("📐 MTF SUPPORT & RESISTANCE — MANUAL LOOKUP")
+st.caption("Optional: use this when you want to inspect S/R for a coin that is not already in the market results.")
 _v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK_USDT, DOGE_USDT", key="v22_mtf_sr_coin")
 if st.button("📐 SHOW 15m / 4H / 1D / 1W SUPPORT & RESISTANCE", key="v22_mtf_sr_button"):
     try:
