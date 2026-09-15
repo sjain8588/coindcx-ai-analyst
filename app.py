@@ -3965,472 +3965,313 @@ def v10_scan_all_extreme(progress=None, max_workers=6):
 
 
 
-# ----------------------- V12 ACTIONABLE SIGNAL BOARD ---------------------------
-def v12_signal_row(r):
-    direction = str(r.get("Direction", "")).upper()
-    valid = str(r.get("Valid", ""))
-    if valid == "✅ TRADE CANDIDATE" and direction == "LONG":
-        decision = "🟢 LONG"
-    elif valid == "✅ TRADE CANDIDATE" and direction == "SHORT":
-        decision = "🔴 SHORT"
-    else:
-        decision = "⚪ WAIT"
 
-    return {
-        "Signal": decision,
-        "Coin": r.get("Coin"),
-        "Setup": r.get("Extreme Move"),
-        "Score": r.get("Score"),
-        "Current": r.get("Current"),
-        "3D %": r.get("3D %"),
-        "5D %": r.get("5D %"),
-        "7D %": r.get("7D %"),
-        "From Peak %": r.get("From Peak %"),
-        "From Low %": r.get("From Low %"),
-        "15m Structure": r.get("15m Structure"),
-        "1H Structure": r.get("1H Structure"),
-        "Entry Trigger": r.get("Entry Trigger"),
-        "Invalidation": r.get("Invalidation"),
-        "15m S1": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("S1"),
-        "15m S2": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("S2"),
-        "15m S3": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("S3"),
-        "15m R1": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("R1"),
-        "15m R2": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("R2"),
-        "15m R3": (r.get("MTF_SR", {}).get("15m", {}) or {}).get("R3"),
-        "4H S1": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("S1"),
-        "4H S2": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("S2"),
-        "4H S3": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("S3"),
-        "4H R1": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("R1"),
-        "4H R2": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("R2"),
-        "4H R3": (r.get("MTF_SR", {}).get("4H", {}) or {}).get("R3"),
-        "1D S1": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("S1"),
-        "1D S2": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("S2"),
-        "1D S3": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("S3"),
-        "1D R1": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("R1"),
-        "1D R2": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("R2"),
-        "1D R3": (r.get("MTF_SR", {}).get("1D", {}) or {}).get("R3"),
-        "1W S1": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("S1"),
-        "1W S2": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("S2"),
-        "1W S3": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("S3"),
-        "1W R1": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("R1"),
-        "1W R2": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("R2"),
-        "1W R3": (r.get("MTF_SR", {}).get("1W", {}) or {}).get("R3"),
-        "Why": r.get("Reasons"),
-    }
+# =============================================================================
+# V22 — ONE-BUTTON DAILY MARKET DECISION ENGINE
+# =============================================================================
+def v22_unified_scan(progress=None, max_workers=6):
+    """One market-wide scan for the trader-facing dashboard.
 
+    Fetches the candle sets once per contract and produces, for every usable
+    contract: simple 15m structure, extreme-move context, MTF S/R and a plain
+    LONG/SHORT/WATCH/WAIT classification. No separate scanner is required.
+    """
+    instruments = active_instruments("USDT")
+    try:
+        prices = futures_prices()
+    except Exception:
+        prices = {}
 
-def v12_actionable_candidates(records, minimum_score=78):
-    """Return only actionable LONG/SHORT signals for manual trading."""
-    out = []
-    for r in records or []:
+    items, seen = [], set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair:
+            continue
+        canonical = str(pair).strip().upper()
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+        live = v61_price_for_pair(prices, pair)
+        symbol = v61_symbol(inst, pair)
+        if meme_only and not any(w in symbol or w in canonical for w in MEME_WORDS):
+            continue
+        items.append((pair, symbol, live))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch(item):
+        pair, symbol, live = item
         try:
-            score = float(r.get("Score", 0))
-        except Exception:
+            tf = {
+                "15m": get_tf(pair, "15m", 12),
+                "1H": get_tf(pair, "1H", 45),
+                "4H": get_tf(pair, "4H", 120),
+                "1D": get_tf(pair, "1D", 180),
+            }
+            price = live
+            if not np.isfinite(price) or price <= 0:
+                c = completed(tf["15m"])
+                if c is not None and not c.empty:
+                    price = v6_num(c.iloc[-1].get("close"), np.nan)
+            if not np.isfinite(price) or price <= 0:
+                return None
+
+            today = simple_today_structure(tf["15m"])
+            sr = v13_mtf_support_resistance(tf, price)
+            sr_summary = v14_sr_summary(sr, price)
+
+            # Existing V10 logic is used as an additional confirmation layer,
+            # but it never replaces the simple daily structure result.
+            extreme = v10_extreme_move_signal(pair, symbol, tf, price)
+            v61 = v61_analyze_candidate(pair, symbol, price, tf["15m"], tf["1H"], tf["4H"])
+
+            i4 = indicators(completed(tf["4H"]))
+            i1 = indicators(completed(tf["1H"]))
+            four_bull = four_bear = False
+            one_bull = one_bear = False
+            if i4 is not None and not i4.empty:
+                q = i4.iloc[-1]
+                four_bull = bool(v6_num(q.get("close"), np.nan) > v6_num(q.get("ema20"), np.nan) > v6_num(q.get("ema50"), np.nan))
+                four_bear = bool(v6_num(q.get("close"), np.nan) < v6_num(q.get("ema20"), np.nan) < v6_num(q.get("ema50"), np.nan))
+            if i1 is not None and not i1.empty:
+                q = i1.iloc[-1]
+                one_bull = bool(v6_num(q.get("close"), np.nan) > v6_num(q.get("ema20"), np.nan) > v6_num(q.get("ema50"), np.nan))
+                one_bear = bool(v6_num(q.get("close"), np.nan) < v6_num(q.get("ema20"), np.nan) < v6_num(q.get("ema50"), np.nan))
+
+            side = today.get("side", "WAIT")
+            label = today.get("label", "⚪ MIXED / NO CLEAR STRUCTURE")
             score = 0
-        if r.get("Valid") != "✅ TRADE CANDIDATE":
-            continue
-        if score < minimum_score:
-            continue
-        if str(r.get("Direction", "")).upper() not in ("LONG", "SHORT"):
-            continue
-        out.append(r)
-    return sorted(out, key=lambda x: float(x.get("Score", 0)), reverse=True)
+            reasons = []
+
+            if side == "LONG":
+                score = 70
+                reasons.append("15m Higher High + Higher Low")
+                if one_bull: score += 8; reasons.append("1H bullish structure")
+                if four_bull: score += 10; reasons.append("4H bullish structure")
+                if one_bear: score -= 8; reasons.append("1H bearish conflict")
+                if four_bear: score -= 12; reasons.append("4H bearish conflict")
+            elif side == "SHORT":
+                score = 70
+                reasons.append("15m Lower High + Lower Low")
+                if one_bear: score += 8; reasons.append("1H bearish structure")
+                if four_bear: score += 10; reasons.append("4H bearish structure")
+                if one_bull: score -= 8; reasons.append("1H bullish conflict")
+                if four_bull: score -= 12; reasons.append("4H bullish conflict")
+            elif side == "WATCH LONG":
+                score = 45; reasons.append("developing HH/HL")
+            elif side == "WATCH SHORT":
+                score = 45; reasons.append("developing LH/LL")
+            else:
+                score = 20; reasons.append("no clear 15m structure")
+
+            # Extreme-move confirmation upgrades/downgrades the same direction.
+            if extreme:
+                eside = str(extreme.get("side", "WAIT")).upper()
+                if extreme.get("valid") and eside == "LONG" and side == "LONG":
+                    score += 12; reasons.append("extreme-move LONG confirmation")
+                elif extreme.get("valid") and eside == "SHORT" and side == "SHORT":
+                    score += 12; reasons.append("extreme-move SHORT confirmation")
+                elif extreme.get("valid") and eside in ("LONG", "SHORT") and eside != side:
+                    score -= 12; reasons.append("extreme-move direction conflict")
+
+            # Existing V61 candidates can add confirmation without becoming a
+            # second scanner in the UI.
+            if v61 and v61.get("candidates"):
+                same = [c for c in v61["candidates"] if c.get("side") == ("LONG" if side == "LONG" else "SHORT" if side == "SHORT" else "")]
+                if same:
+                    best = max(same, key=lambda x: float(x.get("score", 0)))
+                    score += min(10, max(0, int(float(best.get("score", 0)) - 70) // 3))
+                    reasons.append("existing confirmation engine agrees")
+
+            score = int(max(0, min(100, score)))
+
+            # A simple trade-room warning from MTF S/R.
+            room = sr_summary.get("resistance_dist_pct") if side == "LONG" else sr_summary.get("support_dist_pct") if side == "SHORT" else None
+            if room is not None:
+                if room < 2:
+                    score = max(0, score - 15)
+                    reasons.append("major level is very close")
+                elif room >= 5:
+                    score += 3
+                    reasons.append("reasonable room to nearest major level")
+
+            if side == "LONG" and score >= 70:
+                decision = "🟢 LONG TODAY"
+            elif side == "SHORT" and score >= 70:
+                decision = "🔴 SHORT TODAY"
+            elif side == "WATCH LONG":
+                decision = "🟡 WATCH LONG"
+            elif side == "WATCH SHORT":
+                decision = "🟠 WATCH SHORT"
+            else:
+                decision = "⚪ WAIT"
+
+            return {
+                "pair": pair, "symbol": symbol, "price": float(price),
+                "today": today, "decision": decision, "score": score,
+                "reasons": reasons[:8], "extreme": extreme, "sr": sr,
+                "sr_summary": sr_summary,
+                "one_hour": "BULLISH" if one_bull else "BEARISH" if one_bear else "MIXED",
+                "four_hour": "BULLISH" if four_bull else "BEARISH" if four_bear else "MIXED",
+            }
+        except Exception:
+            return None
+
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_fetch, item) for item in items]
+        for fut in as_completed(futs):
+            done += 1
+            if progress:
+                progress(done, len(items))
+            r = fut.result()
+            if r:
+                results.append(r)
+
+    order = {"🟢 LONG TODAY": 0, "🔴 SHORT TODAY": 1, "🟡 WATCH LONG": 2,
+             "🟠 WATCH SHORT": 3, "⚪ WAIT": 4}
+    results.sort(key=lambda r: (order.get(r.get("decision"), 9), -r.get("score", 0)))
+    return results, len(items)
 
 
-def v12_render_signal_cards(records, title="🎯 ACTIONABLE MANUAL TRADING SIGNALS"):
-    candidates = v12_actionable_candidates(records)
-    st.subheader(title)
-    if not candidates:
-        st.info("No confirmed LONG/SHORT signals right now. WAIT is the correct decision.")
+def v22_render_market(results):
+    """Render only the simple trader-facing answer; technical detail stays in expanders."""
+    if not results:
+        st.warning("No usable Futures data was returned. Run the scan again.")
         return
 
-    longs = [r for r in candidates if str(r.get("Direction")).upper() == "LONG"]
-    shorts = [r for r in candidates if str(r.get("Direction")).upper() == "SHORT"]
+    longs = [r for r in results if r.get("decision") == "🟢 LONG TODAY"]
+    shorts = [r for r in results if r.get("decision") == "🔴 SHORT TODAY"]
+    watch_l = [r for r in results if r.get("decision") == "🟡 WATCH LONG"]
+    watch_s = [r for r in results if r.get("decision") == "🟠 WATCH SHORT"]
+    waits = [r for r in results if r.get("decision") == "⚪ WAIT"]
 
-    a, b, c = st.columns(3)
-    a.metric("🟢 LONG signals", len(longs))
-    b.metric("🔴 SHORT signals", len(shorts))
-    c.metric("Total actionable", len(candidates))
+    a,b,c,d = st.columns(4)
+    a.metric("🟢 LONG TODAY", len(longs))
+    b.metric("🔴 SHORT TODAY", len(shorts))
+    c.metric("🟡 WATCH", len(watch_l)+len(watch_s))
+    d.metric("⚪ WAIT", len(waits))
 
-    def render_side(side_records, heading, emoji):
-        if not side_records:
-            st.caption(f"{emoji} {heading}: none")
-            return
-        st.markdown(f"### {emoji} {heading}")
-        for r in side_records[:15]:
-            score = r.get("Score", 0)
-            st.markdown(
-                f"**{r.get('Coin','—')} — {r.get('Extreme Move','—')} — "
-                f"Score {score}/100**"
-            )
-            x1, x2, x3, x4 = st.columns(4)
-            x1.metric("Current", r.get("Current", "—"))
-            x2.metric("3D", r.get("3D %", "—"))
-            x3.metric("5D", r.get("5D %", "—"))
-            x4.metric("7D", r.get("7D %", "—"))
-            st.write(
-                f"**Entry trigger:** {r.get('Entry Trigger','—')}  |  "
-                f"**Invalidation:** {r.get('Invalidation','—')}"
-            )
-            st.write(
-                f"**Structure:** 15m {r.get('15m Structure','—')} | "
-                f"1H {r.get('1H Structure','—')}"
-            )
-            if r.get("MTF_SR"):
-                st.markdown("**📐 Multi-timeframe Support & Resistance**")
-                st.dataframe(
-                    pd.DataFrame(v13_sr_columns(r["MTF_SR"])),
-                    use_container_width=True,
-                    hide_index=True,
-                )
-            st.write(f"**Why:** {r.get('Reasons','—')}")
-            st.divider()
-
-    render_side(longs, "LONG — manual candidates", "🟢")
-    render_side(shorts, "SHORT — manual candidates", "🔴")
-
-    st.markdown("#### 📋 Compact signal table")
-    st.dataframe(
-        pd.DataFrame([v12_signal_row(r) for r in candidates]),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-
-st.divider()
-st.subheader("🎯 CONFIRMED LONG / SHORT SIGNALS")
-st.caption(
-    "Scans the whole Futures universe for higher-confidence LONG/SHORT setups. "
-    "Use this after the simple TODAY structure view when you want a stricter trade filter."
-)
-
-v12_min = st.slider(
-    "Minimum actionable signal score",
-    70, 95, 78, 1,
-    key="v12_min_signal",
-)
-
-if st.button(
-    "🎯 SCAN ALL COINS & GENERATE LONG / SHORT SIGNALS",
-    type="primary",
-    key="v12_signal_scan",
-):
-    bar_v12 = st.progress(0, text="Scanning all active Futures for actionable signals…")
-    def _v12_progress(done, total):
-        bar_v12.progress(
-            int(done / max(total, 1) * 100),
-            text=f"Analyzing {done}/{total} Futures contracts…"
+    def card(r):
+        st.markdown(f"### {r['decision']} — **{r['symbol']}**")
+        x1,x2,x3,x4 = st.columns(4)
+        x1.metric("Current", v13_format_price(r["price"]))
+        x2.metric("Today", r["today"].get("label", "—"))
+        x3.metric("1H", r.get("one_hour", "—"))
+        x4.metric("4H", r.get("four_hour", "—"))
+        st.write(f"**Simple answer:** {r['today'].get('label','—')}  |  **Score:** {r.get('score',0)}/100")
+        st.write("**Why:** " + " • ".join(r.get("reasons", [])))
+        sm = r.get("sr_summary", {})
+        st.write(
+            f"**Nearest support:** {v13_format_price(sm.get('nearest_support'))} "
+            f"({sm.get('support_dist_pct'):+.2f}% if available)  | "
+            f"**Nearest resistance:** {v13_format_price(sm.get('nearest_resistance'))} "
+            f"({sm.get('resistance_dist_pct'):+.2f}% if available)"
         )
-    with st.spinner("Finding extreme moves and deciding LONG / SHORT / WAIT…"):
-        _v12_records, _v12_total = v10_scan_all_extreme(
-            progress=_v12_progress,
-            max_workers=6,
-        )
-    _v12_records = v13_attach_sr_to_records(_v12_records)
-    bar_v12.progress(100, text=f"Complete — {_v12_total} contracts scanned + 15m/4H/1D/1W S/R")
-    st.session_state["v12_signal_records"] = _v12_records
-    st.session_state["v12_signal_total"] = _v12_total
-    st.session_state["v12_signal_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with st.expander("📐 15m / 4H / 1D / 1W Support & Resistance", expanded=False):
+            st.dataframe(pd.DataFrame(v13_sr_columns(r.get("sr", {}))), use_container_width=True, hide_index=True)
+        with st.expander("🧨 Extreme-move details", expanded=False):
+            e=r.get("extreme") or {}
+            if e:
+                st.write(f"**State:** {e.get('state','—')} | **Direction:** {e.get('side','—')} | **Score:** {e.get('score','—')}")
+                st.write(f"3D: {e.get('ret3d','—')}% | 5D: {e.get('ret5d','—')}% | 7D: {e.get('ret7d','—')}% | From peak: {e.get('from_peak_pct','—')}%")
+            else:
+                st.caption("No extreme multi-day move detected for this coin.")
+        st.divider()
 
-_v12_records = st.session_state.get("v12_signal_records", [])
-if _v12_records:
-    st.caption(
-        f"Last signal scan: {st.session_state.get('v12_signal_time','—')} | "
-        f"Contracts scanned: {st.session_state.get('v12_signal_total','—')}"
-    )
-    # Render only actual LONG/SHORT candidates prominently.
-    _v12_filtered = [
-        r for r in _v12_records
-        if float(r.get("Score", 0) or 0) >= v12_min
-    ]
-    v12_render_signal_cards(_v12_filtered)
+    st.markdown("## 🟢 LONG TODAY")
+    if longs:
+        for r in longs[:15]: card(r)
+    else:
+        st.info("No confirmed LONG structure right now.")
 
+    st.markdown("## 🔴 SHORT TODAY")
+    if shorts:
+        for r in shorts[:15]: card(r)
+    else:
+        st.info("No confirmed SHORT structure right now.")
 
-# ---------------- TODAY SIMPLE STRUCTURE DASHBOARD ----------------------------
-st.divider()
-st.subheader("⭐ TODAY — SIMPLE HH / HL / LH / LL MARKET VIEW")
-st.caption(
-    "Simple answer from the latest completed 15m structure: HH + HL = bullish; LH + LL = bearish. "
-    "This section does not require a 78/100 trade score. It is designed to show you what is happening today first."
-)
+    with st.expander("🟡/🟠 WATCH — developing structure", expanded=True):
+        for r in (watch_l + watch_s)[:20]:
+            st.write(f"**{r['symbol']}** — {r['decision']} — {r['today'].get('label','—')} — score {r.get('score',0)}/100")
 
-if st.button("⭐ SCAN ALL COINS — WHAT IS HAPPENING TODAY?", type="secondary", key="v18_today_scan_button"):
-    bar_today = st.progress(0, text="Scanning all Futures for today's HH/HL/LH/LL structure…")
-    def _today_progress(done, total):
-        bar_today.progress(int(done / max(total, 1) * 100), text=f"Analyzing {done}/{total} Futures…")
-    with st.spinner("Fetching 15m/1H/4H data and finding today's structure…"):
-        _today_scan, _today_total = v61_scan_all(_today_progress, max_workers=6)
-    st.session_state["v18_today_results"] = _today_scan
-    st.session_state["v18_today_total"] = _today_total
-    st.session_state["v18_today_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    bar_today.progress(100, text=f"Complete — {_today_total} contracts scanned")
-
-_today_scan = st.session_state.get("v18_today_results", [])
-if _today_scan:
-    def _today_rows(side=None):
+    with st.expander("📋 All scanned coins", expanded=False):
         rows=[]
-        for a in _today_scan:
-            ts = a.get("today_structure") or {}
-            if side and ts.get("side") != side:
-                continue
-            rows.append({
-                "Coin": a.get("symbol", a.get("pair", "—")),
-                "Current": v61_fmt_price(a.get("price")),
-                "Today": ts.get("label", "⚪ NO CLEAR STRUCTURE"),
-                "Higher High": "YES" if ts.get("hh") else "NO",
-                "Higher Low": "YES" if ts.get("hl") else "NO",
-                "Lower High": "YES" if ts.get("lh") else "NO",
-                "Lower Low": "YES" if ts.get("ll") else "NO",
-                "High change": f"{ts.get('high_change_pct', float('nan')):.2f}%" if np.isfinite(v6_num(ts.get('high_change_pct'), np.nan)) else "—",
-                "Low change": f"{ts.get('low_change_pct', float('nan')):.2f}%" if np.isfinite(v6_num(ts.get('low_change_pct'), np.nan)) else "—",
-            })
-        return rows
+        for r in results:
+            t=r.get("today",{})
+            rows.append({"Coin":r["symbol"],"Decision":r["decision"],"Score":r["score"],
+                         "Today":t.get("label"),"HH": "YES" if t.get("hh") else "NO",
+                         "HL":"YES" if t.get("hl") else "NO","LH":"YES" if t.get("lh") else "NO",
+                         "LL":"YES" if t.get("ll") else "NO","1H":r.get("one_hour"),"4H":r.get("four_hour"),
+                         "Nearest S":v13_format_price(r.get("sr_summary",{}).get("nearest_support")),
+                         "Nearest R":v13_format_price(r.get("sr_summary",{}).get("nearest_resistance"))})
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    simple = _today_scan
-    longs_today = [a for a in simple if (a.get("today_structure") or {}).get("side") == "LONG"]
-    shorts_today = [a for a in simple if (a.get("today_structure") or {}).get("side") == "SHORT"]
-    watch_long = [a for a in simple if (a.get("today_structure") or {}).get("side") == "WATCH LONG"]
-    watch_short = [a for a in simple if (a.get("today_structure") or {}).get("side") == "WATCH SHORT"]
-    st.caption(f"Last simple scan: {st.session_state.get('v18_today_time','—')} | Contracts scanned: {st.session_state.get('v18_today_total','—')}")
-    z1,z2,z3,z4 = st.columns(4)
-    z1.metric("🟢 HH + HL", len(longs_today))
-    z2.metric("🔴 LH + LL", len(shorts_today))
-    z3.metric("🟡 Developing LONG", len(watch_long))
-    z4.metric("🟠 Developing SHORT", len(watch_short))
 
-    if longs_today:
-        st.markdown("### 🟢 LONG TODAY — HIGHER HIGH + HIGHER LOW")
-        st.dataframe(pd.DataFrame(_today_rows("LONG")), use_container_width=True, hide_index=True)
-    else:
-        st.info("No coin currently has both Higher High + Higher Low in the latest completed 24h 15m structure.")
+# =============================================================================
+# V22 — SINGLE BUTTON DAILY TRADING WORKFLOW
+# =============================================================================
+st.divider()
+st.subheader("⭐ TODAY'S TRADING OPPORTUNITIES — ONE MARKET SCAN")
+st.caption(
+    "One scan of the active CoinDCX USDT Futures market. The result is intentionally simple: "
+    "HH + HL = bullish, LH + LL = bearish. Extreme pump/dump context and 15m/4H/1D/1W S/R "
+    "are used as confirmation, not as separate scanners."
+)
 
-    if shorts_today:
-        st.markdown("### 🔴 SHORT TODAY — LOWER HIGH + LOWER LOW")
-        st.dataframe(pd.DataFrame(_today_rows("SHORT")), use_container_width=True, hide_index=True)
-    else:
-        st.info("No coin currently has both Lower High + Lower Low in the latest completed 24h 15m structure.")
+v22_workers = st.slider("Concurrent workers", 2, 10, 6, 1, key="v22_workers")
+if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", type="primary", key="v22_market_scan_button"):
+    bar = st.progress(0, text="Scanning all active CoinDCX Futures…")
+    def _v22_progress(done, total):
+        bar.progress(int(done / max(total,1) * 100), text=f"Analyzing {done}/{total} Futures…")
+    with st.spinner("Building today's structure + extreme-move + MTF S/R view…"):
+        _v22_results, _v22_total = v22_unified_scan(_v22_progress, max_workers=v22_workers)
+    st.session_state["v22_market_results"] = _v22_results
+    st.session_state["v22_market_total"] = _v22_total
+    st.session_state["v22_market_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bar.progress(100, text=f"Complete — {_v22_total} Futures contracts scanned")
 
-    with st.expander("🟡/🟠 Developing structures", expanded=False):
-        dev_rows = _today_rows("WATCH LONG") + _today_rows("WATCH SHORT")
-        if dev_rows:
-            st.dataframe(pd.DataFrame(dev_rows), use_container_width=True, hide_index=True)
-        else:
-            st.caption("No developing structure detected.")
+_v22_results = st.session_state.get("v22_market_results", [])
+if _v22_results:
+    st.caption(f"Last scan: {st.session_state.get('v22_market_time','—')} | Contracts scanned: {st.session_state.get('v22_market_total','—')}")
+    v22_render_market(_v22_results)
 else:
-    st.info("Click **SCAN ALL COINS — WHAT IS HAPPENING TODAY?** to get the simple market-wide HH/HL/LH/LL answer.")
+    st.info("Click **⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES** to scan the whole Futures market.")
 
 
-# --------------------- V19 STANDALONE MTF S/R ---------------------------------
+# -------------------------- ANY-COIN DEEP MTF S/R ------------------------------
 st.divider()
 st.subheader("📐 MTF SUPPORT & RESISTANCE — ANY COIN")
-st.caption(
-    "Enter any active CoinDCX Futures pair to see Support 1/2/3 and Resistance 1/2/3 "
-    "on 15m, 4H, 1D and 1W. This is independent of LONG/SHORT signal scoring."
-)
-
-_v19_sr_coin = st.text_input(
-    "Coin / Futures pair for MTF S/R",
-    placeholder="LSK_USDT, B-LSK_USDT, DOGE_USDT",
-    key="v19_mtf_sr_coin",
-)
-
-if st.button("📐 SHOW 15m / 4H / 1D / 1W SUPPORT & RESISTANCE", key="v19_mtf_sr_button"):
+st.caption("Use this only when you want a dedicated 15m / 4H / 1D / 1W S/R view for a specific coin.")
+_v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK_USDT, DOGE_USDT", key="v22_mtf_sr_coin")
+if st.button("📐 SHOW 15m / 4H / 1D / 1W SUPPORT & RESISTANCE", key="v22_mtf_sr_button"):
     try:
-        with st.spinner("Finding the Futures contract and calculating multi-timeframe S/R…"):
-            _req = normalize(_v19_sr_coin)
-            if not _req:
-                st.error("Enter a coin or Futures pair first.")
-                st.stop()
-
-            _prices = futures_prices()
-            _matches = []
-            for _q in (margin, "USDT", "INR"):
-                for _raw in active_instruments(_q):
-                    _pair = v61_instrument_pair(_raw)
-                    if not _pair:
-                        continue
-                    _active_symbol = _pair
-                    if isinstance(_raw, dict):
-                        _active_symbol = str(
-                            _raw.get("symbol") or _raw.get("display_name") or
-                            _raw.get("market") or _raw.get("pair") or _pair
-                        )
-                    if not coin_matches(_pair, _active_symbol, _req, _q):
-                        continue
-                    _prec = price_record_for_pair(_prices, _pair) if "price_record_for_pair" in globals() else None
-                    if _prec is None:
-                        _target = str(_pair).upper().replace("-", "").replace("_", "")
-                        for _key, _rec in (_prices or {}).items():
-                            _ident = str(_key).upper().replace("-", "").replace("_", "")
-                            if _ident == _target or (_ident.startswith("B") and _ident[1:] == _target):
-                                _prec = _rec if isinstance(_rec, dict) else {"pair": _key, "price": _rec}
-                                break
-                    if _prec is None:
-                        try:
-                            _probe = completed(get_tf(_pair, "15m", 2))
-                            if not _probe.empty:
-                                _lc = float(_probe.iloc[-1]["close"])
-                                _prec = {"pair": _pair, "price": _lc, "ls": _lc}
-                        except Exception:
-                            _prec = None
-                    if _prec is not None:
-                        _price = _prec.get("price", _prec.get("ls", _prec.get("last_price")))
-                        try:
-                            _price = float(_price)
-                        except Exception:
-                            _price = None
-                        if _price and _price > 0:
-                            _matches.append((_pair, _price, _active_symbol))
-                if _matches:
-                    break
-
-            if not _matches:
-                st.error(f"Could not find an active CoinDCX Futures contract matching '{_v19_sr_coin}'.")
-                st.stop()
-
-            _sr_pair, _sr_current, _sr_symbol = _matches[0]
-            _sr_tf_data = {
-                "15m": get_tf(_sr_pair, "15m", 12),
-                "4H": get_tf(_sr_pair, "4H", 120),
-                "1D": get_tf(_sr_pair, "1D", 180),
-                "1W": get_tf(_sr_pair, "1W", 365),
-            }
-            _sr = v13_mtf_support_resistance(_sr_tf_data, _sr_current)
-            _sr_summary = v14_sr_summary(_sr, _sr_current)
-            st.session_state["v19_mtf_sr_result"] = {
-                "pair": _sr_pair,
-                "symbol": _sr_symbol,
-                "current": _sr_current,
-                "sr": _sr,
-                "summary": _sr_summary,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            }
-    except Exception as _e:
-        st.error(f"MTF S/R calculation failed: {_e}")
-
-_v19_sr_result = st.session_state.get("v19_mtf_sr_result")
-if _v19_sr_result:
-    st.markdown(f"### {_v19_sr_result.get('symbol', _v19_sr_result.get('pair', '—'))}")
-    _sr_cur = _v19_sr_result["current"]
-    _sr_sum = _v19_sr_result.get("summary", {})
-    _c1, _c2, _c3 = st.columns(3)
-    _c1.metric("Current Price", v13_format_price(_sr_cur))
-    _c2.metric(
-        "Nearest Support",
-        v13_format_price(_sr_sum.get("nearest_support")),
-        f"{_sr_sum.get('support_dist_pct'):+.2f}%" if _sr_sum.get("support_dist_pct") is not None else "—",
-    )
-    _c3.metric(
-        "Nearest Resistance",
-        v13_format_price(_sr_sum.get("nearest_resistance")),
-        f"{_sr_sum.get('resistance_dist_pct'):+.2f}%" if _sr_sum.get("resistance_dist_pct") is not None else "—",
-    )
-    st.dataframe(
-        pd.DataFrame(v13_sr_columns(_v19_sr_result.get("sr", {}))),
-        use_container_width=True,
-        hide_index=True,
-    )
-    st.caption(
-        f"Nearest support: {_sr_sum.get('support_tf','—')} | "
-        f"Nearest resistance: {_sr_sum.get('resistance_tf','—')} | "
-        f"Calculated: {_v19_sr_result.get('time','—')}"
-    )
-
-
-# --------------------- V10 WHOLE-MARKET SCAN CONTROL ---------------------------
-st.divider()
-st.subheader("🧨 V10 Whole-Market Extreme Move Hunter")
-st.caption(
-    "Scans every active CoinDCX USDT Futures contract and shows only coins matching "
-    "the massive-pump / massive-dump conditions. This is separate from the normal "
-    "25/60-contract intraday shortlist."
-)
-v10w1, v10w2 = st.columns([1, 3])
-with v10w1:
-    v10_workers = st.slider("V10 concurrent workers", 2, 10, 6, 1, key="v10_workers")
-with v10w2:
-    st.info(
-        "The hunter looks for 3D/5D/7D extreme moves, then classifies the current "
-        "state as LONG next-leg, SHORT reversal, LONG dump-reversal, SHORT dump-continuation, or WAIT."
-    )
-
-if st.button("🧨 SCAN ALL COINDCX FUTURES FOR EXTREME MOVES", type="primary", key="v10_all_scan"):
-    bar_v10 = st.progress(0, text="Starting whole-market extreme-move scan…")
-    def _v10_progress(done, total):
-        bar_v10.progress(int(done / max(total, 1) * 100),
-                         text=f"Scanning extreme moves: {done}/{total}")
-    with st.spinner("Scanning every active Futures contract…"):
-        _v10_scan, _v10_total = v10_scan_all_extreme(_v10_progress, max_workers=v10_workers)
-    bar_v10.progress(100, text=f"Extreme scan complete: {_v10_total} active contracts checked")
-    st.session_state["v10_all_scan_results"] = _v10_scan
-    st.session_state["v10_all_scan_total"] = _v10_total
-    st.session_state["v10_all_scan_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-_v10_all = st.session_state.get("v10_all_scan_results", [])
-if _v10_all:
-    _v10_trades = [x for x in _v10_all if x.get("Valid") == "✅ TRADE CANDIDATE"]
-    _v10_longs = [x for x in _v10_trades if x.get("Direction") == "LONG"]
-    _v10_shorts = [x for x in _v10_trades if x.get("Direction") == "SHORT"]
-
-    st.caption(
-        f"Last whole-market scan: {st.session_state.get('v10_all_scan_time','—')} | "
-        f"Contracts checked: {st.session_state.get('v10_all_scan_total','—')}"
-    )
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("Extreme candidates", len(_v10_trades))
-    q2.metric("🟢 LONG", len(_v10_longs))
-    q3.metric("🔴 SHORT", len(_v10_shorts))
-    q4.metric("WAIT / watch", max(0, len(_v10_all) - len(_v10_trades)))
-
-    _rows = []
-    for r in _v10_all:
-        _rows.append({
-            "Coin": r.get("Coin"),
-            "State": r.get("Extreme Move"),
-            "Direction": r.get("Direction"),
-            "Score": r.get("Score"),
-            "3D %": r.get("3D %"),
-            "5D %": r.get("5D %"),
-            "7D %": r.get("7D %"),
-            "From Peak %": r.get("From Peak %"),
-            "From Low %": r.get("From Low %"),
-            "15m Structure": r.get("15m Structure"),
-            "Volume": r.get("Volume"),
-            "Decision": "🟢 PAPER LONG" if r.get("Direction") == "LONG" and r.get("Valid") == "✅ TRADE CANDIDATE"
-                       else "🔴 PAPER SHORT" if r.get("Direction") == "SHORT" and r.get("Valid") == "✅ TRADE CANDIDATE"
-                       else "⚪ WAIT",
-            "Reasons": r.get("Reasons"),
-            "Blockers": r.get("Blockers"),
-        })
-    st.dataframe(
-        pd.DataFrame(_rows).sort_values(["Decision", "Score"], ascending=[True, False]),
-        use_container_width=True, hide_index=True
-    )
-
-# --------------------------- V10 EXTREME MOVE UI -----------------------------
-if st.session_state.get("v6_scan_results"):
-    _all_v10 = st.session_state.get("v6_scan_results", [])
-    _extreme10 = [r for r in _all_v10 if r.get("source") == "V10 EXTREME MOVE"]
-    if _extreme10:
-        st.subheader("🧨 V10 Extreme Move Reversal + Next-Leg Hunter")
-        st.caption(
-            "Finds multi-day +150%/+250%/+400% pumps and -65%/-75%/-85% dumps. "
-            "A pump can become LONG next-leg or SHORT reversal; a dump can become LONG reversal or SHORT continuation."
-        )
-        _v10_rows = []
-        for r in _extreme10:
-            _v10_rows.append({
-                "Coin": r.get("Coin"), "State": r.get("Extreme Move"), "Side": r.get("Direction"),
-                "Score": r.get("Score"), "3D %": round(r.get("3D %"),1) if isinstance(r.get("3D %"),(int,float)) else r.get("3D %"),
-                "5D %": round(r.get("5D %"),1) if isinstance(r.get("5D %"),(int,float)) else r.get("5D %"),
-                "7D %": round(r.get("7D %"),1) if isinstance(r.get("7D %"),(int,float)) else r.get("7D %"),
-                "From Peak %": round(r.get("From Peak %"),1) if isinstance(r.get("From Peak %"),(int,float)) else r.get("From Peak %"),
-                "From Low %": round(r.get("From Low %"),1) if isinstance(r.get("From Low %"),(int,float)) else r.get("From Low %"),
-                "15m": r.get("15m Structure"), "Decision": "PAPER TRADE" if r.get("Valid")=="✅ TRADE CANDIDATE" else "WAIT",
-                "Why": r.get("Reasons"), "Blockers": r.get("Blockers"),
-            })
-        st.dataframe(pd.DataFrame(_v10_rows).sort_values(["Score"], ascending=False), use_container_width=True, hide_index=True)
-
+        _req = normalize(_v22_sr_coin)
+        if not _req:
+            st.error("Enter a coin or Futures pair first.")
+        else:
+            _prices = futures_prices(); _match=None
+            for raw in active_instruments("USDT"):
+                pair=v61_instrument_pair(raw)
+                if not pair: continue
+                sym=v61_symbol(raw,pair)
+                if coin_matches(pair,sym,_req,"USDT"):
+                    p=v61_price_for_pair(_prices,pair)
+                    if not np.isfinite(p) or p<=0:
+                        c=completed(get_tf(pair,"15m",2))
+                        if c is not None and not c.empty: p=v6_num(c.iloc[-1].get("close"),np.nan)
+                    if np.isfinite(p) and p>0: _match=(pair,sym,p); break
+            if not _match:
+                st.error(f"Could not find an active CoinDCX Futures contract matching '{_v22_sr_coin}'.")
+            else:
+                pair,sym,p=_match
+                tf={"15m":get_tf(pair,"15m",12),"4H":get_tf(pair,"4H",120),"1D":get_tf(pair,"1D",180),"1W":get_tf(pair,"1W",365)}
+                sr=v13_mtf_support_resistance(tf,p); sm=v14_sr_summary(sr,p)
+                st.markdown(f"### {sym}")
+                a,b,c=st.columns(3); a.metric("Current",v13_format_price(p)); b.metric("Nearest Support",v13_format_price(sm.get("nearest_support")),f"{sm.get('support_dist_pct'):+.2f}%" if sm.get('support_dist_pct') is not None else "—"); c.metric("Nearest Resistance",v13_format_price(sm.get("nearest_resistance")),f"{sm.get('resistance_dist_pct'):+.2f}%" if sm.get('resistance_dist_pct') is not None else "—")
+                st.dataframe(pd.DataFrame(v13_sr_columns(sr)),use_container_width=True,hide_index=True)
+    except Exception as e:
+        st.error(f"MTF S/R calculation failed: {e}")
 
 st.divider()
 st.caption("Core engines retained internally for the remaining workflows. Legacy V6/V6.1/V6.2/V7/Hot-ATH scanner panels have been removed from the visible app to keep the trading workflow simple.")
