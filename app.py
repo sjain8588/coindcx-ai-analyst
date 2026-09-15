@@ -3951,7 +3951,7 @@ def v10_scan_all_extreme(progress=None, max_workers=6):
 
 
 # =============================================================================
-# V22 — ONE-BUTTON DAILY MARKET DECISION ENGINE
+# V26 — ONE-SCAN TABLE MARKET DASHBOARD
 # =============================================================================
 def v23_yesterday_pump_today_fall(d1, current, today_structure):
     """Simple detector for: strong completed daily pump -> current session falling.
@@ -4158,8 +4158,115 @@ def v22_unified_scan(progress=None, max_workers=6):
     # Backward-compatible alias for the single-scan workflow.
     return v23_unified_scan(progress=progress, max_workers=max_workers)
 
+
+def v26_table_mtf_sr_enrich(results, progress=None, max_workers=4):
+    """Add compact MTF S/R to every LONG/SHORT result for the trader tables.
+
+    The 15m dataframe is already available from phase 1.  For actionable
+    LONG/SHORT rows, fetch only 4H and 1D; 1W is derived from 1D.  This keeps
+    the table complete without re-fetching 15m data.
+    """
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    targets = [
+        r for r in (results or [])
+        if r.get("decision") in ("🟢 LONG TODAY", "🔴 SHORT TODAY")
+    ]
+
+    def enrich_one(r):
+        rr = r
+        try:
+            tf = {"15m": rr.get("d15")}
+            pair = rr.get("pair")
+            price = float(rr.get("price"))
+
+            try:
+                tf["4H"] = get_tf(pair, "4H", 90)
+            except Exception:
+                tf["4H"] = pd.DataFrame()
+
+            try:
+                tf["1D"] = get_tf(pair, "1D", 180)
+            except Exception:
+                tf["1D"] = pd.DataFrame()
+
+            try:
+                tf["1W"] = resample_weekly(tf["1D"])
+            except Exception:
+                tf["1W"] = pd.DataFrame()
+
+            rr["table_sr"] = v13_mtf_support_resistance(tf, price)
+
+            # Also provide HTF direction for the compact table.
+            for key, label in (("4H", "table_4h"),):
+                try:
+                    ind = indicators(completed(tf[key]))
+                    if ind is not None and not ind.empty:
+                        q = ind.iloc[-1]
+                        c = v6_num(q.get("close"), np.nan)
+                        e20 = v6_num(q.get("ema20"), np.nan)
+                        e50 = v6_num(q.get("ema50"), np.nan)
+                        if np.isfinite(c) and np.isfinite(e20) and np.isfinite(e50):
+                            rr[label] = (
+                                "BULLISH" if c > e20 > e50
+                                else "BEARISH" if c < e20 < e50
+                                else "MIXED"
+                            )
+                except Exception:
+                    rr["table_4h"] = "—"
+        except Exception:
+            rr["table_sr"] = rr.get("sr", {}) or {}
+            rr["table_4h"] = rr.get("four_hour", "—")
+        return rr
+
+    done = 0
+    workers = max(2, min(int(max_workers), 4))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(enrich_one, r) for r in targets]
+        for fut in as_completed(futures):
+            done += 1
+            if progress:
+                progress(done, len(targets), f"Building MTF S/R table {done}/{len(targets)}…")
+            try:
+                fut.result()
+            except Exception:
+                pass
+
+    return results
+
+
+def v26_compact_sr_table_rows(records):
+    """Create a compact, trader-friendly table with S/R on all four timeframes."""
+    rows = []
+    for r in records:
+        sr = r.get("table_sr") or r.get("sr") or {}
+        def lv(tf, side):
+            return v13_format_price((sr.get(tf) or {}).get(side))
+
+        yp = r.get("yesterday") or {}
+        pump = "YES" if yp.get("flag") else "—"
+
+        rows.append({
+            "Coin": r.get("symbol", "—"),
+            "Current": v13_format_price(r.get("price")),
+            "Today": r.get("today", {}).get("label", "—"),
+            "Score": r.get("score", 0),
+            "15m S": lv("15m", "S1"),
+            "15m R": lv("15m", "R1"),
+            "4H S": lv("4H", "S1"),
+            "4H R": lv("4H", "R1"),
+            "1D S": lv("1D", "S1"),
+            "1D R": lv("1D", "R1"),
+            "1W S": lv("1W", "S1"),
+            "1W R": lv("1W", "R1"),
+            "4H Trend": r.get("table_4h", r.get("four_hour", "—")),
+            "Pump→Fall": pump,
+        })
+    return rows
+
+
 def v22_render_market(results):
-    """Render only the simple trader-facing answer; technical detail stays in expanders."""
+    """Render the daily market answer primarily as compact LONG/SHORT tables."""
     if not results:
         st.warning("No usable Futures data was returned. Run the scan again.")
         return
@@ -4170,70 +4277,74 @@ def v22_render_market(results):
     watch_s = [r for r in results if r.get("decision") == "🟠 WATCH SHORT"]
     waits = [r for r in results if r.get("decision") == "⚪ WAIT"]
 
-    a,b,c,d = st.columns(4)
+    a, b, c, d = st.columns(4)
     a.metric("🟢 LONG TODAY", len(longs))
     b.metric("🔴 SHORT TODAY", len(shorts))
-    c.metric("🟡 WATCH", len(watch_l)+len(watch_s))
+    c.metric("🟡 WATCH", len(watch_l) + len(watch_s))
     d.metric("⚪ WAIT", len(waits))
 
-    def card(r):
-        st.markdown(f"### {r['decision']} — **{r['symbol']}**")
-        x1,x2,x3,x4 = st.columns(4)
-        x1.metric("Current", v13_format_price(r["price"]))
-        x2.metric("Today", r["today"].get("label", "—"))
-        x3.metric("1H", r.get("one_hour", "—"))
-        x4.metric("4H", r.get("four_hour", "—"))
-        st.write(f"**Simple answer:** {r['today'].get('label','—')}  |  **Score:** {r.get('score',0)}/100")
-        st.write("**Why:** " + " • ".join(r.get("reasons", [])))
-        yp = r.get("yesterday") or {}
-        if yp.get("flag"):
-            st.success(f"🔥 YESTERDAY PUMP → TODAY FALL: +{yp.get('pump_pct', 0):.1f}% yesterday, {yp.get('today_vs_yesterday_close_pct', 0):.1f}% vs yesterday close")
-        sm = r.get("sr_summary", {})
-        sdist = sm.get("support_dist_pct")
-        rdist = sm.get("resistance_dist_pct")
-        sdist_txt = f"{sdist:+.2f}%" if isinstance(sdist, (int, float)) and np.isfinite(sdist) else "—"
-        rdist_txt = f"{rdist:+.2f}%" if isinstance(rdist, (int, float)) and np.isfinite(rdist) else "—"
-        st.write(
-            f"**Nearest support:** {v13_format_price(sm.get('nearest_support'))} ({sdist_txt})  | "
-            f"**Nearest resistance:** {v13_format_price(sm.get('nearest_resistance'))} ({rdist_txt})"
-        )
-        with st.expander("📐 15m / 4H / 1D / 1W Support & Resistance", expanded=False):
-            st.dataframe(pd.DataFrame(v13_sr_columns(r.get("sr", {}))), use_container_width=True, hide_index=True)
-        with st.expander("🧨 Extreme-move details", expanded=False):
-            e=r.get("extreme") or {}
-            if e:
-                st.write(f"**State:** {e.get('state','—')} | **Direction:** {e.get('side','—')} | **Score:** {e.get('score','—')}")
-                st.write(f"3D: {e.get('ret3d','—')}% | 5D: {e.get('ret5d','—')}% | 7D: {e.get('ret7d','—')}% | From peak: {e.get('from_peak_pct','—')}%")
-            else:
-                st.caption("No extreme multi-day move detected for this coin.")
-        st.divider()
+    st.caption(
+        "Tables show the current structure plus nearest S1/R1 on 15m, 4H, 1D and 1W. "
+        "Use the separate coin analysis for S2/S3/R2/R3."
+    )
+
+    table_cols = [
+        "Coin", "Current", "Today", "Score",
+        "15m S", "15m R", "4H S", "4H R",
+        "1D S", "1D R", "1W S", "1W R",
+        "4H Trend", "Pump→Fall"
+    ]
 
     st.markdown("## 🟢 LONG TODAY")
     if longs:
-        for r in longs[:15]: card(r)
+        st.dataframe(
+            pd.DataFrame(v26_compact_sr_table_rows(longs), columns=table_cols),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Score": st.column_config.NumberColumn("Score", format="%d"),
+            },
+        )
     else:
-        st.info("No confirmed LONG structure right now.")
+        st.info("No LONG structure right now.")
 
     st.markdown("## 🔴 SHORT TODAY")
     if shorts:
-        for r in shorts[:15]: card(r)
+        st.dataframe(
+            pd.DataFrame(v26_compact_sr_table_rows(shorts), columns=table_cols),
+            use_container_width=True, hide_index=True,
+            column_config={
+                "Score": st.column_config.NumberColumn("Score", format="%d"),
+            },
+        )
     else:
-        st.info("No confirmed SHORT structure right now.")
+        st.info("No SHORT structure right now.")
 
-    with st.expander("🟡/🟠 WATCH — developing structure", expanded=True):
-        for r in (watch_l + watch_s)[:20]:
-            st.write(f"**{r['symbol']}** — {r['decision']} — {r['today'].get('label','—')} — score {r.get('score',0)}/100")
+    with st.expander("🟡/🟠 WATCH — developing structure", expanded=False):
+        watch_rows = []
+        for r in watch_l + watch_s:
+            watch_rows.append({
+                "Coin": r.get("symbol", "—"),
+                "Decision": r.get("decision", "—"),
+                "Today": r.get("today", {}).get("label", "—"),
+                "Score": r.get("score", 0),
+            })
+        if watch_rows:
+            st.dataframe(pd.DataFrame(watch_rows), use_container_width=True, hide_index=True)
 
     with st.expander("📋 All scanned coins", expanded=False):
-        rows=[]
+        rows = []
         for r in results:
-            t=r.get("today",{})
-            rows.append({"Coin":r["symbol"],"Decision":r["decision"],"Score":r["score"],
-                         "Today":t.get("label"),"HH": "YES" if t.get("hh") else "NO",
-                         "HL":"YES" if t.get("hl") else "NO","LH":"YES" if t.get("lh") else "NO",
-                         "LL":"YES" if t.get("ll") else "NO","1H":r.get("one_hour"),"4H":r.get("four_hour"),
-                         "Nearest S":v13_format_price(r.get("sr_summary",{}).get("nearest_support")),
-                         "Nearest R":v13_format_price(r.get("sr_summary",{}).get("nearest_resistance"))})
+            t = r.get("today", {})
+            rows.append({
+                "Coin": r.get("symbol", "—"),
+                "Decision": r.get("decision", "—"),
+                "Score": r.get("score", 0),
+                "Today": t.get("label", "—"),
+                "HH": "YES" if t.get("hh") else "NO",
+                "HL": "YES" if t.get("hl") else "NO",
+                "LH": "YES" if t.get("lh") else "NO",
+                "LL": "YES" if t.get("ll") else "NO",
+            })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
@@ -4255,6 +4366,15 @@ if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", t
         bar.progress(int(done / max(total,1) * 100), text=text or f"Analyzing {done}/{total} Futures…")
     with st.spinner("Building today's structure + extreme-move + MTF S/R view…"):
         _v22_results, _v22_total = v23_unified_scan(_v22_progress, max_workers=v22_workers)
+        # Populate MTF S/R for EVERY actionable LONG/SHORT row so the trader
+        # does not have to open hundreds of individual cards.
+        def _sr_progress(done, total, text=None):
+            # Keep the same progress bar, but reserve the final phase for S/R.
+            pct = 50 + int(done / max(total, 1) * 50)
+            bar.progress(min(pct, 100), text=text or f"Building MTF S/R {done}/{total}…")
+        _v22_results = v26_table_mtf_sr_enrich(
+            _v22_results, progress=_sr_progress, max_workers=v22_workers
+        )
     st.session_state["v22_market_results"] = _v22_results
     st.session_state["v22_market_total"] = _v22_total
     st.session_state["v22_market_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
