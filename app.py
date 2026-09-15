@@ -3984,6 +3984,97 @@ def v23_yesterday_pump_today_fall(d1, current, today_structure):
         return out
 
 
+
+def v28_basic_sr_from_df(df, current):
+    """Robust S/R fallback so the table never shows blank levels unnecessarily."""
+    out = {"S1": None, "S2": None, "S3": None, "R1": None, "R2": None, "R3": None}
+    try:
+        d = completed(df)
+        c = float(current)
+        if d is None or d.empty or not np.isfinite(c) or c <= 0:
+            return out
+        highs = pd.to_numeric(d["high"], errors="coerce").dropna().tolist()
+        lows = pd.to_numeric(d["low"], errors="coerce").dropna().tolist()
+        below = sorted(set(float(x) for x in lows if 0 < float(x) < c), reverse=True)
+        above = sorted(set(float(x) for x in highs if float(x) > c))
+        # Use recent range levels first, clustered by 0.4%.
+        def cluster(vals, reverse=False):
+            vals = sorted(vals, reverse=reverse)
+            ans = []
+            for x in vals:
+                if not ans or abs(x-ans[-1])/max(abs(ans[-1]),1e-12) > 0.004:
+                    ans.append(x)
+            return ans
+        below, above = cluster(below, True), cluster(above, False)
+        for i, x in enumerate(below[:3], 1): out[f"S{i}"] = x
+        for i, x in enumerate(above[:3], 1): out[f"R{i}"] = x
+    except Exception:
+        pass
+    return out
+
+def v28_attach_15m_sr(r):
+    try:
+        price = float(r.get("price"))
+        fb = v28_basic_sr_from_df(r.get("d15"), price)
+        sr = dict(r.get("sr") or {})
+        cur = dict(sr.get("15m") or {})
+        for k, v in fb.items():
+            if cur.get(k) is None:
+                cur[k] = v
+        sr["15m"] = cur
+        r["sr"] = sr
+        r["table_sr"] = sr
+    except Exception:
+        pass
+    return r
+
+
+def v28_full_mtf_top5(records):
+    """Attach complete MTF S/R only to the final freshness-filtered Top 5 each side."""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    selected = []
+    for side in ("LONG", "SHORT"):
+        key = "🟢 LONG TODAY" if side == "LONG" else "🔴 SHORT TODAY"
+        cand = [r for r in records if r.get("decision") == key and r.get("trade_eligible", True)]
+        cand.sort(key=lambda r: (-v29_rank_score(r), -v27_pre_rank_score(r), r.get("symbol","")))
+        selected.extend(cand[:5])
+
+    def enrich(r):
+        try:
+            pair, price = r["pair"], float(r["price"])
+            tf = {"15m": r["d15"]}
+            for name, days in (("4H", 90), ("1D", 180)):
+                try: tf[name] = get_tf(pair, name, days)
+                except Exception: tf[name] = pd.DataFrame()
+            tf["1W"] = resample_weekly(tf["1D"])
+            sr = v13_mtf_support_resistance(tf, price)
+            for name in ("15m","4H","1D","1W"):
+                base = dict(sr.get(name) or {})
+                fb = v28_basic_sr_from_df(tf.get(name), price)
+                for k, v in fb.items():
+                    if base.get(k) is None: base[k] = v
+                sr[name] = base
+            r["sr"] = sr
+            r["table_sr"] = sr
+            r["sr_summary"] = v14_sr_summary(sr, price)
+            for key, label in (("4H","four_hour"),):
+                ind = indicators(completed(tf[key]))
+                if ind is not None and not ind.empty:
+                    q=ind.iloc[-1]
+                    c=v6_num(q.get("close"),np.nan); e20=v6_num(q.get("ema20"),np.nan); e50=v6_num(q.get("ema50"),np.nan)
+                    r[label] = "BULLISH" if np.isfinite(c) and np.isfinite(e20) and np.isfinite(e50) and c>e20>e50 else "BEARISH" if np.isfinite(c) and np.isfinite(e20) and np.isfinite(e50) and c<e20<e50 else "MIXED"
+        except Exception:
+            pass
+        return r
+    with ThreadPoolExecutor(max_workers=4) as ex:
+        fs=[ex.submit(enrich,r) for r in selected]
+        for f in as_completed(fs):
+            try: f.result()
+            except Exception: pass
+    return records
+
+
+
 def v23_unified_scan(progress=None, max_workers=4):
     """Reliable ONE-button market scan.
 
@@ -4083,12 +4174,22 @@ def v23_unified_scan(progress=None, max_workers=4):
         elif side == "WATCH SHORT": r["decision"] = "🟠 WATCH SHORT"
         else: r["decision"] = "⚪ WAIT"
         r["reasons"] = [t.get("label", "No clear structure")]
+        v28_attach_15m_sr(r)
 
-    # Enrich only the most useful candidates. This prevents 500 x 4 API calls
-    # from starving the primary 15m market scan.
+    # Enrich the strongest candidates on BOTH sides. The old implementation
+    # could spend all 40 enrichment slots on LONGs because LONGs were sorted first.
+    # Keep a deterministic 25 LONG + 25 SHORT shortlist for HTF/SR enrichment.
     priority = {"🟢 LONG TODAY":0,"🔴 SHORT TODAY":1,"🟡 WATCH LONG":2,"🟠 WATCH SHORT":3,"⚪ WAIT":4}
-    phase1.sort(key=lambda r:(priority.get(r["decision"],9), -r["score"]))
-    enrich = [r for r in phase1 if r["decision"] in ("🟢 LONG TODAY","🔴 SHORT TODAY","🟡 WATCH LONG","🟠 WATCH SHORT")][:40]
+    phase1.sort(key=lambda r:(priority.get(r["decision"],9), -v27_pre_rank_score(r), r.get("symbol","")))
+    longs_pre = sorted(
+        [r for r in phase1 if r["decision"] == "🟢 LONG TODAY"],
+        key=lambda r: (-v27_pre_rank_score(r), r.get("symbol",""))
+    )[:30]
+    shorts_pre = sorted(
+        [r for r in phase1 if r["decision"] == "🔴 SHORT TODAY"],
+        key=lambda r: (-v27_pre_rank_score(r), r.get("symbol",""))
+    )[:30]
+    enrich = longs_pre + shorts_pre
 
     for r in enrich:
         pair, symbol, price = r["pair"], r["symbol"], r["price"]
@@ -4099,6 +4200,7 @@ def v23_unified_scan(progress=None, max_workers=4):
         except Exception: tf["4H"] = pd.DataFrame()
         try: tf["1D"] = get_tf(pair,"1D",180)
         except Exception: tf["1D"] = pd.DataFrame()
+        r["d1"] = tf.get("1D")
         try:
             tf["1W"] = resample_weekly(tf["1D"])
         except Exception:
@@ -4118,6 +4220,7 @@ def v23_unified_scan(progress=None, max_workers=4):
             r["yesterday"] = v23_yesterday_pump_today_fall(tf["1D"], price, r["today"])
         except Exception:
             pass
+        v29_apply_freshness(r)
 
         for key, label in (("1H","one_hour"),("4H","four_hour")):
             try:
@@ -4143,7 +4246,17 @@ def v23_unified_scan(progress=None, max_workers=4):
             r["reasons"].append("🔥 yesterday pump → today fall")
         r["score"] = int(max(0,min(100,r["score"])))
 
-    phase1.sort(key=lambda r:(priority.get(r["decision"],9), -r["score"]))
+    # Compute final ranking for the enriched LONG/SHORT candidates.
+    for r in phase1:
+        if r.get("decision") in ("🟢 LONG TODAY", "🔴 SHORT TODAY"):
+            r["final_rank_score"] = v27_final_rank_score(r)
+
+    phase1.sort(key=lambda r: (
+        priority.get(r["decision"], 9),
+        -r.get("final_rank_score", r.get("score", 0)),
+        -v27_pre_rank_score(r),
+        r.get("symbol", "")
+    ))
     # Always return every successfully-read 15m coin, including WAIT, so the
     # user can see that the market was actually analyzed. Store diagnostics so
     # a zero-result scan never hides the real API/data problem.
@@ -4157,6 +4270,131 @@ def v23_unified_scan(progress=None, max_workers=4):
 def v22_unified_scan(progress=None, max_workers=6):
     # Backward-compatible alias for the single-scan workflow.
     return v23_unified_scan(progress=progress, max_workers=max_workers)
+
+
+
+def v27_pre_rank_score(r):
+    """Deterministic first-pass quality score from the already-fetched 15m structure."""
+    t = r.get("today") or {}
+    side = t.get("side")
+    if side not in ("LONG", "SHORT"):
+        return 0.0
+
+    score = 60.0
+    # Strength of the two confirmed pivot changes. Tiny changes are filtered
+    # by simple_today_structure already; larger changes get more weight.
+    hc = abs(float(t.get("high_change_pct", 0) or 0))
+    lc = abs(float(t.get("low_change_pct", 0) or 0))
+    score += min(hc * 2.0, 15.0)
+    score += min(lc * 2.0, 15.0)
+    if (side == "LONG" and t.get("hh")) or (side == "SHORT" and t.get("lh")):
+        score += 5
+    if (side == "LONG" and t.get("hl")) or (side == "SHORT" and t.get("ll")):
+        score += 5
+    return float(score)
+
+
+def v27_final_rank_score(r):
+    """Rank actionable setups using structure + HTF alignment + S/R room + pump/fall context."""
+    t = r.get("today") or {}
+    side = t.get("side")
+    score = v27_pre_rank_score(r)
+
+    h1 = r.get("one_hour", "NOT CHECKED")
+    h4 = r.get("four_hour", "NOT CHECKED")
+    if side == "LONG":
+        if h1 == "BULLISH": score += 7
+        elif h1 == "BEARISH": score -= 4
+        if h4 == "BULLISH": score += 10
+        elif h4 == "BEARISH": score -= 8
+    elif side == "SHORT":
+        if h1 == "BEARISH": score += 7
+        elif h1 == "BULLISH": score -= 4
+        if h4 == "BEARISH": score += 10
+        elif h4 == "BULLISH": score -= 8
+
+    ssum = r.get("sr_summary") or {}
+    rd = ssum.get("resistance_dist_pct")
+    sd = ssum.get("support_dist_pct")
+
+    # For LONG we want room up to resistance; for SHORT we want room down to support.
+    if side == "LONG" and rd is not None:
+        try:
+            rd = float(rd)
+            if rd < 1.0: score -= 12
+            elif rd < 2.0: score -= 6
+            elif rd >= 5.0: score += 8
+            elif rd >= 3.0: score += 5
+        except Exception:
+            pass
+    if side == "SHORT" and sd is not None:
+        try:
+            sd = float(sd)
+            if sd < 1.0: score -= 12
+            elif sd < 2.0: score -= 6
+            elif sd >= 5.0: score += 8
+            elif sd >= 3.0: score += 5
+        except Exception:
+            pass
+
+    yp = r.get("yesterday") or {}
+    if side == "SHORT" and yp.get("flag"):
+        score += 10
+    # A dump-reversal context is useful for LONGs when the extreme engine found it.
+    ex = r.get("extreme") or {}
+    if side == "LONG":
+        txt = str(ex).upper()
+        if "DUMP REVERSAL" in txt or "LONG" in txt and "REVERSAL" in txt:
+            score += 8
+
+    return int(max(0, min(100, round(score))))
+
+
+def v27_top5(records, side):
+    """Return the five highest-quality actionable records for the requested side."""
+    key = "🟢 LONG TODAY" if side == "LONG" else "🔴 SHORT TODAY"
+    candidates = [r for r in records if r.get("decision") == key]
+    for r in candidates:
+        r["final_rank_score"] = v27_final_rank_score(r)
+    return sorted(
+        candidates,
+        key=lambda r: (
+            -r.get("final_rank_score", 0),
+            -v27_pre_rank_score(r),
+            r.get("symbol", "")
+        )
+    )[:5]
+
+
+def v27_top5_table_rows(records):
+    rows = []
+    for rank, r in enumerate(records, 1):
+        sr = r.get("table_sr") or r.get("sr") or {}
+        def lv(tf, side):
+            return v13_format_price((sr.get(tf) or {}).get(side))
+        t = r.get("today") or {}
+        yp = r.get("yesterday") or {}
+        rows.append({
+            "#": rank,
+            "Coin": r.get("symbol", "—"),
+            "Current": v13_format_price(r.get("price")),
+            "Structure": t.get("label", "—"),
+            "Score": r.get("final_rank_score", v27_final_rank_score(r)),
+            "15m S": lv("15m", "S1"),
+            "15m R": lv("15m", "R1"),
+            "4H S": lv("4H", "S1"),
+            "4H R": lv("4H", "R1"),
+            "1D S": lv("1D", "S1"),
+            "1D R": lv("1D", "R1"),
+            "1W S": lv("1W", "S1"),
+            "1W R": lv("1W", "R1"),
+            "4H Trend": r.get("four_hour", "—"),
+            "Freshness": r.get("freshness", "⚪ NORMAL"),
+            "3D": f"{r.get('recent_3d_pct'):+.1f}%" if np.isfinite(r.get("recent_3d_pct", np.nan)) else "—",
+            "From Peak": f"{r.get('from_peak_pct'):+.1f}%" if np.isfinite(r.get("from_peak_pct", np.nan)) else "—",
+            "Pump→Fall": "YES" if yp.get("flag") else "—",
+        })
+    return rows
 
 
 def v26_table_mtf_sr_enrich(results, progress=None, max_workers=4):
@@ -4250,7 +4488,7 @@ def v26_compact_sr_table_rows(records):
             "Coin": r.get("symbol", "—"),
             "Current": v13_format_price(r.get("price")),
             "Today": r.get("today", {}).get("label", "—"),
-            "Score": r.get("score", 0),
+            "Score": r.get("final_rank_score", r.get("score", 0)),
             "15m S": lv("15m", "S1"),
             "15m R": lv("15m", "R1"),
             "4H S": lv("4H", "S1"),
@@ -4261,6 +4499,192 @@ def v26_compact_sr_table_rows(records):
             "1W R": lv("1W", "R1"),
             "4H Trend": r.get("table_4h", r.get("four_hour", "—")),
             "Pump→Fall": pump,
+        })
+    return rows
+
+
+
+# =============================================================================
+# V29 — FRESHNESS / NO-CHASE FILTER
+# =============================================================================
+# The market can be bullish while the LONG entry is already late, or bearish
+# while the SHORT has already traveled too far. V29 ranks "tradeable now",
+# not merely "directionally correct".
+V29_LONG_MAX_3D_EXTENDED = 50.0
+V29_LONG_MAX_FROM_PEAK_FRESH = -15.0
+V29_LONG_TOO_LATE_FROM_PEAK = -20.0
+V29_SHORT_FRESH_FROM_PEAK = -12.0
+V29_SHORT_TOO_LATE_FROM_PEAK = -22.0
+V29_YESTERDAY_PUMP_MIN = 15.0
+
+
+def v29_freshness_metrics(d1, current, side, today=None, yesterday=None):
+    out = {
+        "freshness": "⚪ NORMAL",
+        "freshness_score": 0,
+        "trade_eligible": True,
+        "recent_3d_pct": np.nan,
+        "recent_5d_pct": np.nan,
+        "from_peak_pct": np.nan,
+        "from_low_pct": np.nan,
+        "freshness_reason": "",
+    }
+    try:
+        d = completed(d1)
+        c = float(current)
+        if d is None or d.empty or len(d) < 8 or not np.isfinite(c) or c <= 0:
+            out["freshness"] = "⚪ DATA LIMITED"
+            out["freshness_reason"] = "Not enough daily history for freshness test"
+            return out
+
+        closes = pd.to_numeric(d["close"], errors="coerce").dropna()
+        highs = pd.to_numeric(d["high"], errors="coerce").dropna()
+        lows = pd.to_numeric(d["low"], errors="coerce").dropna()
+        if len(closes) < 8:
+            return out
+
+        out["recent_3d_pct"] = _v10_pct(c, float(closes.iloc[-4]))
+        out["recent_5d_pct"] = _v10_pct(c, float(closes.iloc[-6]))
+        window = d.tail(8)
+        peak = float(pd.to_numeric(window["high"], errors="coerce").max())
+        low = float(pd.to_numeric(window["low"], errors="coerce").min())
+        out["from_peak_pct"] = _v10_pct(c, peak)
+        out["from_low_pct"] = _v10_pct(c, low)
+
+        t = today or {}
+        y = yesterday or {}
+        hhhl = bool(t.get("hh") and t.get("hl"))
+        lhll = bool(t.get("lh") and t.get("ll"))
+
+        if side == "SHORT":
+            fp = out["from_peak_pct"]
+            pump_flag = bool(y.get("flag")) and float(y.get("pump_pct", 0) or 0) >= V29_YESTERDAY_PUMP_MIN
+            fall = float(y.get("today_vs_yesterday_close_pct", 0) or 0)
+
+            if np.isfinite(fp) and fp <= V29_SHORT_TOO_LATE_FROM_PEAK:
+                out.update(freshness="🔴 TOO LATE — DUMP ALREADY TRAVELED",
+                           freshness_score=-35, trade_eligible=False)
+                out["freshness_reason"] = f"{fp:.1f}% from recent peak"
+            elif np.isfinite(fp) and fp <= -15.0:
+                out.update(freshness="🟠 LATE — WAIT FOR A NEW SETUP",
+                           freshness_score=-18, trade_eligible=False)
+                out["freshness_reason"] = f"{fp:.1f}% from recent peak"
+            elif lhll and pump_flag and fall <= -2.0:
+                out.update(freshness="🟢 FRESH PUMP → FALL SHORT",
+                           freshness_score=18)
+                out["freshness_reason"] = f"yesterday +{float(y.get('pump_pct')):.1f}% → today {fall:.1f}%"
+            elif lhll and np.isfinite(fp) and fp >= V29_SHORT_FRESH_FROM_PEAK:
+                out.update(freshness="🟢 FRESH REVERSAL SHORT",
+                           freshness_score=14)
+                out["freshness_reason"] = f"LH+LL with only {abs(fp):.1f}% off recent peak"
+            elif np.isfinite(fp) and fp >= -8.0:
+                out.update(freshness="🟢 FRESH BEARISH START",
+                           freshness_score=8)
+                out["freshness_reason"] = f"Only {abs(fp):.1f}% off recent peak"
+            else:
+                out["freshness_reason"] = f"{fp:.1f}% from recent peak" if np.isfinite(fp) else "Peak unavailable"
+
+        elif side == "LONG":
+            r3 = out["recent_3d_pct"]
+            fp = out["from_peak_pct"]
+            fl = out["from_low_pct"]
+
+            # A huge move with price still hugging the peak is usually a chase.
+            if (np.isfinite(r3) and r3 >= 80.0 and np.isfinite(fp) and fp > -10.0) or (
+                np.isfinite(fl) and fl >= 120.0 and np.isfinite(fp) and fp > -8.0
+            ):
+                out.update(freshness="🔴 TOO LATE — PUMP ALREADY EXTENDED",
+                           freshness_score=-35, trade_eligible=False)
+                out["freshness_reason"] = f"3D +{r3:.1f}% / {fp:.1f}% from recent peak"
+            elif np.isfinite(r3) and r3 >= V29_LONG_MAX_3D_EXTENDED and np.isfinite(fp) and fp > -8.0:
+                out.update(freshness="🟠 EXTENDED — DO NOT CHASE",
+                           freshness_score=-22, trade_eligible=False)
+                out["freshness_reason"] = f"3D +{r3:.1f}% and near recent peak"
+            elif hhhl and np.isfinite(fp) and -15.0 <= fp <= -3.0:
+                out.update(freshness="🟢 FRESH CONSOLIDATION LONG",
+                           freshness_score=18)
+                out["freshness_reason"] = f"HH+HL after {abs(fp):.1f}% pullback from recent peak"
+            elif hhhl and np.isfinite(r3) and r3 <= 35.0:
+                out.update(freshness="🟢 FRESH LONG",
+                           freshness_score=14)
+                out["freshness_reason"] = f"3D move {r3:+.1f}%"
+            elif hhhl and np.isfinite(fp) and fp < -15.0:
+                out.update(freshness="🟡 REBUILDING — NOT CHASING",
+                           freshness_score=4)
+                out["freshness_reason"] = f"{abs(fp):.1f}% below recent peak"
+            else:
+                out["freshness_reason"] = f"3D {r3:+.1f}% / {fp:.1f}% from peak" if np.isfinite(r3) and np.isfinite(fp) else "Extension unavailable"
+        return out
+    except Exception:
+        return out
+
+
+def v29_apply_freshness(r):
+    try:
+        t = r.get("today") or {}
+        side = t.get("side")
+        if side in ("LONG", "SHORT") and r.get("d1") is not None:
+            f = v29_freshness_metrics(
+                r["d1"], r["price"], side, t, r.get("yesterday") or {}
+            )
+            r["freshness_info"] = f
+            r["freshness"] = f["freshness"]
+            r["freshness_score"] = f["freshness_score"]
+            r["trade_eligible"] = f["trade_eligible"]
+            r["recent_3d_pct"] = f["recent_3d_pct"]
+            r["recent_5d_pct"] = f["recent_5d_pct"]
+            r["from_peak_pct"] = f["from_peak_pct"]
+            r["from_low_pct"] = f["from_low_pct"]
+            r["freshness_reason"] = f["freshness_reason"]
+    except Exception:
+        pass
+    return r
+
+
+def v29_rank_score(r):
+    base = v27_final_rank_score(r)
+    return int(max(0, min(100, base + int(r.get("freshness_score", 0) or 0))))
+
+
+def v29_top5(records, side):
+    key = "🟢 LONG TODAY" if side == "LONG" else "🔴 SHORT TODAY"
+    candidates = [
+        r for r in records
+        if r.get("decision") == key and r.get("trade_eligible", True)
+    ]
+    for r in candidates:
+        r["final_rank_score"] = v29_rank_score(r)
+    return sorted(
+        candidates,
+        key=lambda r: (
+            -r.get("final_rank_score", 0),
+            -v27_pre_rank_score(r),
+            r.get("symbol", "")
+        )
+    )[:5]
+
+
+def v29_top5_table_rows(records):
+    rows = []
+    for rank, r in enumerate(records, 1):
+        sr = r.get("table_sr") or r.get("sr") or {}
+        def lv(tf, side):
+            return v13_format_price((sr.get(tf) or {}).get(side))
+        rows.append({
+            "#": rank,
+            "Coin": r.get("symbol", "—"),
+            "Current": v13_format_price(r.get("price")),
+            "Structure": (r.get("today") or {}).get("label", "—"),
+            "Freshness": r.get("freshness", "⚪ NORMAL"),
+            "3D": f"{r.get('recent_3d_pct'):+.1f}%" if np.isfinite(r.get("recent_3d_pct", np.nan)) else "—",
+            "From Peak": f"{r.get('from_peak_pct'):+.1f}%" if np.isfinite(r.get("from_peak_pct", np.nan)) else "—",
+            "Score": r.get("final_rank_score", v29_rank_score(r)),
+            "15m S": lv("15m", "S1"), "15m R": lv("15m", "R1"),
+            "4H S": lv("4H", "S1"), "4H R": lv("4H", "R1"),
+            "1D S": lv("1D", "S1"), "1D R": lv("1D", "R1"),
+            "1W S": lv("1W", "S1"), "1W R": lv("1W", "R1"),
+            "4H Trend": r.get("four_hour", "—"),
+            "Pump→Fall": "YES" if (r.get("yesterday") or {}).get("flag") else "—",
         })
     return rows
 
@@ -4284,9 +4708,40 @@ def v22_render_market(results):
     d.metric("⚪ WAIT", len(waits))
 
     st.caption(
-        "Tables show the current structure plus nearest S1/R1 on 15m, 4H, 1D and 1W. "
-        "Use the separate coin analysis for S2/S3/R2/R3."
+        "TOP 5 ranks tradeable-now setups, not simply the strongest direction. "
+        "The freshness filter removes mature pumps/dumps that are too late to chase. "
+        "TOP 5 rows include full 15m/4H/1D/1W S1/R1."
     )
+
+    # ------------------------------------------------------------------
+    # TOP 5 — the part the trader should look at first.
+    # ------------------------------------------------------------------
+    top_longs = v29_top5(results, "LONG")
+    top_shorts = v29_top5(results, "SHORT")
+
+    st.markdown("## 🏆 TOP 5 LONG CANDIDATES TODAY")
+    if top_longs:
+        st.caption("Ranked for a FRESH entry: HH/HL strength, 1H/4H alignment, S/R room, and how extended the move already is.")
+        st.dataframe(
+            pd.DataFrame(v29_top5_table_rows(top_longs)),
+            use_container_width=True, hide_index=True,
+            column_config={"Score": st.column_config.NumberColumn("Score", format="%d")},
+        )
+    else:
+        st.info("No fresh LONG candidates. Existing LONG structure may be too extended or not sufficiently confirmed.")
+
+    st.markdown("## 🏆 TOP 5 SHORT CANDIDATES TODAY")
+    if top_shorts:
+        st.caption("Ranked for a FRESH entry: LH/LL strength, 1H/4H alignment, downside room, and whether a recent pump is just starting to reverse.")
+        st.dataframe(
+            pd.DataFrame(v29_top5_table_rows(top_shorts)),
+            use_container_width=True, hide_index=True,
+            column_config={"Score": st.column_config.NumberColumn("Score", format="%d")},
+        )
+    else:
+        st.info("No fresh SHORT candidates. Existing SHORT structure may already be too far below its peak.")
+
+    st.divider()
 
     table_cols = [
         "Coin", "Current", "Today", "Score",
@@ -4295,7 +4750,7 @@ def v22_render_market(results):
         "4H Trend", "Pump→Fall"
     ]
 
-    st.markdown("## 🟢 LONG TODAY")
+    st.markdown("## 🟢 ALL LONG TODAY")
     if longs:
         st.dataframe(
             pd.DataFrame(v26_compact_sr_table_rows(longs), columns=table_cols),
@@ -4307,7 +4762,7 @@ def v22_render_market(results):
     else:
         st.info("No LONG structure right now.")
 
-    st.markdown("## 🔴 SHORT TODAY")
+    st.markdown("## 🔴 ALL SHORT TODAY")
     if shorts:
         st.dataframe(
             pd.DataFrame(v26_compact_sr_table_rows(shorts), columns=table_cols),
@@ -4372,9 +4827,7 @@ if st.button("⭐ SCAN MARKET — GIVE ME TODAY'S LONG / SHORT OPPORTUNITIES", t
             # Keep the same progress bar, but reserve the final phase for S/R.
             pct = 50 + int(done / max(total, 1) * 50)
             bar.progress(min(pct, 100), text=text or f"Building MTF S/R {done}/{total}…")
-        _v22_results = v26_table_mtf_sr_enrich(
-            _v22_results, progress=_sr_progress, max_workers=v22_workers
-        )
+        _v22_results = v28_full_mtf_top5(_v22_results)
     st.session_state["v22_market_results"] = _v22_results
     st.session_state["v22_market_total"] = _v22_total
     st.session_state["v22_market_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
