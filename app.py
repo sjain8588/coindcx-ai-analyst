@@ -1466,6 +1466,78 @@ def diversified_matches(matches, max_matches=50, per_coin=4):
 # =============================================================================
 # CURRENT COIN PROFILE
 # =============================================================================
+def simple_today_structure(d15, bars=96):
+    """Simple trader-facing structure for the latest 24 hours of completed 15m candles.
+
+    Returns plain-language labels such as:
+      - HIGHER HIGH + HIGHER LOW -> LONG structure
+      - LOWER HIGH + LOWER LOW -> SHORT structure
+      - HIGHER HIGH / HIGHER LOW -> developing bullish structure
+      - LOWER HIGH / LOWER LOW -> developing bearish structure
+      - MIXED / NO CLEAR STRUCTURE
+
+    Uses confirmed swing pivots only, so the latest forming candle is never used.
+    """
+    out = {
+        "label": "⚪ NO CLEAR STRUCTURE", "side": "WAIT", "hh": False, "hl": False,
+        "lh": False, "ll": False, "high_now": np.nan, "high_prev": np.nan,
+        "low_now": np.nan, "low_prev": np.nan, "high_change_pct": np.nan,
+        "low_change_pct": np.nan, "lookback_bars": 0,
+    }
+    try:
+        d = completed(d15)
+        if d is None or d.empty:
+            return out
+        d = d.tail(int(bars)).reset_index(drop=True)
+        out["lookback_bars"] = len(d)
+        if len(d) < 12:
+            out["label"] = "⚪ NOT ENOUGH DATA"
+            return out
+
+        h = pd.to_numeric(d["high"], errors="coerce").to_numpy(float)
+        l = pd.to_numeric(d["low"], errors="coerce").to_numpy(float)
+        highs, lows = [], []
+        left = right = 2
+        for i in range(left, len(d) - right):
+            hs = h[i-left:i+right+1]
+            ls = l[i-left:i+right+1]
+            if np.isfinite(h[i]) and h[i] >= np.nanmax(hs) and h[i] > h[i-1] and h[i] >= h[i+1]:
+                highs.append(float(h[i]))
+            if np.isfinite(l[i]) and l[i] <= np.nanmin(ls) and l[i] < l[i-1] and l[i] <= l[i+1]:
+                lows.append(float(l[i]))
+
+        if len(highs) >= 2:
+            hp, hn = highs[-2], highs[-1]
+            out["high_prev"], out["high_now"] = hp, hn
+            out["high_change_pct"] = (hn / hp - 1) * 100 if hp > 0 else np.nan
+        if len(lows) >= 2:
+            lp, ln = lows[-2], lows[-1]
+            out["low_prev"], out["low_now"] = lp, ln
+            out["low_change_pct"] = (ln / lp - 1) * 100 if lp > 0 else np.nan
+
+        threshold = 0.05  # avoid calling tiny pivot noise a structure change
+        hc = out["high_change_pct"]
+        lc = out["low_change_pct"]
+        out["hh"] = bool(np.isfinite(hc) and hc >= threshold)
+        out["lh"] = bool(np.isfinite(hc) and hc <= -threshold)
+        out["hl"] = bool(np.isfinite(lc) and lc >= threshold)
+        out["ll"] = bool(np.isfinite(lc) and lc <= -threshold)
+
+        if out["hh"] and out["hl"]:
+            out["label"], out["side"] = "🟢 HIGHER HIGH + HIGHER LOW", "LONG"
+        elif out["lh"] and out["ll"]:
+            out["label"], out["side"] = "🔴 LOWER HIGH + LOWER LOW", "SHORT"
+        elif out["hh"] or out["hl"]:
+            out["label"], out["side"] = "🟡 DEVELOPING HIGHER HIGH / HIGHER LOW", "WATCH LONG"
+        elif out["lh"] or out["ll"]:
+            out["label"], out["side"] = "🟠 DEVELOPING LOWER HIGH / LOWER LOW", "WATCH SHORT"
+        else:
+            out["label"], out["side"] = "⚪ MIXED / NO CLEAR STRUCTURE", "WAIT"
+    except Exception:
+        return out
+    return out
+
+
 def analyze_current_coin(pair, price_info):
     tf_data={}
     # Enough history for EMA100 and meaningful structure, without requesting huge 1m history.
@@ -1487,6 +1559,7 @@ def analyze_current_coin(pair, price_info):
         "current":current,"event":event,"target":target,
         "4h":last4,"1d":last1,"15m":d15.iloc[-1] if not d15.empty else None,
         "structure4":structure(d4),"structure1":structure(d1),"structure15":structure(d15) if not d15.empty else "Mixed",
+        "today_structure": simple_today_structure(tf_data.get("15m")),
         "mtf_sr": v13_mtf_support_resistance(tf_data, current) if "v13_mtf_support_resistance" in globals() else {}
     }
 
@@ -2723,10 +2796,17 @@ def v61_scan_all(progress=None, max_workers=6):
                         price = v6_num(c.iloc[-1].close)
                 if not np.isfinite(price) or price <= 0:
                     continue
+                # IMPORTANT: keep the analyzer outside the invalid-price guard.
+                # The previous build accidentally indented this call underneath
+                # `continue`, making every valid contract skip the analyzer and
+                # leaving the V7/V61 result set empty.
                 a = v61_analyze_candidate(pair, base[1], price, d15, d1h, d4h)
                 if a:
+                    a["today_structure"] = simple_today_structure(d15)
                     a["price"] = price
                     a["price_source"] = "LIVE_FEED" if np.isfinite(base[2]) and base[2] > 0 else "15M_CANDLE_FALLBACK"
+                    a["symbol"] = base[1]
+                    a["pair"] = pair
                     results.append(a)
             except Exception:
                 continue
@@ -2879,6 +2959,16 @@ if st.button("🧠 Analyze Coin & Learn From CoinDCX",type="primary"):
             q4.metric("ADX",f"{s15['adx']:.1f}" if np.isfinite(s15['adx']) else "—")
             q5.metric("EMA20 slope",f"{s15['ema20_slope']:+.2f}%" if np.isfinite(s15['ema20_slope']) else "—")
             q6.metric("Pullback from 24-bar high",f"{s15['pullback']:+.1f}%" if np.isfinite(s15['pullback']) else "—")
+
+            _today_struct = current.get("today_structure", {}) or {}
+            st.markdown("### ⭐ Simple answer — what is happening today?")
+            st.write(f"**{_today_struct.get('label','⚪ NO CLEAR STRUCTURE')}**")
+            _ts1,_ts2,_ts3,_ts4=st.columns(4)
+            _ts1.metric("Higher High", "YES" if _today_struct.get("hh") else "NO")
+            _ts2.metric("Higher Low", "YES" if _today_struct.get("hl") else "NO")
+            _ts3.metric("Lower High", "YES" if _today_struct.get("lh") else "NO")
+            _ts4.metric("Lower Low", "YES" if _today_struct.get("ll") else "NO")
+            st.caption("🟢 HH + HL = bullish structure / LONG bias | 🔴 LH + LL = bearish structure / SHORT bias | ⚪ otherwise WAIT. Uses the latest completed 15m candles over roughly 24 hours.")
 
             st.markdown("### 🧭 Trend vs. reversal")
             t1,t2,t3,t4=st.columns(4)
@@ -5670,7 +5760,7 @@ else:
 # LONGs, LH/LL for SHORTs, and fresh EMA20/EMA100 transitions on 15m and 4H.
 # It does not place live orders.
 
-V7_VERSION = "7.0-STRUCTURE-RADAR"
+V7_VERSION = "7.1-STRUCTURE-RADAR-SIMPLE-TODAY"
 V7_DEFAULTS = {
     "min_score": 70,
     "pivot_left": 2,
@@ -6036,6 +6126,14 @@ def v71_scan_from_existing(scan):
             "long_score":min(100,int(long_score)), "short_score":min(100,int(short_score)),
             "long_reasons":long_reasons, "short_reasons":short_reasons,
             "structure":stx.get("state","UNKNOWN"),
+            "today_structure": (a.get("today_structure") or {}).get("label", "⚪ NO CLEAR STRUCTURE"),
+            "today_side": (a.get("today_structure") or {}).get("side", "WAIT"),
+            "today_hh": bool((a.get("today_structure") or {}).get("hh")),
+            "today_hl": bool((a.get("today_structure") or {}).get("hl")),
+            "today_lh": bool((a.get("today_structure") or {}).get("lh")),
+            "today_ll": bool((a.get("today_structure") or {}).get("ll")),
+            "today_high": (a.get("today_structure") or {}).get("high_now", np.nan),
+            "today_low": (a.get("today_structure") or {}).get("low_now", np.nan),
             "early_state":early.get("state","NO TRANSITION"), "early_side":early.get("side"),
             "early_score":int(early.get("score",0) or 0), "early_sequence":early.get("sequence",""),
             "early_first_break":early.get("first_break_price",np.nan),
@@ -6441,6 +6539,80 @@ if _v12_records:
     v12_render_signal_cards(_v12_filtered)
 
 
+# ---------------- TODAY SIMPLE STRUCTURE DASHBOARD ----------------------------
+st.divider()
+st.subheader("⭐ TODAY — SIMPLE HH / HL / LH / LL MARKET VIEW")
+st.caption(
+    "Simple answer from the latest completed 15m structure: HH + HL = bullish; LH + LL = bearish. "
+    "This section does not require a 78/100 trade score. It is designed to show you what is happening today first."
+)
+
+if st.button("⭐ SCAN ALL COINS — WHAT IS HAPPENING TODAY?", type="secondary", key="v18_today_scan"):
+    bar_today = st.progress(0, text="Scanning all Futures for today's HH/HL/LH/LL structure…")
+    def _today_progress(done, total):
+        bar_today.progress(int(done / max(total, 1) * 100), text=f"Analyzing {done}/{total} Futures…")
+    with st.spinner("Fetching 15m/1H/4H data and finding today's structure…"):
+        _today_scan, _today_total = v61_scan_all(_today_progress, max_workers=6)
+    st.session_state["v18_today_scan"] = _today_scan
+    st.session_state["v18_today_total"] = _today_total
+    st.session_state["v18_today_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    bar_today.progress(100, text=f"Complete — {_today_total} contracts scanned")
+
+_today_scan = st.session_state.get("v18_today_scan", [])
+if _today_scan:
+    def _today_rows(side=None):
+        rows=[]
+        for a in _today_scan:
+            ts = a.get("today_structure") or {}
+            if side and ts.get("side") != side:
+                continue
+            rows.append({
+                "Coin": a.get("symbol", a.get("pair", "—")),
+                "Current": v61_fmt_price(a.get("price")),
+                "Today": ts.get("label", "⚪ NO CLEAR STRUCTURE"),
+                "Higher High": "YES" if ts.get("hh") else "NO",
+                "Higher Low": "YES" if ts.get("hl") else "NO",
+                "Lower High": "YES" if ts.get("lh") else "NO",
+                "Lower Low": "YES" if ts.get("ll") else "NO",
+                "High change": f"{ts.get('high_change_pct', float('nan')):.2f}%" if np.isfinite(v6_num(ts.get('high_change_pct'), np.nan)) else "—",
+                "Low change": f"{ts.get('low_change_pct', float('nan')):.2f}%" if np.isfinite(v6_num(ts.get('low_change_pct'), np.nan)) else "—",
+            })
+        return rows
+
+    simple = _today_scan
+    longs_today = [a for a in simple if (a.get("today_structure") or {}).get("side") == "LONG"]
+    shorts_today = [a for a in simple if (a.get("today_structure") or {}).get("side") == "SHORT"]
+    watch_long = [a for a in simple if (a.get("today_structure") or {}).get("side") == "WATCH LONG"]
+    watch_short = [a for a in simple if (a.get("today_structure") or {}).get("side") == "WATCH SHORT"]
+    st.caption(f"Last simple scan: {st.session_state.get('v18_today_time','—')} | Contracts scanned: {st.session_state.get('v18_today_total','—')}")
+    z1,z2,z3,z4 = st.columns(4)
+    z1.metric("🟢 HH + HL", len(longs_today))
+    z2.metric("🔴 LH + LL", len(shorts_today))
+    z3.metric("🟡 Developing LONG", len(watch_long))
+    z4.metric("🟠 Developing SHORT", len(watch_short))
+
+    if longs_today:
+        st.markdown("### 🟢 LONG TODAY — HIGHER HIGH + HIGHER LOW")
+        st.dataframe(pd.DataFrame(_today_rows("LONG")), use_container_width=True, hide_index=True)
+    else:
+        st.info("No coin currently has both Higher High + Higher Low in the latest completed 24h 15m structure.")
+
+    if shorts_today:
+        st.markdown("### 🔴 SHORT TODAY — LOWER HIGH + LOWER LOW")
+        st.dataframe(pd.DataFrame(_today_rows("SHORT")), use_container_width=True, hide_index=True)
+    else:
+        st.info("No coin currently has both Lower High + Lower Low in the latest completed 24h 15m structure.")
+
+    with st.expander("🟡/🟠 Developing structures", expanded=False):
+        dev_rows = _today_rows("WATCH LONG") + _today_rows("WATCH SHORT")
+        if dev_rows:
+            st.dataframe(pd.DataFrame(dev_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No developing structure detected.")
+else:
+    st.info("Click **SCAN ALL COINS — WHAT IS HAPPENING TODAY?** to get the simple market-wide HH/HL/LH/LL answer.")
+
+
 # --------------------- V10 WHOLE-MARKET SCAN CONTROL ---------------------------
 st.divider()
 st.subheader("🧨 V10 Whole-Market Extreme Move Hunter")
@@ -6593,11 +6765,24 @@ if radar:
     q5.metric("HH + HL", len(hhhl))
     q6.metric("LH + LL", len(lhll))
 
-    t1,t2,t3,t4,t5,t6,t7 = st.tabs(["🟢 LONG", "🔴 SHORT / DUMP", "🟡 EARLY LONG", "🟠 EARLY SHORT", "📈 HH + HL", "📉 LH + LL", "⚠️ EMA20/100"])
+    t0,t1,t2,t3,t4,t5,t6,t7 = st.tabs(["⭐ TODAY SIMPLE", "🟢 LONG", "🔴 SHORT / DUMP", "🟡 EARLY LONG", "🟠 EARLY SHORT", "📈 HH + HL", "📉 LH + LL", "⚠️ EMA20/100"])
+    with t0:
+        st.markdown("### What is the price structure today? (latest completed 24h / 15m candles)")
+        st.caption("Simple view: HH = Higher High, HL = Higher Low, LH = Lower High, LL = Lower Low. The latest forming 15m candle is excluded.")
+        simple_rows = sorted(radar, key=lambda x: (0 if x.get("today_side") in ("LONG","SHORT") else 1, -(max(x.get("long_score",0), x.get("short_score",0)))))
+        st.dataframe(pd.DataFrame([{
+            "Coin":x["symbol"], "Today structure":x.get("today_structure","⚪ NO CLEAR STRUCTURE"),
+            "Simple result": ("🟢 LONG" if x.get("today_side")=="LONG" else "🔴 SHORT" if x.get("today_side")=="SHORT" else "⚪ WAIT"),
+            "Price":x["price"], "Higher High": "YES" if x.get("today_hh") else "NO",
+            "Higher Low": "YES" if x.get("today_hl") else "NO", "Lower High": "YES" if x.get("today_lh") else "NO",
+            "Lower Low": "YES" if x.get("today_ll") else "NO",
+            "HH pivot":x.get("today_high",np.nan), "HL/LL pivot":x.get("today_low",np.nan)
+        } for x in simple_rows]), use_container_width=True, hide_index=True)
+        st.info("🟢 HIGHER HIGH + HIGHER LOW = bullish structure. 🔴 LOWER HIGH + LOWER LOW = bearish structure. This is a structure signal, not an automatic trade entry; confirm with S/R, momentum and risk before trading.")
     with t1:
         if longs:
             st.dataframe(pd.DataFrame([{
-                "Symbol":x["symbol"], "Score":x["long_score"], "Price":x["price"], "Structure":x["structure"],
+                "Symbol":x["symbol"], "Score":x["long_score"], "Price":x["price"], "Today":x.get("today_structure","—"), "Structure":x["structure"],
                 "EMA15":x["ema15"], "EMA4H":x["ema4h"], "RSI":x["rsi"], "Vol":x["vol_ratio"],
                 "Why":" | ".join(x["long_reasons"])
             } for x in longs[:20]]), use_container_width=True, hide_index=True)
@@ -6605,7 +6790,7 @@ if radar:
     with t2:
         if shorts:
             st.dataframe(pd.DataFrame([{
-                "Symbol":x["symbol"], "Score":x["short_score"], "Price":x["price"], "Structure":x["structure"],
+                "Symbol":x["symbol"], "Score":x["short_score"], "Price":x["price"], "Today":x.get("today_structure","—"), "Structure":x["structure"],
                 "EMA15":x["ema15"], "EMA4H":x["ema4h"], "RSI":x["rsi"], "Vol":x["vol_ratio"],
                 "Why":" | ".join(x["short_reasons"])
             } for x in shorts[:20]]), use_container_width=True, hide_index=True)
