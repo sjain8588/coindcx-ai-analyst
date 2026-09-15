@@ -5395,16 +5395,16 @@ _v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK
 # V34 PRIMARY UI — CLEAN SYMMETRIC HEALTHY-PULLBACK / STRUCTURE PATH AGENT
 # =============================================================================
 st.divider()
-st.header("🧠 V35 — Healthy Pullback / Structure Path Agent")
+st.header("🧠 V36 — Healthy Pullback / Structure Path Agent")
 st.caption(
     "One core model for both directions: LONG = HH → HL → EMA20 test → hold → local-high break. "
     "SHORT = LH → LL → EMA20 test → reject → local-low break. Do not chase extended moves. "
     "4H and 1D levels are reaction/target zones, not automatic reversals."
 )
 
-v34_workers = st.slider("V35 scan workers", 2, 8, 6, 1, key="v35_workers")
+v34_workers = st.slider("V36 scan workers", 2, 8, 6, 1, key="v36_workers")
 
-if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v35_scan_button"):
+if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v36_scan_button"):
     bar = st.progress(0, text="Loading active Futures…")
     try:
         instruments = active_instruments("USDT")
@@ -5438,6 +5438,7 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                 universe_failures += 1
 
         results = []
+        results_cache = []
         errors = []
         stats = {
             "universe": len(items), "data_ok": 0, "directional": 0,
@@ -5458,10 +5459,12 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                 p = v33_pullback_signal(d15, price)
                 sig = p.get("signal", "WAIT")
                 status = "LONG" if sig.startswith("LONG") else "SHORT" if sig.startswith("SHORT") else "WAIT"
+                today = simple_today_structure(d15, bars=96)
 
                 return {
                     "status": status, "pair": pair, "symbol": symbol, "price": price,
-                    "d15": d15, "v33_pullback": p, "error": None
+                    "d15": d15, "v33_pullback": p, "today_structure": today,
+                    "error": None
                 }
             except Exception as exc:
                 return {
@@ -5494,48 +5497,55 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                         results.append(rr)
                     else:
                         stats["wait"] += 1
+                    # Cache every successful analysis for the fallback path.
+                    if rr.get("d15") is not None and not rr.get("d15").empty:
+                        results_cache.append(rr)
 
                 bar.progress(
                     int(i / max(total, 1) * 100),
                     text=f"15m structure {i}/{total}…"
                 )
 
-        # If strict EMA20 pullback logic produces no candidates, expose the
-        # strongest confirmed HH/HL or LH/LL structures as WATCH instead of
-        # leaving the user with an apparently broken blank result.
+        # If strict EMA20 pullback logic produces no candidates, use the
+        # already-fetched 15m data. Never refetch the whole market here.
         if not results:
             fallback = []
-            for item in items:
-                pair, symbol, price = item
+            for rr in results_cache:
                 try:
-                    d15 = get_tf(pair, "15m", 10)
-                    stx = simple_today_structure(d15, bars=96)
+                    stx = rr.get("today_structure") or {}
+                    p = dict(rr.get("v33_pullback") or {})
+                    side = stx.get("side")
 
-                    if stx.get("side") in ("LONG", "WATCH LONG"):
-                        p = v33_pullback_signal(d15, price)
+                    if side in ("LONG", "WATCH LONG"):
                         p.update({
                             "signal": "LONG WATCH",
                             "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
                             "score": max(float(p.get("score", 0)), 55),
                             "reason": "Recent 15m HH/HL structure detected. Wait for EMA20 pullback, hold, and local-high break."
                         })
-                        fallback.append({"pair": pair, "symbol": symbol, "price": price, "d15": d15, "v33_pullback": p})
+                        rr2 = dict(rr)
+                        rr2["v33_pullback"] = p
+                        fallback.append(rr2)
 
-                    elif stx.get("side") in ("SHORT", "WATCH SHORT"):
-                        p = v33_pullback_signal(d15, price)
+                    elif side in ("SHORT", "WATCH SHORT"):
                         p.update({
                             "signal": "SHORT WATCH",
                             "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
                             "score": max(float(p.get("score", 0)), 55),
                             "reason": "Recent 15m LH/LL structure detected. Wait for EMA20 retest, rejection, and local-low break."
                         })
-                        fallback.append({"pair": pair, "symbol": symbol, "price": price, "d15": d15, "v33_pullback": p})
+                        rr2 = dict(rr)
+                        rr2["v33_pullback"] = p
+                        fallback.append(rr2)
                 except Exception:
                     continue
             results = fallback
+            stats["watch"] = len(results)
+            stats["directional"] = len(results)
+
 
         results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score", 0)))
-        enrich = results[:40]
+        enrich = results[:20]
 
         with ThreadPoolExecutor(max_workers=min(v34_workers, 4)) as ex:
             futures = [ex.submit(v33_attach_mtf_path, r) for r in enrich]
@@ -5557,7 +5567,7 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
         bar.progress(100, text=f"Complete — {total} Futures checked")
 
     except Exception as e:
-        st.error(f"V35 scan failed: {type(e).__name__}: {e}")
+        st.error(f"V36 scan failed: {type(e).__name__}: {e}")
 
 _saved = st.session_state.get("v34_results", [])
 _stats = st.session_state.get("v34_stats", {})
@@ -5582,7 +5592,7 @@ if _scan_errors:
 
 if _saved:
     st.caption(
-        f"Last V35 scan: {st.session_state.get('v34_time', '—')} | "
+        f"Last V36 scan: {st.session_state.get('v34_time', '—')} | "
         f"Futures checked: {st.session_state.get('v34_total', '—')} | candidates: {len(_saved)}"
     )
 
@@ -5635,7 +5645,7 @@ if _saved:
         else:
             st.info("No fresh candidates on this side.")
 else:
-    st.info("Run the V35 market scan to find fresh pullback/retest entries.")
+    st.info("Run the V36 market scan to find fresh pullback/retest entries.")
 
 st.divider()
 st.caption(
