@@ -3658,6 +3658,313 @@ def v14_sr_summary(sr, current):
     return out
 
 
+# =============================================================================
+# V10 EXTREME MOVE REVERSAL + NEXT-LEG RADAR
+# =============================================================================
+# This strategy is intentionally independent of ATH/ATL.  It hunts coins that
+# have been repriced violently over several days and then classifies the next
+# opportunity as: LONG next-leg, SHORT reversal, or WAIT.
+V10_EXTREME_PUMP_3D = 150.0
+V10_EXTREME_PUMP_5D = 250.0
+V10_EXTREME_PUMP_7D = 400.0
+V10_EXTREME_DUMP_3D = -65.0
+V10_EXTREME_DUMP_5D = -75.0
+V10_EXTREME_DUMP_7D = -85.0
+V10_MIN_SCORE = 72
+V10_MAX_SHORT_FROM_PEAK = 22.0       # don't chase a mature dump
+V10_MAX_LONG_FROM_LOW = 22.0         # don't chase a mature rebound
+V10_NEAR_HIGH_PULLBACK = 18.0
+V10_NEAR_LOW_REBOUND = 18.0
+
+
+def _v10_pct(a, b):
+    try:
+        a, b = float(a), float(b)
+        return (a / b - 1.0) * 100.0 if b else np.nan
+    except Exception:
+        return np.nan
+
+
+def v10_extreme_move_signal(pair, symbol, tf_data, current):
+    """Detect massive multi-day pumps/dumps and trade the next phase.
+
+    Four states are deliberately separated:
+      1) PUMP -> HH/HL / consolidation -> LONG next leg
+      2) PUMP -> rejection -> LH/LL -> SHORT
+      3) DUMP -> LH/LL / continuation -> SHORT next leg
+      4) DUMP -> stabilization -> HH/HL -> LONG reversal
+
+    A large percentage move by itself never creates a trade.
+    """
+    try:
+        d1 = completed(tf_data.get("1D"))
+        d15 = completed(tf_data.get("15m"))
+        d1h = completed(tf_data.get("1H"))
+        d4 = completed(tf_data.get("4H"))
+        if any(x is None or x.empty for x in (d1, d15, d1h, d4)):
+            return None
+        if len(d1) < 12 or len(d15) < 35 or len(d1h) < 35 or len(d4) < 35:
+            return None
+        price = float(current)
+        if not np.isfinite(price) or price <= 0:
+            return None
+
+        # Daily closes are used for multi-day move detection.  The last row may
+        # be the current forming day, so use completed history and current price
+        # only for the live leg.
+        c = pd.to_numeric(d1["close"], errors="coerce").dropna()
+        h = pd.to_numeric(d1["high"], errors="coerce").dropna()
+        l = pd.to_numeric(d1["low"], errors="coerce").dropna()
+        if len(c) < 8:
+            return None
+        p3 = float(c.iloc[-4])
+        p5 = float(c.iloc[-6])
+        p7 = float(c.iloc[-8])
+        ret3 = _v10_pct(price, p3)
+        ret5 = _v10_pct(price, p5)
+        ret7 = _v10_pct(price, p7)
+
+        # Peak/trough of the recent completed daily window, excluding today's
+        # forming candle.  This gives us "how far has the dump already traveled?"
+        hist = d1.iloc[:-1] if len(d1) > 2 else d1
+        recent_hi = float(pd.to_numeric(hist.high, errors="coerce").tail(8).max())
+        recent_lo = float(pd.to_numeric(hist.low, errors="coerce").tail(8).min())
+        from_peak = _v10_pct(price, recent_hi)       # negative after a peak
+        from_low = _v10_pct(price, recent_lo)        # positive after a low
+
+        s15 = v71_structure_tf(d15, "15m")
+        s1h = v71_structure_tf(d1h, "1H")
+        e15 = v71_ema_transition(d15, 8)
+        e4 = v71_ema_transition(d4, 6)
+        i15 = indicators(d15)
+        i4 = indicators(d4)
+        if i15.empty or i4.empty:
+            return None
+        r15, r4 = i15.iloc[-1], i4.iloc[-1]
+        rsi = v6_num(r15.get("rsi"), 50)
+        vol = v6_num(r15.get("vol_ratio"), 1)
+        macd = v6_num(r15.get("macd"), 0)
+        sig = v6_num(r15.get("macd_signal"), 0)
+
+        # Detect whether the multi-day move is exceptional in either direction.
+        pump_strength = max(
+            ret3 / V10_EXTREME_PUMP_3D if ret3 > 0 else 0,
+            ret5 / V10_EXTREME_PUMP_5D if ret5 > 0 else 0,
+            ret7 / V10_EXTREME_PUMP_7D if ret7 > 0 else 0,
+        )
+        dump_strength = max(
+            abs(ret3) / abs(V10_EXTREME_DUMP_3D) if ret3 < 0 else 0,
+            abs(ret5) / abs(V10_EXTREME_DUMP_5D) if ret5 < 0 else 0,
+            abs(ret7) / abs(V10_EXTREME_DUMP_7D) if ret7 < 0 else 0,
+        )
+        side_extreme = "PUMP" if pump_strength >= 1 and pump_strength >= dump_strength else "DUMP" if dump_strength >= 1 else None
+        if not side_extreme:
+            return None
+
+        results = []
+
+        # ---------------- MASSIVE PUMP ----------------
+        if side_extreme == "PUMP":
+            # LONG = healthy consolidation / next leg.
+            ls, lr, lb = 0, [], []
+            ls += 25; lr.append("massive multi-day pump")
+            if ret7 >= V10_EXTREME_PUMP_7D: ls += 15; lr.append(f"7D +{ret7:.0f}%")
+            elif ret5 >= V10_EXTREME_PUMP_5D: ls += 12; lr.append(f"5D +{ret5:.0f}%")
+            elif ret3 >= V10_EXTREME_PUMP_3D: ls += 9; lr.append(f"3D +{ret3:.0f}%")
+            if s15.get("hh") and s15.get("hl"): ls += 25; lr.append("15m HH + HL intact")
+            elif s15.get("hh") or s15.get("hl"): ls += 12; lr.append("15m early HH/HL")
+            if s1h.get("hh") and s1h.get("hl"): ls += 15; lr.append("1H HH + HL")
+            elif s1h.get("hh") or s1h.get("hl"): ls += 7; lr.append("1H improving structure")
+            if e15.get("bullish"): ls += 6; lr.append("15m bullish EMA")
+            if e4.get("bullish"): ls += 6; lr.append("4H bullish EMA")
+            if macd > sig: ls += 6; lr.append("MACD bullish")
+            if vol >= 1.2: ls += 6; lr.append(f"volume {vol:.1f}x")
+            if 2 <= max(0, -from_peak) <= V10_NEAR_HIGH_PULLBACK: ls += 10; lr.append(f"controlled pullback {abs(from_peak):.1f}% from peak")
+            if from_peak < -V10_MAX_SHORT_FROM_PEAK: lb.append("pump has already retraced too far for a clean next-leg entry")
+            if s15.get("lh") and s15.get("ll"): ls -= 25; lb.append("bearish reversal structure; prefer SHORT analysis")
+            results.append(("LONG", ls, lr, lb, "PUMP NEXT-LEG"))
+
+            # SHORT = blow-off/reversal after the pump.
+            ss, sr, sb = 0, [], []
+            ss += 25; sr.append("massive multi-day pump")
+            if ret7 >= V10_EXTREME_PUMP_7D: ss += 15; sr.append(f"7D +{ret7:.0f}%")
+            elif ret5 >= V10_EXTREME_PUMP_5D: ss += 12; sr.append(f"5D +{ret5:.0f}%")
+            elif ret3 >= V10_EXTREME_PUMP_3D: ss += 9; sr.append(f"3D +{ret3:.0f}%")
+            if s15.get("lh") and s15.get("ll"): ss += 32; sr.append("15m LH + LL")
+            elif s15.get("lh") or s15.get("ll"): ss += 14; sr.append("15m early LH/LL")
+            if s1h.get("lh") and s1h.get("ll"): ss += 15; sr.append("1H LH + LL")
+            elif s1h.get("lh") or s1h.get("ll"): ss += 7; sr.append("1H weakening structure")
+            if e15.get("bearish"): ss += 7; sr.append("15m bearish EMA")
+            if e15.get("fresh_bearish"): ss += 9; sr.append("fresh 15m EMA transition")
+            if e4.get("bearish"): ss += 6; sr.append("4H bearish EMA")
+            if macd < sig: ss += 7; sr.append("MACD bearish")
+            if vol >= 1.5: ss += 8; sr.append(f"volume {vol:.1f}x")
+            if from_peak <= -2: ss += 10; sr.append(f"{abs(from_peak):.1f}% off recent peak")
+            if from_peak < -V10_MAX_SHORT_FROM_PEAK: sb.append("dump already too far from peak; short may be late")
+            if not (s15.get("lh") and s15.get("ll")): sb.append("wait for confirmed LH + LL before shorting the blow-off")
+            results.append(("SHORT", ss, sr, sb, "PUMP REVERSAL"))
+
+        # ---------------- MASSIVE DUMP ----------------
+        if side_extreme == "DUMP":
+            # LONG = capitulation/reversal.
+            ls, lr, lb = 0, [], []
+            ls += 25; lr.append("massive multi-day dump")
+            if ret7 <= V10_EXTREME_DUMP_7D: ls += 15; lr.append(f"7D {ret7:.0f}%")
+            elif ret5 <= V10_EXTREME_DUMP_5D: ls += 12; lr.append(f"5D {ret5:.0f}%")
+            elif ret3 <= V10_EXTREME_DUMP_3D: ls += 9; lr.append(f"3D {ret3:.0f}%")
+            if s15.get("hh") and s15.get("hl"): ls += 32; lr.append("15m HH + HL")
+            elif s15.get("hh") or s15.get("hl"): ls += 14; lr.append("15m early HH/HL")
+            if s1h.get("hh") and s1h.get("hl"): ls += 15; lr.append("1H HH + HL")
+            elif s1h.get("hh") or s1h.get("hl"): ls += 7; lr.append("1H improving structure")
+            if e15.get("bullish"): ls += 7; lr.append("15m bullish EMA")
+            if e15.get("fresh_bullish"): ls += 9; lr.append("fresh 15m EMA transition")
+            if e4.get("bullish"): ls += 6; lr.append("4H bullish EMA")
+            if macd > sig: ls += 7; lr.append("MACD bullish")
+            if vol >= 1.5: ls += 8; lr.append(f"volume {vol:.1f}x")
+            if from_low <= V10_MAX_LONG_FROM_LOW: ls += 10; lr.append(f"near capitulation low (+{from_low:.1f}%)")
+            if from_low > V10_MAX_LONG_FROM_LOW: lb.append("rebound already too far for a clean capitulation entry")
+            if s15.get("lh") and s15.get("ll"): ls -= 25; lb.append("bearish continuation; prefer SHORT analysis")
+            results.append(("LONG", ls, lr, lb, "DUMP REVERSAL"))
+
+            # SHORT = continuation after a massive dump.
+            ss, sr, sb = 0, [], []
+            ss += 25; sr.append("massive multi-day dump")
+            if ret7 <= V10_EXTREME_DUMP_7D: ss += 15; sr.append(f"7D {ret7:.0f}%")
+            elif ret5 <= V10_EXTREME_DUMP_5D: ss += 12; sr.append(f"5D {ret5:.0f}%")
+            elif ret3 <= V10_EXTREME_DUMP_3D: ss += 9; sr.append(f"3D {ret3:.0f}%")
+            if s15.get("lh") and s15.get("ll"): ss += 32; sr.append("15m LH + LL")
+            elif s15.get("lh") or s15.get("ll"): ss += 14; sr.append("15m early LH/LL")
+            if s1h.get("lh") and s1h.get("ll"): ss += 15; sr.append("1H LH + LL")
+            elif s1h.get("lh") or s1h.get("ll"): ss += 7; sr.append("1H weakening structure")
+            if e15.get("bearish"): ss += 7; sr.append("15m bearish EMA")
+            if e4.get("bearish"): ss += 6; sr.append("4H bearish EMA")
+            if macd < sig: ss += 7; sr.append("MACD bearish")
+            if vol >= 1.2: ss += 6; sr.append(f"volume {vol:.1f}x")
+            if not (s15.get("lh") and s15.get("ll")): sb.append("wait for confirmed LH + LL before shorting continued weakness")
+            if from_low > V10_MAX_LONG_FROM_LOW: ss -= 15; sb.append("bounce is already large; avoid chasing")
+            results.append(("SHORT", ss, sr, sb, "DUMP CONTINUATION"))
+
+        valid = []
+        for side, score, reasons, blockers, state in results:
+            hard = any("wait for confirmed" in b.lower() or "already too far" in b.lower() for b in blockers)
+            if score >= V10_MIN_SCORE and not hard:
+                valid.append((side, score, reasons, blockers, state))
+        best = max(results, key=lambda z: z[1]) if results else None
+        if not best:
+            return None
+        chosen = max(valid, key=lambda z: z[1]) if valid else best
+        side, score, reasons, blockers, state = chosen
+        return {
+            "pair": pair, "symbol": symbol, "price": price,
+            "side": side if valid else "WAIT", "score": int(max(0, min(100, score))),
+            "valid": bool(valid), "state": state, "reasons": reasons[:10], "blockers": blockers[:8],
+            "ret3d": ret3, "ret5d": ret5, "ret7d": ret7,
+            "from_peak_pct": from_peak, "from_low_pct": from_low,
+            "structure15": s15.get("state"), "structure1h": s1h.get("state"),
+            "rsi": rsi, "volume": vol,
+            "entry": price,
+        }
+    except Exception:
+        return None
+
+
+def v10_extreme_record(x):
+    if not x:
+        return None
+    return {
+        "Coin": x.get("symbol"), "Pair": x.get("pair"), "Direction": x.get("side"),
+        "Score": x.get("score", 0),
+        "Valid": "✅ TRADE CANDIDATE" if x.get("valid") else "WAIT",
+        "Regime": x.get("state", ""), "15m Structure": x.get("structure15", ""),
+        "Volume": f"{x.get('volume', 0):.1f}x",
+        "Current": fmt(x.get("price", x.get("entry", 0))),
+        "Entry": fmt(x.get("entry", x.get("price", 0))),
+        "Stop": "—", "TP1": "—", "TP2": "—", "TP3": "—",
+        "Blockers": "; ".join(x.get("blockers", [])) or "—",
+        "Reasons": " | ".join(x.get("reasons", [])[:5]),
+        "Extreme Move": x.get("state", ""), "3D %": x.get("ret3d"), "5D %": x.get("ret5d"),
+        "7D %": x.get("ret7d"), "From Peak %": x.get("from_peak_pct"),
+        "From Low %": x.get("from_low_pct"), "source": "V10 EXTREME MOVE",
+        "setup": x,
+    }
+
+
+def v10_scan_all_extreme(progress=None, max_workers=6):
+    """Scan the ENTIRE active USDT Futures universe for V10 extreme-move setups.
+
+    This is deliberately separate from the normal 25/60-contract V6 scan.
+    Every active contract is considered; a missing live-price-feed key falls
+    back to the latest completed 15m close instead of discarding the contract.
+    """
+    instruments = active_instruments("USDT")
+    try:
+        prices = futures_prices()
+    except Exception:
+        prices = {}
+
+    items, seen = [], set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair:
+            continue
+        canonical = str(pair).strip().upper()
+        if canonical in seen:
+            continue
+        seen.add(canonical)
+
+        live = v61_price_for_pair(prices, pair)
+        symbol = v61_symbol(inst, pair)
+        if meme_only and not any(w in symbol or w in canonical for w in MEME_WORDS):
+            continue
+        items.append((pair, symbol, live))
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    def _fetch(item):
+        pair, symbol, live = item
+        try:
+            # V10 needs daily history for 3D/5D/7D plus intraday structure.
+            tf_data = {
+                "15m": get_tf(pair, "15m", 12),
+                "1H": get_tf(pair, "1H", 45),
+                "4H": get_tf(pair, "4H", 120),
+                "1D": get_tf(pair, "1D", 180),
+            }
+            p = live
+            if not np.isfinite(p) or p <= 0:
+                c = completed(tf_data["15m"])
+                if c is not None and not c.empty:
+                    p = v6_num(c.iloc[-1].get("close"))
+            if not np.isfinite(p) or p <= 0:
+                return None
+            sig = v10_extreme_move_signal(pair, symbol, tf_data, p)
+            if not sig:
+                return None
+            rec = v10_extreme_record(sig)
+            if rec:
+                rec["price_source"] = "LIVE_FEED" if np.isfinite(live) and live > 0 else "15M_CANDLE_FALLBACK"
+            return rec
+        except Exception:
+            return None
+
+    results, done = [], 0
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [ex.submit(_fetch, item) for item in items]
+        for fut in as_completed(futs):
+            done += 1
+            if progress:
+                progress(done, len(items))
+            r = fut.result()
+            if r:
+                results.append(r)
+
+    results.sort(key=lambda r: (r.get("Valid") != "✅ TRADE CANDIDATE",
+                                -float(r.get("Score", 0))))
+    return results, len(items)
+
+
+
+
 # ----------------------- V12 ACTIONABLE SIGNAL BOARD ---------------------------
 def v12_signal_row(r):
     direction = str(r.get("Direction", "")).upper()
