@@ -5654,10 +5654,29 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
     bar=st.progress(0,text="Loading active Futures…")
     try:
         instruments=active_instruments("USDT")
-        bar.progress(5,text="Loading live Futures prices…")
+        discovered_count=len(instruments)
+        bar.progress(5,text=f"Discovered {discovered_count} active USDT Futures…")
         prices=futures_prices()
+
         def _norm_pair(v):
-            return str(v or "").upper().replace("/","").replace("-","").replace("_","").strip()
+            # CoinDCX commonly represents perpetuals as B-BTC_USDT while
+            # realtime feeds may expose BTCUSDT/BTC_USDT. Treat these as the
+            # same market for price lookup without changing the actual candle pair.
+            x=str(v or "").upper().replace("/","").replace("_","").replace("-","").strip()
+            if x.startswith("B") and x.endswith("USDT"):
+                x=x[1:]
+            return x
+
+        def _aliases(v):
+            raw=str(v or "").upper().strip()
+            variants={raw, raw.replace("/",""), raw.replace("_",""), raw.replace("-","")}
+            if raw.startswith("B-"):
+                variants.add(raw[2:])
+                variants.add(raw[2:].replace("_",""))
+            if raw.startswith("B") and "USDT" in raw and not raw.startswith("BTC"):
+                variants.add(raw[1:])
+            return {_norm_pair(x) for x in variants if x}
+
         def _raw_price(v):
             if isinstance(v,dict):
                 for kk in ("price","last_price","last","close","p","lp","mark_price","mp"):
@@ -5667,37 +5686,47 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                 q=v6_num(v)
                 if np.isfinite(q) and q>0: return q
             return np.nan
+
         price_map={}
         for k,v in (prices or {}).items():
             ident=str(k)
-            if isinstance(v,dict): ident=str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k)
+            if isinstance(v,dict):
+                ident=str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k)
             q=_raw_price(v)
-            if np.isfinite(q): price_map.setdefault(ident,q); price_map.setdefault(_norm_pair(ident),q)
-        items=[]; seen=set()
+            if np.isfinite(q):
+                for a in _aliases(ident): price_map.setdefault(a,q)
+
+        # IMPORTANT: do not require a live-price match before scanning a contract.
+        # The 15m candle close is a valid fallback current price. This prevents a
+        # symbol-format mismatch in the realtime feed from reducing a 500+ market
+        # to a handful of contracts.
+        items=[]; seen=set(); price_matched=0
         for raw in instruments:
             try:
                 pair=v61_instrument_pair(raw) if isinstance(raw,dict) else str(raw)
-                if not pair: continue
+                if not pair or "USDT" not in pair.upper(): continue
                 symbol=v61_symbol(raw,pair) if isinstance(raw,dict) else pair
                 price=v61_price_for_pair(prices,pair)
-                if not (np.isfinite(price) and price>0): price=price_map.get(pair,price_map.get(_norm_pair(pair),np.nan))
-                if np.isfinite(price) and price>0 and _norm_pair(pair) not in seen:
-                    items.append((pair,symbol,float(price))); seen.add(_norm_pair(pair))
-            except Exception: continue
-        if not items:
-            for k,v in (prices or {}).items():
-                pair=str(k)
-                if isinstance(v,dict): pair=str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k)
-                if "USDT" not in pair.upper(): continue
-                price=_raw_price(v)
-                if np.isfinite(price) and price>0 and _norm_pair(pair) not in seen:
-                    items.append((pair,pair,float(price))); seen.add(_norm_pair(pair))
+                if not (np.isfinite(price) and price>0):
+                    for a in _aliases(pair):
+                        if a in price_map:
+                            price=price_map[a]; break
+                if np.isfinite(price) and price>0: price_matched += 1
+                key=_norm_pair(pair)
+                if key not in seen:
+                    items.append((pair,symbol,float(price) if np.isfinite(price) and price>0 else np.nan))
+                    seen.add(key)
+            except Exception:
+                continue
+
         total=len(items)
-        if total==0: raise RuntimeError("CoinDCX returned no usable USDT Futures symbols/prices. The market feed may be temporarily unavailable.")
+        if total==0:
+            raise RuntimeError("CoinDCX returned no usable USDT Futures symbols. The Futures instrument feed may be temporarily unavailable.")
 
         from concurrent.futures import ThreadPoolExecutor,as_completed
         phase1=[]; results=[]; errors=[]
-        stats={"universe":total,"data_ok":0,"directional":0,"mtf_analyzed":0,
+        stats={"universe":total,"discovered":discovered_count,"price_matched":price_matched,
+                "data_ok":0,"directional":0,"mtf_analyzed":0,
                 "ready":0,"watch":0,"wait":0,"errors":0,"phase1_long":0,"phase1_short":0}
 
         def scan15(item):
@@ -5705,6 +5734,11 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
             try:
                 d15=get_tf(pair,"15m",10)
                 if d15 is None or d15.empty: return None,f"{pair}: no 15m candles"
+                # Use the latest completed 15m close when the realtime price feed
+                # could not be matched by symbol format. The scan must not discard
+                # a valid contract just because the live ticker uses another name.
+                if not (np.isfinite(price) and price>0):
+                    price=float(d15.iloc[-1]["close"])
                 p=v33_pullback_signal(d15,price); x15=v36_ema_tf_state(d15); q=v36_indicator_snapshot(d15)
                 ls=ss=0
                 if x15.get("direction")=="BULLISH": ls+=8
@@ -5780,7 +5814,7 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                     p.update({"signal":"SHORT WATCH","stage":"15m EMA/STRUCTURE → WAIT FOR MTF CONFIRMATION","reason":"Bearish 15m EMA/structure candidate found across the market; wait for MTF confirmation."})
                 else: continue
                 rr["v33_pullback"]=p; results.append(rr)
-            stats["watch"]=len(results); stats["directional"]=len(results)
+            stats["watch"]=len(results); stats["wait"]=0; stats["directional"]=len(results)
 
         results.sort(key=lambda r:-float((r.get("v36_ema") or {}).get("score",0)))
         enrich=results[:20]
@@ -5807,6 +5841,7 @@ _scan_errors = st.session_state.get("v34_errors", [])
 if _stats:
     st.caption(
         f"Scan diagnostics — Futures discovered: {_stats.get('universe', 0)} | "
+        f"Live prices matched: {_stats.get('price_matched', 0)} | "
         f"15m data OK: {_stats.get('data_ok', 0)} | "
         f"15m LONG: {_stats.get('phase1_long', 0)} | 15m SHORT: {_stats.get('phase1_short', 0)} | "
         f"MTF analyzed: {_stats.get('mtf_analyzed', 0)} | "
