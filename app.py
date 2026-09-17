@@ -177,6 +177,20 @@ def indicators(d):
     x["mdi"] = 100 * minus.ewm(alpha=1/14, adjust=False).mean() / atr
     dx = 100 * (x.pdi-x.mdi).abs() / (x.pdi+x.mdi).replace(0, np.nan)
     x["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
+    x["macd_hist"] = x["macd"] - x["macd_signal"]
+    x["roc"] = x.close.pct_change(10) * 100
+    direction = np.sign(x.close.diff()).fillna(0)
+    x["obv"] = (direction * x.volume).cumsum()
+    x["obv_ma"] = x.obv.rolling(10).mean()
+    x["obv_slope"] = x.obv.pct_change(5)
+    pv = ((x.high + x.low + x.close) / 3.0) * x.volume
+    x["vwap20"] = pv.rolling(20).sum() / x.volume.rolling(20).sum().replace(0, np.nan)
+    x["vwap_dist_pct"] = (x.close / x.vwap20.replace(0, np.nan) - 1) * 100
+    x["bb_width_pct"] = ((x.bbup - x.bblow) / x.bbmid.replace(0, np.nan)) * 100
+    x["bb_width_ma"] = x.bb_width_pct.rolling(20).mean()
+    mfm = ((x.close - x.low) - (x.high - x.close)) / (x.high - x.low).replace(0, np.nan)
+    mfv = mfm.fillna(0) * x.volume
+    x["cmf20"] = mfv.rolling(20).sum() / x.volume.rolling(20).sum().replace(0, np.nan)
     return x
 
 def resample_weekly(d):
@@ -5060,7 +5074,7 @@ def v36_ema_tf_state(df, side=None):
     """Return the EMA20/50/100 state for one completed timeframe."""
     out = {
         "direction": "NEUTRAL", "close": np.nan, "ema20": np.nan,
-        "ema50": np.nan, "ema100": np.nan, "ema20_slope": np.nan,
+        "ema50": np.nan, "ema100": np.nan, "ema200": np.nan, "ema20_slope": np.nan,
         "price_vs_ema20": np.nan, "ema20_50_spread": np.nan,
         "touch_20_50": False, "turn_up": False, "turn_down": False,
     }
@@ -5069,7 +5083,7 @@ def v36_ema_tf_state(df, side=None):
         if len(x) < 25:
             return out
         r = x.iloc[-1]
-        close = float(r.close); e20 = float(r.ema20); e50 = float(r.ema50); e100 = float(r.ema100)
+        close = float(r.close); e20 = float(r.ema20); e50 = float(r.ema50); e100 = float(r.ema100); e200 = float(r.ema200)
         n = min(V36_EMA_SLOPE_LOOKBACK, len(x)-1)
         prev20 = float(x.iloc[-1-n].ema20)
         slope = ((e20 / prev20) - 1.0) * 100.0 if prev20 > 0 else np.nan
@@ -5086,7 +5100,7 @@ def v36_ema_tf_state(df, side=None):
         direction = "BULLISH" if close > e20 and e20 > e50 and e50 > e100 else \
                     "BEARISH" if close < e20 and e20 < e50 and e50 < e100 else "MIXED"
         out.update({"direction":direction, "close":close, "ema20":e20, "ema50":e50,
-                    "ema100":e100, "ema20_slope":slope, "price_vs_ema20":price_dist,
+                    "ema100":e100, "ema200":e200, "ema20_slope":slope, "price_vs_ema20":price_dist,
                     "ema20_50_spread":spread, "touch_20_50":touch,
                     "turn_up":turn_up, "turn_down":turn_down})
     except Exception:
@@ -5094,116 +5108,183 @@ def v36_ema_tf_state(df, side=None):
     return out
 
 
-def v36_ema_pattern_engine(d15, d1h=None, d4h=None, d1d=None, pullback=None):
-    """V36 EMA pattern score: LONG/SHORT 0-10 plus MTF confirmation.
-
-    LONG base model:
-      EMA20 > EMA50 > EMA100, price above EMA20, recent EMA20/50 contact,
-      EMA20 turns up, HH/HL structure, local-high break and volume.
-    SHORT is the exact inverse.
-
-    The 1H/4H/1D states are confirmation/filter context.  A 4H/1D conflict
-    does not manufacture a signal; it reduces confidence and can move READY
-    to WATCH.
-    """
-    p = pullback or v33_pullback_signal(d15)
-    x15 = v36_ema_tf_state(d15)
-    x1h = v36_ema_tf_state(d1h) if d1h is not None and not d1h.empty else {}
-    x4h = v36_ema_tf_state(d4h) if d4h is not None and not d4h.empty else {}
-    x1d = v36_ema_tf_state(d1d) if d1d is not None and not d1d.empty else {}
-
-    long_score = 0; short_score = 0
-    long_reasons=[]; short_reasons=[]
-
-    # 1) EMA alignment: 20/50/100
-    if x15.get("direction") == "BULLISH":
-        long_score += 2; long_reasons.append("EMA20 > EMA50 > EMA100")
-    elif x15.get("direction") == "BEARISH":
-        short_score += 2; short_reasons.append("EMA20 < EMA50 < EMA100")
-
-    # 2) Price vs EMA20
-    if x15.get("price_vs_ema20", np.nan) > 0:
-        long_score += 1; long_reasons.append("Price above EMA20")
-    elif x15.get("price_vs_ema20", np.nan) < 0:
-        short_score += 1; short_reasons.append("Price below EMA20")
-
-    # 3) EMA20/EMA50 interaction. Touch alone is never an entry.
-    if x15.get("touch_20_50") and x15.get("turn_up") and x15.get("ema20",0) > x15.get("ema50",0):
-        long_score += 2; long_reasons.append("EMA20 touched EMA50 and turned upward")
-    elif x15.get("touch_20_50") and x15.get("turn_down") and x15.get("ema20",0) < x15.get("ema50",0):
-        short_score += 2; short_reasons.append("EMA20 touched EMA50 and turned downward")
-
-    # 4) EMA20 slope
-    if x15.get("turn_up"):
-        long_score += 1; long_reasons.append(f"EMA20 rising ({x15.get('ema20_slope',0):+.2f}%)")
-    if x15.get("turn_down"):
-        short_score += 1; short_reasons.append(f"EMA20 falling ({x15.get('ema20_slope',0):+.2f}%)")
-
-    # 5) Structure confirmation
-    if p.get("hh",0) > 0 and p.get("hl",0) > 0:
-        long_score += 1; long_reasons.append("HH + HL structure")
-    if p.get("lh",0) > 0 and p.get("ll",0) > 0:
-        short_score += 1; short_reasons.append("LH + LL structure")
-
-    # 6) Local trigger already calculated by V36 pullback engine
-    if p.get("signal") == "LONG READY":
-        long_score += 1; long_reasons.append("Local high broken")
-    if p.get("signal") == "SHORT READY":
-        short_score += 1; short_reasons.append("Local low broken")
-
-    # 7) Volume confirmation from 15m
+def v36_indicator_snapshot(df):
+    out={"rsi":np.nan,"macd":np.nan,"macd_signal":np.nan,"macd_hist":np.nan,"adx":np.nan,
+         "pdi":np.nan,"mdi":np.nan,"vol_ratio":np.nan,"atr":np.nan,"atr_pct":np.nan,
+         "roc":np.nan,"obv_slope":np.nan,"vwap":np.nan,"vwap_dist_pct":np.nan,
+         "bb_width_pct":np.nan,"bb_width_ma":np.nan,"cmf20":np.nan,"close":np.nan}
     try:
-        ix = indicators(completed(d15)); vr = float(ix.iloc[-1].vol_ratio)
-    except Exception:
-        vr = np.nan
-    if np.isfinite(vr) and vr >= 1.0:
-        if long_score >= short_score:
-            long_score += 1; long_reasons.append(f"Volume {vr:.1f}x average")
-        else:
-            short_score += 1; short_reasons.append(f"Volume {vr:.1f}x average")
+        x=indicators(completed(df))
+        if x.empty: return out
+        r=x.iloc[-1]
+        mapping={"rsi":"rsi","macd":"macd","macd_signal":"macd_signal","macd_hist":"macd_hist",
+                 "adx":"adx","pdi":"pdi","mdi":"mdi","vol_ratio":"vol_ratio","atr":"atr",
+                 "atr_pct":"atr_pct","roc":"roc","obv_slope":"obv_slope","vwap":"vwap20",
+                 "vwap_dist_pct":"vwap_dist_pct","bb_width_pct":"bb_width_pct","bb_width_ma":"bb_width_ma",
+                 "cmf20":"cmf20","close":"close"}
+        for k,src in mapping.items(): out[k]=v6_num(r.get(src))
+    except Exception: pass
+    return out
 
-    # 8) 4H trend confirmation replaces the old single-level bonus.
-    if x4h.get("direction") == "BULLISH":
-        long_score += 1; long_reasons.append("4H EMA trend bullish")
-    elif x4h.get("direction") == "BEARISH":
-        short_score += 1; short_reasons.append("4H EMA trend bearish")
 
-    # 1H momentum + 1D major trend are filters/diagnostics, not extra points.
-    long_conf = sum(1 for z in (x1h,x4h,x1d) if z.get("direction") == "BULLISH")
-    short_conf = sum(1 for z in (x1h,x4h,x1d) if z.get("direction") == "BEARISH")
-    long_conflict = sum(1 for z in (x1h,x4h,x1d) if z.get("direction") == "BEARISH")
-    short_conflict = sum(1 for z in (x1h,x4h,x1d) if z.get("direction") == "BULLISH")
-
-    # READY requires the actual V36 trigger. EMA conditions alone produce WATCH.
-    if long_score >= 8 and p.get("signal") == "LONG READY" and long_conflict == 0:
-        signal, stage = "LONG READY", "EMA PATTERN CONFIRMED → LOCAL HIGH BREAK"
-    elif long_score >= 5 and long_conf >= 1 and long_conflict <= 1:
-        signal, stage = "LONG WATCH", "EMA20/50 PULLBACK → WAIT FOR CONFIRMATION"
-    elif short_score >= 8 and p.get("signal") == "SHORT READY" and short_conflict == 0:
-        signal, stage = "SHORT READY", "EMA PATTERN CONFIRMED → LOCAL LOW BREAK"
-    elif short_score >= 5 and short_conf >= 1 and short_conflict <= 1:
-        signal, stage = "SHORT WATCH", "EMA20/50 RETEST → WAIT FOR CONFIRMATION"
+def v36_explain_decision(signal, score, ema, ind, pullback, mtf):
+    side="LONG" if signal.startswith("LONG") else "SHORT" if signal.startswith("SHORT") else ("LONG" if score["long"]>=score["short"] else "SHORT")
+    reasons=[]
+    rsi,adx,hist,vr=ind.get("rsi",np.nan),ind.get("adx",np.nan),ind.get("macd_hist",np.nan),ind.get("vol_ratio",np.nan)
+    roc,vd,cmf=ind.get("roc",np.nan),ind.get("vwap_dist_pct",np.nan),ind.get("cmf20",np.nan)
+    if side=="LONG":
+        if ema.get("direction")=="BULLISH": reasons.append("EMA20 > EMA50 > EMA100 shows a bullish trend")
+        elif ema.get("ema20",0)>ema.get("ema50",0): reasons.append("EMA20 is above EMA50")
+        if ema.get("touch_20_50") and ema.get("turn_up"): reasons.append("EMA20 touched EMA50 and turned upward")
+        if pullback.get("hh",0) and pullback.get("hl",0): reasons.append("price structure is HH + HL")
+        if np.isfinite(rsi) and 50<=rsi<=68: reasons.append(f"RSI {rsi:.0f} confirms healthy bullish momentum")
+        elif np.isfinite(rsi) and rsi>68: reasons.append(f"RSI {rsi:.0f} is strong but getting extended")
+        elif np.isfinite(rsi): reasons.append(f"RSI {rsi:.0f} has not fully confirmed bullish momentum")
+        if np.isfinite(hist) and hist>0: reasons.append("MACD momentum is bullish")
+        elif np.isfinite(hist): reasons.append("MACD is not yet bullish")
+        if np.isfinite(adx) and adx>=25: reasons.append(f"ADX {adx:.0f} confirms trend strength")
+        elif np.isfinite(adx) and adx>=20: reasons.append(f"ADX {adx:.0f} shows the trend is developing")
+        elif np.isfinite(adx): reasons.append(f"ADX {adx:.0f} is weak")
+        if np.isfinite(vr) and vr>=1.2: reasons.append(f"volume is {vr:.1f}x average")
+        if np.isfinite(vd) and vd>=0: reasons.append("price is above rolling VWAP")
+        if np.isfinite(cmf) and cmf>0.05: reasons.append("CMF shows buying pressure")
+        if np.isfinite(roc) and roc>0: reasons.append(f"10-bar momentum is positive ({roc:+.1f}%)")
+        if mtf.get("bullish",0)>=2: reasons.append(f"{mtf['bullish']}/3 higher timeframes support LONG")
+        next_step="Wait for the local high to break" if signal=="LONG WATCH" else "Local high break is the trigger"
     else:
-        signal, stage = "WAIT", "NO CLEAN EMA/STRUCTURE SETUP"
+        if ema.get("direction")=="BEARISH": reasons.append("EMA20 < EMA50 < EMA100 shows a bearish trend")
+        elif ema.get("ema20",0)<ema.get("ema50",0): reasons.append("EMA20 is below EMA50")
+        if ema.get("touch_20_50") and ema.get("turn_down"): reasons.append("EMA20 retested EMA50 and turned downward")
+        if pullback.get("lh",0) and pullback.get("ll",0): reasons.append("price structure is LH + LL")
+        if np.isfinite(rsi) and 32<=rsi<=50: reasons.append(f"RSI {rsi:.0f} confirms bearish momentum")
+        elif np.isfinite(rsi) and rsi<32: reasons.append(f"RSI {rsi:.0f} is weak but oversold risk is rising")
+        elif np.isfinite(rsi): reasons.append(f"RSI {rsi:.0f} has not fully confirmed bearish momentum")
+        if np.isfinite(hist) and hist<0: reasons.append("MACD momentum is bearish")
+        elif np.isfinite(hist): reasons.append("MACD is not yet bearish")
+        if np.isfinite(adx) and adx>=25: reasons.append(f"ADX {adx:.0f} confirms trend strength")
+        elif np.isfinite(adx) and adx>=20: reasons.append(f"ADX {adx:.0f} shows the trend is developing")
+        elif np.isfinite(adx): reasons.append(f"ADX {adx:.0f} is weak")
+        if np.isfinite(vr) and vr>=1.2: reasons.append(f"volume is {vr:.1f}x average")
+        if np.isfinite(vd) and vd<=0: reasons.append("price is below rolling VWAP")
+        if np.isfinite(cmf) and cmf<-0.05: reasons.append("CMF shows selling pressure")
+        if np.isfinite(roc) and roc<0: reasons.append(f"10-bar momentum is negative ({roc:+.1f}%)")
+        if mtf.get("bearish",0)>=2: reasons.append(f"{mtf['bearish']}/3 higher timeframes support SHORT")
+        next_step="Wait for the local low to break" if signal=="SHORT WATCH" else "Local low break is the trigger"
+    seen=[]
+    for x in reasons:
+        if x not in seen: seen.append(x)
+    why="; ".join(seen[:6]) if seen else "The indicators are mixed, so there is no clean setup."
+    return why+".",next_step
 
-    if signal.startswith("LONG"):
-        reasons = long_reasons
-    elif signal.startswith("SHORT"):
-        reasons = short_reasons
-    else:
-        reasons = (long_reasons if long_score >= short_score else short_reasons)[:5]
 
-    return {
-        "signal":signal, "stage":stage,
-        "long_score":min(10,long_score), "short_score":min(10,short_score),
-        "score":min(10, max(long_score, short_score)), "reasons":reasons,
-        "long_reasons":long_reasons, "short_reasons":short_reasons,
-        "1H":x1h, "4H":x4h, "1D":x1d,
-        "mtf_long_confirmations":long_conf, "mtf_short_confirmations":short_conflict,
-        "volume_ratio":vr,
-        "ema20":x15.get("ema20"), "ema50":x15.get("ema50"), "ema100":x15.get("ema100"),
-        "ema20_slope":x15.get("ema20_slope"), "ema20_50_touch":x15.get("touch_20_50"),
-    }
+def v36_advanced_decision(d15,d1h=None,d4h=None,d1d=None,pullback=None):
+    """Unified V36: Structure + EMA + RSI + MACD + ADX + Volume + ATR/VWAP/Bollinger/OBV + MTF."""
+    p=pullback or v33_pullback_signal(d15)
+    x15=v36_ema_tf_state(d15); x1h=v36_ema_tf_state(d1h) if d1h is not None and not d1h.empty else {}; x4h=v36_ema_tf_state(d4h) if d4h is not None and not d4h.empty else {}; x1d=v36_ema_tf_state(d1d) if d1d is not None and not d1d.empty else {}
+    ind=v36_indicator_snapshot(d15)
+    scores={"LONG":0,"SHORT":0}; modules={"LONG":{},"SHORT":{}}; reasons={"LONG":[],"SHORT":[]}
+    def add(side,module,pts,text=""):
+        modules[side][module]=min(modules[side].get(module,0)+pts, {"EMA":25,"Structure":25,"Momentum":15,"ADX":10,"Volume":10,"Volatility":5,"MTF":10}[module])
+        scores[side]+=pts
+        if text: reasons[side].append(text)
+    # EMA 25
+    for side,bull in (("LONG",True),("SHORT",False)):
+        aligned=x15.get("direction")==("BULLISH" if bull else "BEARISH")
+        ema20=x15.get("ema20",np.nan); ema50=x15.get("ema50",np.nan); ema100=x15.get("ema100",np.nan)
+        price_ok=(x15.get("price_vs_ema20",0)>0) if bull else (x15.get("price_vs_ema20",0)<0)
+        touch_turn=x15.get("touch_20_50") and (x15.get("turn_up") if bull else x15.get("turn_down"))
+        ema200_ok=(ema100>0 and ((ema20>ema100) if bull else (ema20<ema100)))
+        price_200_ok=(x15.get("close",0)>x15.get("ema200",np.nan)) if bull else (x15.get("close",0)<x15.get("ema200",np.nan))
+        if aligned: add(side,"EMA",8,"EMA20/50/100 aligned")
+        elif ((ema20>ema50) if bull else (ema20<ema50)): add(side,"EMA",4,"EMA20/50 direction agrees")
+        if price_ok: add(side,"EMA",3,"price is on the correct side of EMA20")
+        if touch_turn: add(side,"EMA",5,"EMA20/50 pullback turn")
+        elif x15.get("touch_20_50"): add(side,"EMA",2,"EMA20/50 pullback zone reached")
+        if (x15.get("turn_up") if bull else x15.get("turn_down")): add(side,"EMA",2,"EMA20 slope supports direction")
+        if ema200_ok: add(side,"EMA",3,"EMA20/EMA100 direction agrees")
+        if price_200_ok: add(side,"EMA",4,"price is on the correct side of EMA200")
+    # Structure 25
+    if p.get("hh") and p.get("hl"): add("LONG","Structure",10,"HH + HL structure")
+    elif p.get("hh") or p.get("hl"): add("LONG","Structure",5,"bullish structure developing")
+    if p.get("lh") and p.get("ll"): add("SHORT","Structure",10,"LH + LL structure")
+    elif p.get("lh") or p.get("ll"): add("SHORT","Structure",5,"bearish structure developing")
+    if p.get("signal")=="LONG READY": add("LONG","Structure",10,"local high broken")
+    elif p.get("signal")=="LONG WATCH" and p.get("retests",0)>0: add("LONG","Structure",5,"EMA20 pullback tested")
+    if p.get("signal")=="SHORT READY": add("SHORT","Structure",10,"local low broken")
+    elif p.get("signal")=="SHORT WATCH" and p.get("retests",0)>0: add("SHORT","Structure",5,"EMA20 retest tested")
+    # Momentum 15
+    rsi=ind.get("rsi",np.nan); hist=ind.get("macd_hist",np.nan); roc=ind.get("roc",np.nan)
+    if np.isfinite(rsi):
+        if 50<=rsi<=68: add("LONG","Momentum",5,"RSI healthy bullish")
+        elif 68<rsi<=75: add("LONG","Momentum",3,"RSI bullish but extended")
+        if 32<=rsi<=50: add("SHORT","Momentum",5,"RSI bearish")
+        elif 25<=rsi<32: add("SHORT","Momentum",3,"RSI weak but oversold risk")
+    if np.isfinite(hist):
+        if hist>0: add("LONG","Momentum",5,"MACD bullish")
+        elif hist<0: add("SHORT","Momentum",5,"MACD bearish")
+    if np.isfinite(roc):
+        if roc>0.20: add("LONG","Momentum",5,"ROC positive")
+        elif roc>0: add("LONG","Momentum",2,"ROC positive")
+        if roc<-0.20: add("SHORT","Momentum",5,"ROC negative")
+        elif roc<0: add("SHORT","Momentum",2,"ROC negative")
+    # ADX 10
+    adx,pdi,mdi=ind.get("adx",np.nan),ind.get("pdi",np.nan),ind.get("mdi",np.nan)
+    if np.isfinite(adx) and adx>=25:
+        if np.isfinite(pdi) and np.isfinite(mdi) and pdi>mdi: add("LONG","ADX",6,"ADX strong +DI > -DI")
+        elif np.isfinite(pdi) and np.isfinite(mdi) and mdi>pdi: add("SHORT","ADX",6,"ADX strong -DI > +DI")
+    elif np.isfinite(adx) and adx>=20:
+        if np.isfinite(pdi) and np.isfinite(mdi) and pdi>mdi: add("LONG","ADX",3,"ADX developing +DI > -DI")
+        elif np.isfinite(pdi) and np.isfinite(mdi) and mdi>pdi: add("SHORT","ADX",3,"ADX developing -DI > +DI")
+    if np.isfinite(pdi) and np.isfinite(mdi):
+        if pdi>mdi: add("LONG","ADX",4,"+DI above -DI")
+        elif mdi>pdi: add("SHORT","ADX",4,"-DI above +DI")
+    # Volume 10
+    vr,obv,cmf=ind.get("vol_ratio",np.nan),ind.get("obv_slope",np.nan),ind.get("cmf20",np.nan)
+    if np.isfinite(vr):
+        pts=5 if vr>=1.5 else 3 if vr>=1.2 else 2 if vr>=1.0 else 0
+        if pts: add("LONG","Volume",pts,f"volume {vr:.1f}x average"); add("SHORT","Volume",pts,f"volume {vr:.1f}x average")
+    if np.isfinite(obv):
+        if obv>0: add("LONG","Volume",3,"OBV rising")
+        elif obv<0: add("SHORT","Volume",3,"OBV falling")
+    if np.isfinite(cmf):
+        if cmf>0.05: add("LONG","Volume",2,"CMF buying pressure")
+        elif cmf<-0.05: add("SHORT","Volume",2,"CMF selling pressure")
+    # Volatility/location 5
+    vd,bb,bbma,atrp=ind.get("vwap_dist_pct",np.nan),ind.get("bb_width_pct",np.nan),ind.get("bb_width_ma",np.nan),ind.get("atr_pct",np.nan)
+    if np.isfinite(vd) and vd>=0: add("LONG","Volatility",2,"price above rolling VWAP")
+    if np.isfinite(vd) and vd<=0: add("SHORT","Volatility",2,"price below rolling VWAP")
+    if np.isfinite(bb) and np.isfinite(bbma) and bb>bbma*1.05:
+        add("LONG","Volatility",2,"Bollinger width expanding"); add("SHORT","Volatility",2,"Bollinger width expanding")
+    if np.isfinite(atrp): add("LONG","Volatility",1,f"ATR {atrp:.2f}%"); add("SHORT","Volatility",1,f"ATR {atrp:.2f}%")
+    # MTF 10
+    states=(x1h,x4h,x1d); bull=sum(z.get("direction")=="BULLISH" for z in states); bear=sum(z.get("direction")=="BEARISH" for z in states)
+    if bull==3: add("LONG","MTF",10,"1H + 4H + 1D bullish")
+    elif bull==2: add("LONG","MTF",7,"2/3 higher timeframes bullish")
+    elif bull==1: add("LONG","MTF",3,"1/3 higher timeframes bullish")
+    if bear==3: add("SHORT","MTF",10,"1H + 4H + 1D bearish")
+    elif bear==2: add("SHORT","MTF",7,"2/3 higher timeframes bearish")
+    elif bear==1: add("SHORT","MTF",3,"1/3 higher timeframes bearish")
+    # Extreme oscillator caution
+    if np.isfinite(rsi) and rsi>=75: scores["LONG"]-=6
+    if np.isfinite(rsi) and rsi<=25: scores["SHORT"]-=6
+    scores={k:int(max(0,min(100,v))) for k,v in scores.items()}
+    if scores["LONG"]>=72 and p.get("signal")=="LONG READY" and bear==0: signal="LONG READY"
+    elif scores["SHORT"]>=72 and p.get("signal")=="SHORT READY" and bull==0: signal="SHORT READY"
+    elif scores["LONG"]>=58 and bull>=1 and bear<=1 and scores["LONG"]>scores["SHORT"]+5: signal="LONG WATCH"
+    elif scores["SHORT"]>=58 and bear>=1 and bull<=1 and scores["SHORT"]>scores["LONG"]+5: signal="SHORT WATCH"
+    else: signal="WAIT"
+    stage={"LONG READY":"CONFIRMED → LOCAL HIGH BREAK","LONG WATCH":"EMA/STRUCTURE + MOMENTUM → WAIT FOR HIGH BREAK","SHORT READY":"CONFIRMED → LOCAL LOW BREAK","SHORT WATCH":"EMA/STRUCTURE + MOMENTUM → WAIT FOR LOW BREAK","WAIT":"NO CLEAN MULTI-FACTOR SETUP"}[signal]
+    why,next_step=v36_explain_decision(signal,{"long":scores["LONG"],"short":scores["SHORT"]},x15,ind,p,{"bullish":bull,"bearish":bear})
+    chosen="LONG" if scores["LONG"]>=scores["SHORT"] else "SHORT"
+    return {"signal":signal,"stage":stage,"score":max(scores.values()),"long_score":scores["LONG"],"short_score":scores["SHORT"],"modules":modules,
+            "reasons":reasons[chosen],"long_reasons":reasons["LONG"],"short_reasons":reasons["SHORT"],"why":why,"next_step":next_step,"chosen_side":chosen,
+            "1H":x1h,"4H":x4h,"1D":x1d,"mtf_long_confirmations":bull,"mtf_short_confirmations":bear,"volume_ratio":vr,
+            "ema20":x15.get("ema20"),"ema50":x15.get("ema50"),"ema100":x15.get("ema100"),"ema200":x15.get("ema200"),"ema20_slope":x15.get("ema20_slope"),"ema20_50_touch":x15.get("touch_20_50"),
+            "indicators":ind,"rsi":rsi,"macd_hist":hist,"adx":adx,"roc":roc,"atr_pct":atrp,"vwap":ind.get("vwap"),"bb_width_pct":bb,"obv_slope":obv,"cmf20":cmf}
+
+
+def v36_ema_pattern_engine(d15,d1h=None,d4h=None,d1d=None,pullback=None):
+    return v36_advanced_decision(d15,d1h,d4h,d1d,pullback)
 
 V33_EMA_NEAR_PCT = 1.25
 
@@ -5432,9 +5513,10 @@ def v33_rank(records):
         p=r.get("v33_pullback") or {}
         ema=r.get("v36_ema") or {}
         sig=ema.get("signal", p.get("signal","WAIT"))
-        # Preserve the proven V36 structure score, then use EMA pattern score
-        # as the confirmation layer. EMA score contributes up to 25 points.
-        score=float(p.get("score",0))*0.75 + float(ema.get("score",0))*2.5
+        # The advanced V36 score is now the primary decision score. The older
+        # structure score remains a small supporting component so the ranking
+        # still respects the proven HH/HL or LH/LL path logic.
+        score=float(ema.get("score",0))*0.80 + float(p.get("score",0))*0.20
         room=float(r.get("v33_room_4h_pct",np.nan))
         if np.isfinite(room):
             if room >= 5: score += 10
@@ -5506,9 +5588,8 @@ _v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK
 st.divider()
 st.header("🧠 V36 — Healthy Pullback / Structure Path Agent")
 st.caption(
-    "One core model for both directions: LONG = HH → HL → EMA20 test → hold → local-high break. "
-    "SHORT = LH → LL → EMA20 test → reject → local-low break. Do not chase extended moves. "
-    "4H and 1D levels are reaction/target zones, not automatic reversals."
+    "One core model for both directions: LONG = HH → HL → EMA20/50 pullback → momentum confirmation → local-high break. "
+    "SHORT = LH → LL → EMA20/50 retest → momentum confirmation → local-low break. The agent explains each decision using EMA, structure, RSI, MACD, ADX, volume, volatility and MTF."
 )
 
 v34_workers = st.slider("V36 scan workers", 2, 8, 6, 1, key="v36_workers")
@@ -5519,17 +5600,44 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
         instruments=active_instruments("USDT")
         bar.progress(5,text="Loading live Futures prices…")
         prices=futures_prices()
-        items=[]
+        def _norm_pair(v):
+            return str(v or "").upper().replace("/","").replace("-","").replace("_","").strip()
+        def _raw_price(v):
+            if isinstance(v,dict):
+                for kk in ("price","last_price","last","close","p","lp","mark_price","mp"):
+                    q=v6_num(v.get(kk))
+                    if np.isfinite(q) and q>0: return q
+            else:
+                q=v6_num(v)
+                if np.isfinite(q) and q>0: return q
+            return np.nan
+        price_map={}
+        for k,v in (prices or {}).items():
+            ident=str(k)
+            if isinstance(v,dict): ident=str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k)
+            q=_raw_price(v)
+            if np.isfinite(q): price_map.setdefault(ident,q); price_map.setdefault(_norm_pair(ident),q)
+        items=[]; seen=set()
         for raw in instruments:
             try:
                 pair=v61_instrument_pair(raw) if isinstance(raw,dict) else str(raw)
                 if not pair: continue
                 symbol=v61_symbol(raw,pair) if isinstance(raw,dict) else pair
                 price=v61_price_for_pair(prices,pair)
-                if np.isfinite(price) and price>0: items.append((pair,symbol,float(price)))
+                if not (np.isfinite(price) and price>0): price=price_map.get(pair,price_map.get(_norm_pair(pair),np.nan))
+                if np.isfinite(price) and price>0 and _norm_pair(pair) not in seen:
+                    items.append((pair,symbol,float(price))); seen.add(_norm_pair(pair))
             except Exception: continue
+        if not items:
+            for k,v in (prices or {}).items():
+                pair=str(k)
+                if isinstance(v,dict): pair=str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k)
+                if "USDT" not in pair.upper(): continue
+                price=_raw_price(v)
+                if np.isfinite(price) and price>0 and _norm_pair(pair) not in seen:
+                    items.append((pair,pair,float(price))); seen.add(_norm_pair(pair))
         total=len(items)
-        if total==0: raise RuntimeError("No active USDT Futures contracts were returned by CoinDCX.")
+        if total==0: raise RuntimeError("CoinDCX returned no usable USDT Futures symbols/prices. The market feed may be temporarily unavailable.")
 
         from concurrent.futures import ThreadPoolExecutor,as_completed
         phase1=[]; results=[]; errors=[]
@@ -5540,20 +5648,23 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
             try:
                 d15=get_tf(pair,"15m",10)
                 if d15 is None or d15.empty: return None,f"{pair}: no 15m candles"
-                p=v33_pullback_signal(d15,price); x15=v36_ema_tf_state(d15)
+                p=v33_pullback_signal(d15,price); x15=v36_ema_tf_state(d15); q=v36_indicator_snapshot(d15)
                 ls=ss=0
-                if x15.get("direction")=="BULLISH": ls+=2
-                if x15.get("direction")=="BEARISH": ss+=2
-                if x15.get("price_vs_ema20",0)>0: ls+=1
-                if x15.get("price_vs_ema20",0)<0: ss+=1
-                if x15.get("touch_20_50") and x15.get("turn_up"): ls+=2
-                if x15.get("touch_20_50") and x15.get("turn_down"): ss+=2
-                if x15.get("turn_up"): ls+=1
-                if x15.get("turn_down"): ss+=1
-                if p.get("hh",0)>0 and p.get("hl",0)>0: ls+=1
-                if p.get("lh",0)>0 and p.get("ll",0)>0: ss+=1
-                if p.get("signal")=="LONG READY": ls+=1
-                if p.get("signal")=="SHORT READY": ss+=1
+                if x15.get("direction")=="BULLISH": ls+=8
+                if x15.get("direction")=="BEARISH": ss+=8
+                if x15.get("price_vs_ema20",0)>0: ls+=3
+                if x15.get("price_vs_ema20",0)<0: ss+=3
+                if x15.get("touch_20_50") and x15.get("turn_up"): ls+=5
+                if x15.get("touch_20_50") and x15.get("turn_down"): ss+=5
+                if p.get("hh") and p.get("hl"): ls+=10
+                if p.get("lh") and p.get("ll"): ss+=10
+                if np.isfinite(q.get("rsi",np.nan)) and 50<=q["rsi"]<=68: ls+=5
+                if np.isfinite(q.get("rsi",np.nan)) and 32<=q["rsi"]<=50: ss+=5
+                if np.isfinite(q.get("macd_hist",np.nan)) and q["macd_hist"]>0: ls+=5
+                if np.isfinite(q.get("macd_hist",np.nan)) and q["macd_hist"]<0: ss+=5
+                if np.isfinite(q.get("adx",np.nan)) and q["adx"]>=20:
+                    if q.get("pdi",0)>q.get("mdi",0): ls+=5
+                    elif q.get("mdi",0)>q.get("pdi",0): ss+=5
                 side="LONG" if ls>ss else "SHORT" if ss>ls else "WAIT"
                 priority=max(ls,ss)+float(p.get("score",0))/20.0
                 return {"pair":pair,"symbol":symbol,"price":price,"d15":d15,"v33_pullback":p,"pre_side":side,"pre_score":priority},None
@@ -5653,6 +5764,8 @@ if _saved:
         f"Futures checked: {st.session_state.get('v34_total', '—')} | candidates: {len(_saved)}"
     )
 
+    st.info("**How V36 decides:** it checks price structure, EMA20/50/100/200, RSI, MACD, ADX, volume/OBV/CMF, ATR, VWAP, Bollinger expansion and 1H/4H/1D trend. The **Why** column translates those checks into plain English. EMA20/50 touch alone never creates an entry; READY still needs the local high/low break.")
+
     for side, title, emoji in (
         ("LONG", "🟢 LONG — FRESH PULLBACK / NEXT-LEG ENTRIES", "🟢"),
         ("SHORT", "🔴 SHORT — FRESH RETEST / NEXT-LEG ENTRIES", "🔴"),
@@ -5693,14 +5806,24 @@ if _saved:
                 "Signal": effective_signal,
                 "Stage": stage,
                 "Score": r.get("v33_score", 0),
-                "EMA Score": f"L{ema.get('long_score',0)}/S{ema.get('short_score',0)}",
+                "Decision Score": f"L{ema.get('long_score',0)}/S{ema.get('short_score',0)}",
+                "Modules": " / ".join(f"{k[:3]}:{v}" for k,v in (ema.get("modules",{}).get("LONG" if side=="LONG" else "SHORT",{})).items()),
                 "EMA20/50": "TOUCH → UP" if ema.get("ema20_50_touch") and ema.get("ema20_slope",0) > 0 else "TOUCH → DOWN" if ema.get("ema20_50_touch") and ema.get("ema20_slope",0) < 0 else "—",
                 "1H/4H/1D": "/".join([(ema.get(k) or {}).get("direction","—")[:4] for k in ("1H","4H","1D")]),
+                "RSI": f"{ema.get('rsi',np.nan):.1f}" if np.isfinite(ema.get('rsi',np.nan)) else "—",
+                "MACD": "BULL" if ema.get('macd_hist',0)>0 else "BEAR" if ema.get('macd_hist',0)<0 else "—",
+                "ADX": f"{ema.get('adx',np.nan):.1f}" if np.isfinite(ema.get('adx',np.nan)) else "—",
+                "Volume": f"{ema.get('volume_ratio',np.nan):.1f}x" if np.isfinite(ema.get('volume_ratio',np.nan)) else "—",
+                "ATR%": f"{ema.get('atr_pct',np.nan):.2f}" if np.isfinite(ema.get('atr_pct',np.nan)) else "—",
                 "Current": v13_format_price(r.get("price")),
                 "EMA20": v13_format_price(ema20_value),
                 "EMA50": v13_format_price(ema50_value),
+                "EMA100": v13_format_price(ema.get("ema100",np.nan)),
+                "EMA200": v13_format_price(ema.get("ema200",np.nan)),
                 "EMA dist": f"{ema_dist:.2f}%" if np.isfinite(ema_dist) else "—",
                 "Retests": p.get("retests", 0),
+                "Why": ema.get("why","—"),
+                "Next": ema.get("next_step","—"),
                 "SETUP SEQUENCE": sequence,
                 "Entry trigger": v13_format_price(p.get("local_trigger")),
                 "Invalidation": v13_format_price(p.get("invalidation")),
@@ -5712,6 +5835,7 @@ if _saved:
         st.subheader(f"{emoji} {title}")
         if side_rows:
             st.dataframe(pd.DataFrame(side_rows[:5]), use_container_width=True, hide_index=True)
+            st.caption("**Why:** V36 does not enter just because an EMA crosses or touches. It waits for agreement between trend, structure, momentum, trend strength, participation, volatility and higher timeframes. **READY** additionally requires the local high/low break.")
         else:
             st.info("No fresh candidates on this side.")
 else:
@@ -5719,7 +5843,6 @@ else:
 
 st.divider()
 st.caption(
-    "V36 EMA rule: EMA20/EMA50 touch is a setup, not an entry. READY requires EMA alignment, structure, confirmation break, and MTF agreement. "
-    "WAIT = no clean structure. Never chase a stretched move. A 4H support/resistance touch is a reaction zone, "
-    "not an automatic entry or reversal. Manual signals are analysis-only; no live orders are placed."
+    "V36 rule: EMA20/EMA50 touch is a setup, not an entry. The decision combines EMA + structure + RSI + MACD + ADX + volume + ATR/VWAP/Bollinger/OBV + MTF. "
+    "READY requires the actual local high/low break. WATCH means the setup is forming but the trigger is missing. WAIT means the evidence is mixed. Manual signals are analysis-only; no live orders are placed."
 )
