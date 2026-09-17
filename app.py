@@ -22,51 +22,107 @@ MEME_WORDS = {
     "1000LUNC","PONKE","MYRO","SLERF","LADYS","DEGEN","MOTHER","MAGA","TRUMP"
 }
 
-@st.cache_data(ttl=60, show_spinner=False)
+@st.cache_data(ttl=30, show_spinner=False)
 def active_instruments(margin="USDT"):
-    """Fast Futures universe discovery with one primary attempt and live-feed fallback."""
+    """Discover a complete, validated CoinDCX Futures universe.
+
+    We do not accept a tiny non-empty API response as the whole market.  We
+    try the documented endpoint with several encodings, validate that returned
+    values actually look like Futures pairs, and compare the result with the
+    public realtime Futures feed.  The largest valid USDT universe is used.
+    """
     url = f"{API}/exchange/v1/derivatives/futures/data/active_instruments"
     errors = []
+
+    def norm_pair(v):
+        return str(v or "").upper().replace("/", "").replace("-", "").replace("_", "").strip()
+
+    def extract_pairs(obj):
+        found = []
+        def add(v):
+            if not isinstance(v, str):
+                return
+            v = v.strip()
+            u = v.upper()
+            # A valid USDT futures pair normally contains USDT and has a
+            # recognizable separator or suffix. Reject response metadata.
+            if "USDT" not in u:
+                return
+            if len(u) < 6 or len(u) > 80:
+                return
+            if v not in found:
+                found.append(v)
+        def walk(obj, depth=0):
+            if depth > 5:
+                return
+            if isinstance(obj, str):
+                add(obj); return
+            if isinstance(obj, list):
+                for x in obj: walk(x, depth+1)
+                return
+            if isinstance(obj, dict):
+                # Prefer explicit pair-like fields.
+                for k in ("pair","symbol","market","instrument","coindcx_name","id","futures_pair"):
+                    v=obj.get(k)
+                    if isinstance(v,str): add(v)
+                # Handle nested containers and keyed maps.
+                for k in ("data","instruments","active_instruments","result","markets","items","prices"):
+                    if k in obj: walk(obj[k], depth+1)
+                for k,v in obj.items():
+                    if isinstance(k,str) and "USDT" in k.upper(): add(k)
+                    if isinstance(v,(dict,list)) and k not in {"data","instruments","active_instruments","result","markets","items","prices"}:
+                        walk(v, depth+1)
+        walk(obj)
+        return found
+
+    candidate_sets=[]
+    attempts = [
+        [("margin_currency_short_name[]", margin)],
+        [("margin_currency_short_name", margin)],
+        [("margin_currency_short_name[]", margin), ("margin_currency_short_name[]", margin)],
+        [],
+    ]
+    for params in attempts:
+        try:
+            r=requests.get(url, params=params, timeout=12)
+            r.raise_for_status()
+            payload=r.json()
+            pairs=extract_pairs(payload)
+            if pairs:
+                candidate_sets.append((len(pairs), pairs, f"active_instruments params={params or 'none'}"))
+            else:
+                errors.append(f"active endpoint returned no valid USDT pairs params={params or 'none'}")
+        except Exception as exc:
+            errors.append(f"active endpoint {type(exc).__name__} params={params or 'none'}: {exc}")
+
+    # Public realtime feed is also a useful independent market-universe source.
     try:
-        r = requests.get(url, params={"margin_currency_short_name[]": margin}, timeout=8)
-        r.raise_for_status()
-        payload = r.json()
-        rows = payload.get("data", payload) if isinstance(payload, dict) else payload
-        if isinstance(rows, list):
-            pairs = []
-            for item in rows:
-                if isinstance(item, str): pair = item.strip()
-                elif isinstance(item, dict):
-                    pair = next((item.get(k) for k in ("pair","symbol","market","instrument","coindcx_name","id") if isinstance(item.get(k), str) and item.get(k).strip()), None)
-                else: pair = None
-                if pair and pair not in pairs: pairs.append(pair)
-            if pairs: return pairs
-        errors.append(f"primary endpoint returned no usable pairs ({type(payload).__name__})")
-    except Exception as exc:
-        errors.append(f"primary endpoint {type(exc).__name__}: {exc}")
-    try:
-        raw = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=10)
+        raw=requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=12)
         raw.raise_for_status()
-        payload = raw.json()
-        feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
-        pairs=[]
-        if isinstance(feed, dict): iterator=feed.items()
-        elif isinstance(feed, list):
-            iterator=[]
-            for item in feed:
-                if isinstance(item, dict):
-                    key=item.get("pair") or item.get("symbol") or item.get("mkt") or item.get("market")
-                    if key: iterator.append((key,item))
-        else: iterator=[]
-        for key,value in iterator:
-            pair=key
-            if isinstance(value, dict): pair=value.get("pair") or value.get("symbol") or value.get("mkt") or value.get("market") or key
-            if isinstance(pair,str) and "USDT" in pair.upper() and pair not in pairs: pairs.append(pair)
-        if pairs: return pairs
-        errors.append("live price feed returned no USDT Futures pairs")
+        payload=raw.json()
+        pairs=extract_pairs(payload)
+        if pairs:
+            candidate_sets.append((len(pairs), pairs, "realtime_futures_feed"))
+        else:
+            errors.append("realtime Futures feed returned no valid USDT pairs")
     except Exception as exc:
-        errors.append(f"price feed {type(exc).__name__}: {exc}")
-    raise RuntimeError("CoinDCX Futures universe discovery failed: " + " | ".join(errors))
+        errors.append(f"realtime Futures feed {type(exc).__name__}: {exc}")
+
+    if not candidate_sets:
+        raise RuntimeError("CoinDCX Futures universe discovery failed. " + " | ".join(errors[-5:]))
+
+    # Do not blindly trust the first response. Pick the largest validated set.
+    candidate_sets.sort(key=lambda x:x[0], reverse=True)
+    best_count,best_pairs,best_source=candidate_sets[0]
+
+    # A healthy USDT market should normally be much larger than a handful of
+    # contracts. If the largest source is tiny, expose that fact rather than
+    # pretending it is the whole market.
+    if best_count < 20:
+        sources="; ".join(f"{n} from {src}" for n,_,src in candidate_sets[:4])
+        raise RuntimeError(f"CoinDCX returned only {best_count} validated USDT Futures pairs ({sources}). Refusing to treat a tiny response as the full market.")
+
+    return best_pairs
 
 @st.cache_data(ttl=15, show_spinner=False)
 def futures_prices():
@@ -5641,7 +5697,8 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
 
         from concurrent.futures import ThreadPoolExecutor,as_completed
         phase1=[]; results=[]; errors=[]
-        stats={"universe":total,"data_ok":0,"directional":0,"ready":0,"watch":0,"wait":0,"errors":0}
+        stats={"universe":total,"data_ok":0,"directional":0,"mtf_analyzed":0,
+                "ready":0,"watch":0,"wait":0,"errors":0,"phase1_long":0,"phase1_short":0}
 
         def scan15(item):
             pair,symbol,price=item
@@ -5684,6 +5741,8 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                 bar.progress(int(5+i/max(total,1)*35),text=f"Phase 1/2 — 15m EMA + structure {i}/{total}…")
 
         phase1.sort(key=lambda r:(-float(r.get("pre_score",0)),r.get("symbol","")))
+        stats["phase1_long"] = sum(1 for r in phase1 if r.get("pre_side") == "LONG")
+        stats["phase1_short"] = sum(1 for r in phase1 if r.get("pre_side") == "SHORT")
         mtf_limit=min(80,max(30,v31_candidates*2))
         targets=phase1[:mtf_limit]
 
@@ -5702,9 +5761,13 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
             fs=[ex.submit(add_mtf,rr) for rr in targets]
             for i,f in enumerate(as_completed(fs),1):
                 rr=f.result(); sig=(rr.get("v36_ema") or {}).get("signal","WAIT")
+                stats["mtf_analyzed"] += 1
                 if sig.startswith("LONG") or sig.startswith("SHORT"):
-                    results.append(rr); stats["directional"]+=1; stats["ready" if sig.endswith("READY") else "watch"]+=1
-                else: stats["wait"]+=1
+                    results.append(rr); stats["directional"] += 1
+                    if sig.endswith("READY"): stats["ready"] += 1
+                    else: stats["watch"] += 1
+                else:
+                    stats["wait"] += 1
                 if rr.get("error") and len(errors)<25: errors.append(rr["error"])
                 bar.progress(40+int(i/max(len(targets),1)*50),text=f"Phase 2/2 — MTF confirmation {i}/{len(targets)}…")
 
@@ -5745,10 +5808,9 @@ if _stats:
     st.caption(
         f"Scan diagnostics — Futures discovered: {_stats.get('universe', 0)} | "
         f"15m data OK: {_stats.get('data_ok', 0)} | "
-        f"Directional: {_stats.get('directional', 0)} | "
-        f"READY: {_stats.get('ready', 0)} | "
-        f"WATCH: {_stats.get('watch', 0)} | "
-        f"WAIT: {_stats.get('wait', 0)} | "
+        f"15m LONG: {_stats.get('phase1_long', 0)} | 15m SHORT: {_stats.get('phase1_short', 0)} | "
+        f"MTF analyzed: {_stats.get('mtf_analyzed', 0)} | "
+        f"READY: {_stats.get('ready', 0)} | WATCH: {_stats.get('watch', 0)} | WAIT: {_stats.get('wait', 0)} | "
         f"Errors: {_stats.get('errors', 0)}"
     )
 
@@ -5765,6 +5827,7 @@ if _saved:
     )
 
     st.info("**How V36 decides:** it checks price structure, EMA20/50/100/200, RSI, MACD, ADX, volume/OBV/CMF, ATR, VWAP, Bollinger expansion and 1H/4H/1D trend. The **Why** column translates those checks into plain English. EMA20/50 touch alone never creates an entry; READY still needs the local high/low break.")
+    st.caption("Market scan design: every discovered Futures contract gets the 15m screening pass; only the strongest 15m candidates receive 1H/4H/1D confirmation. READY/WATCH/WAIT counts refer to that MTF-confirmed candidate set, not the entire market.")
 
     for side, title, emoji in (
         ("LONG", "🟢 LONG — FRESH PULLBACK / NEXT-LEG ENTRIES", "🟢"),
