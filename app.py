@@ -5802,7 +5802,14 @@ if _saved:
             stage = ema.get("stage") or p.get("stage", "—")
             if effective_signal == "WAIT":
                 continue
-            ema_dist = p.get("ema_distance_pct", np.nan)
+            # Use the V36 EMA engine as the authoritative EMA source.
+            # The older pullback object can legitimately have NaN EMA fields
+            # after MTF enrichment, while the EMA engine has already computed
+            # the completed 15m EMA20/50/100 state.
+            ema20_value = ema.get("ema20", np.nan)
+            ema50_value = ema.get("ema50", np.nan)
+            ema_dist = ((float(r.get("price")) / float(ema20_value)) - 1.0) * 100.0 \
+                if np.isfinite(ema20_value) and float(ema20_value) > 0 and float(r.get("price", 0)) > 0 else np.nan
             room4 = r.get("v33_room_4h_pct", np.nan)
             side_rows.append({
                 "Coin": r.get("symbol", "—"),
@@ -5813,7 +5820,8 @@ if _saved:
                 "EMA20/50": "TOUCH → UP" if ema.get("ema20_50_touch") and ema.get("ema20_slope",0) > 0 else "TOUCH → DOWN" if ema.get("ema20_50_touch") and ema.get("ema20_slope",0) < 0 else "—",
                 "1H/4H/1D": "/".join([(ema.get(k) or {}).get("direction","—")[:4] for k in ("1H","4H","1D")]),
                 "Current": v13_format_price(r.get("price")),
-                "EMA20": v13_format_price(p.get("ema20")),
+                "EMA20": v13_format_price(ema20_value),
+                "EMA50": v13_format_price(ema50_value),
                 "EMA dist": f"{ema_dist:.2f}%" if np.isfinite(ema_dist) else "—",
                 "Retests": p.get("retests", 0),
                 "SETUP SEQUENCE": sequence,
