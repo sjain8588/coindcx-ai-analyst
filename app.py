@@ -22,116 +22,56 @@ MEME_WORDS = {
     "1000LUNC","PONKE","MYRO","SLERF","LADYS","DEGEN","MOTHER","MAGA","TRUMP"
 }
 
+@st.cache_data(ttl=60, show_spinner=False)
 def active_instruments(margin="USDT"):
-    """Discover the complete active CoinDCX Futures universe robustly.
-
-    CoinDCX responses have appeared in several shapes (plain list, nested data,
-    keyed dictionaries and price-feed objects).  This function normalizes all
-    of them.  It never converts an API failure into a fake empty market.
-    """
+    """Fast Futures universe discovery with one primary attempt and live-feed fallback."""
     url = f"{API}/exchange/v1/derivatives/futures/data/active_instruments"
     errors = []
-
-    def flatten_records(obj):
-        out = []
-        if isinstance(obj, list):
-            for item in obj:
-                if isinstance(item, dict):
-                    out.append(item)
-                elif isinstance(item, str):
-                    out.append({"pair": item, "symbol": item})
-        elif isinstance(obj, dict):
-            # Normal documented/nested response containers.
-            for key in ("data", "instruments", "active_instruments", "result", "markets", "items"):
-                if key in obj:
-                    out.extend(flatten_records(obj[key]))
-            # Also support keyed dictionaries such as {"B-BTC_USDT": {...}}.
-            for key, value in obj.items():
-                if isinstance(value, dict):
-                    rec = dict(value)
-                    if not any(rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name")):
-                        if isinstance(key, str) and ("_USDT" in key.upper() or "USDT" in key.upper()):
-                            rec["pair"] = key
-                    if any(rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name")):
-                        out.append(rec)
-        return out
-
-    attempts = [
-        {"margin_currency_short_name[]": margin},
-        {"margin_currency_short_name": margin},
-        {"margin_currency_short_name[]": [margin]},
-        {},
-    ]
-    for params in attempts:
-        try:
-            r = requests.get(url, params=params, timeout=25)
-            r.raise_for_status()
-            payload = r.json()
-            rows = flatten_records(payload)
-            if rows:
-                # Keep the legacy V5 contract: callers expect a list of pair strings.
-                # V6/V6.2 also accepts strings via v61_instrument_pair().
-                pairs = []
-                seen_pairs = set()
-                for rec in rows:
-                    if isinstance(rec, str):
-                        pair = rec.strip()
-                    elif isinstance(rec, dict):
-                        pair = next((rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name", "id") if isinstance(rec.get(k), str) and rec.get(k).strip()), None)
-                    else:
-                        pair = None
-                    if pair and pair not in seen_pairs:
-                        seen_pairs.add(pair)
-                        pairs.append(pair)
-                if pairs:
-                    return pairs
-            errors.append(f"empty response params={params}; payload_type={type(payload).__name__}")
-        except Exception as exc:
-            errors.append(f"instrument endpoint {type(exc).__name__}: {exc}")
-
-    # Robust fallback: the public real-time Futures feed itself is a live market
-    # universe. This is especially useful if the active_instruments schema changes.
     try:
-        raw = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
+        r = requests.get(url, params={"margin_currency_short_name[]": margin}, timeout=8)
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+        if isinstance(rows, list):
+            pairs = []
+            for item in rows:
+                if isinstance(item, str): pair = item.strip()
+                elif isinstance(item, dict):
+                    pair = next((item.get(k) for k in ("pair","symbol","market","instrument","coindcx_name","id") if isinstance(item.get(k), str) and item.get(k).strip()), None)
+                else: pair = None
+                if pair and pair not in pairs: pairs.append(pair)
+            if pairs: return pairs
+        errors.append(f"primary endpoint returned no usable pairs ({type(payload).__name__})")
+    except Exception as exc:
+        errors.append(f"primary endpoint {type(exc).__name__}: {exc}")
+    try:
+        raw = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=10)
         raw.raise_for_status()
         payload = raw.json()
         feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
-        derived = []
-        if isinstance(feed, dict):
-            iterator = feed.items()
+        pairs=[]
+        if isinstance(feed, dict): iterator=feed.items()
         elif isinstance(feed, list):
-            iterator = []
+            iterator=[]
             for item in feed:
                 if isinstance(item, dict):
-                    key = item.get("pair") or item.get("symbol") or item.get("mkt") or item.get("market")
-                    if key:
-                        iterator.append((key, item))
-        else:
-            iterator = []
-        seen = set()
-        for key, value in iterator:
-            pair = None
-            if isinstance(value, dict):
-                pair = value.get("pair") or value.get("symbol") or value.get("mkt") or value.get("market") or key
-            else:
-                pair = key
-            if isinstance(pair, str):
-                pair = pair.strip()
-                up = pair.upper()
-                if pair and ("USDT" in up or margin.upper() in up) and pair not in seen:
-                    seen.add(pair)
-                    derived.append({"pair": pair, "symbol": pair, "margin_currency_short_name": margin})
-        if derived:
-            return [x["pair"] for x in derived if isinstance(x, dict) and x.get("pair")]
-        errors.append(f"price-feed fallback returned no {margin} Futures pairs; payload_type={type(feed).__name__}")
+                    key=item.get("pair") or item.get("symbol") or item.get("mkt") or item.get("market")
+                    if key: iterator.append((key,item))
+        else: iterator=[]
+        for key,value in iterator:
+            pair=key
+            if isinstance(value, dict): pair=value.get("pair") or value.get("symbol") or value.get("mkt") or value.get("market") or key
+            if isinstance(pair,str) and "USDT" in pair.upper() and pair not in pairs: pairs.append(pair)
+        if pairs: return pairs
+        errors.append("live price feed returned no USDT Futures pairs")
     except Exception as exc:
-        errors.append(f"price-feed fallback {type(exc).__name__}: {exc}")
+        errors.append(f"price feed {type(exc).__name__}: {exc}")
+    raise RuntimeError("CoinDCX Futures universe discovery failed: " + " | ".join(errors))
 
-    raise RuntimeError("CoinDCX Futures universe discovery failed. " + " | ".join(errors[-5:]))
-
+@st.cache_data(ttl=15, show_spinner=False)
 def futures_prices():
     """Return current Futures prices normalized to {pair: price-record}."""
-    r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
+    r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=10)
     r.raise_for_status()
     payload = r.json()
     feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
@@ -174,9 +114,10 @@ def futures_prices():
         raise RuntimeError(f"CoinDCX Futures price feed returned no usable prices (payload_type={type(feed).__name__})")
     return out
 
+@st.cache_data(ttl=60, show_spinner=False)
 def candles(pair, resolution, start_ts, end_ts):
     params = {"pair": pair, "from": int(start_ts), "to": int(end_ts), "resolution": resolution, "pcode": "f"}
-    r = requests.get(f"{PUBLIC}/market_data/candlesticks", params=params, timeout=30)
+    r = requests.get(f"{PUBLIC}/market_data/candlesticks", params=params, timeout=10)
     r.raise_for_status()
     x = r.json()
     rows = x.get("data", []) if isinstance(x, dict) else x
@@ -192,6 +133,7 @@ def candles(pair, resolution, start_ts, end_ts):
     d["time"] = pd.to_datetime(d["time"], unit="ms", errors="coerce", utc=True)
     return d.dropna(subset=["time","open","high","low","close","volume"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
+@st.cache_data(ttl=60, show_spinner=False)
 def get_tf(pair, tf, days):
     now = int(time.time())
     if tf == "1W":
@@ -5572,180 +5514,115 @@ st.caption(
 v34_workers = st.slider("V36 scan workers", 2, 8, 6, 1, key="v36_workers")
 
 if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v36_scan_button"):
-    bar = st.progress(0, text="Loading active Futures…")
+    bar=st.progress(0,text="Loading active Futures…")
     try:
-        instruments = active_instruments("USDT")
-        prices = futures_prices()
-
-        items = []
-        universe_failures = 0
-
+        instruments=active_instruments("USDT")
+        bar.progress(5,text="Loading live Futures prices…")
+        prices=futures_prices()
+        items=[]
         for raw in instruments:
             try:
-                pair = v61_instrument_pair(raw)
-                if not pair:
-                    universe_failures += 1
-                    continue
-                symbol = v61_symbol(raw, pair)
-                price = v61_price_for_pair(prices, pair)
+                pair=v61_instrument_pair(raw) if isinstance(raw,dict) else str(raw)
+                if not pair: continue
+                symbol=v61_symbol(raw,pair) if isinstance(raw,dict) else pair
+                price=v61_price_for_pair(prices,pair)
+                if np.isfinite(price) and price>0: items.append((pair,symbol,float(price)))
+            except Exception: continue
+        total=len(items)
+        if total==0: raise RuntimeError("No active USDT Futures contracts were returned by CoinDCX.")
 
-                if not np.isfinite(price) or price <= 0:
-                    try:
-                        d = completed(get_tf(pair, "15m", 2))
-                        if d is not None and not d.empty:
-                            price = v6_num(d.iloc[-1].get("close"), np.nan)
-                    except Exception:
-                        price = np.nan
-
-                if np.isfinite(price) and price > 0:
-                    items.append((pair, symbol, float(price)))
-                else:
-                    universe_failures += 1
-            except Exception:
-                universe_failures += 1
-
-        results = []
-        results_cache = []
-        errors = []
-        stats = {
-            "universe": len(items), "data_ok": 0, "directional": 0,
-            "ready": 0, "watch": 0, "wait": 0, "errors": universe_failures
-        }
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
+        from concurrent.futures import ThreadPoolExecutor,as_completed
+        phase1=[]; results=[]; errors=[]
+        stats={"universe":total,"data_ok":0,"directional":0,"ready":0,"watch":0,"wait":0,"errors":0}
 
         def scan15(item):
-            pair, symbol, price = item
+            pair,symbol,price=item
             try:
-                # More history = more confirmed 15m pivots and fewer false
-                # "no structure" results across newer/volatile Futures contracts.
-                d15 = get_tf(pair, "15m", 10)
-                if d15 is None or d15.empty:
-                    return {"status": "WAIT", "error": f"{pair}: no 15m candles"}
-
-                # V36 EMA engine runs on the WHOLE market, not only the final
-                # 20 candidates.  The data is cached, so later MTF enrichment
-                # does not create another request for the same pair/timeframe.
-                d1h = get_tf(pair, "1H", 8)
-                d4h = get_tf(pair, "4H", 45)
-                d1d = get_tf(pair, "1D", 180)
-
-                p = v33_pullback_signal(d15, price)
-                ema_engine = v36_ema_pattern_engine(d15, d1h, d4h, d1d, p)
-                sig = ema_engine.get("signal", "WAIT")
-                status = "LONG" if sig.startswith("LONG") else "SHORT" if sig.startswith("SHORT") else "WAIT"
-                today = simple_today_structure(d15, bars=96)
-
-                # Keep the original V36 pullback result intact and attach the
-                # new EMA engine beside it so the historical/structure logic is
-                # preserved rather than replaced.
-                return {
-                    "status": status, "pair": pair, "symbol": symbol, "price": price,
-                    "d15": d15, "d1h": d1h, "d4h": d4h, "d1d": d1d,
-                    "v33_pullback": p, "v36_ema": ema_engine,
-                    "today_structure": today, "error": None
-                }
+                d15=get_tf(pair,"15m",10)
+                if d15 is None or d15.empty: return None,f"{pair}: no 15m candles"
+                p=v33_pullback_signal(d15,price); x15=v36_ema_tf_state(d15)
+                ls=ss=0
+                if x15.get("direction")=="BULLISH": ls+=2
+                if x15.get("direction")=="BEARISH": ss+=2
+                if x15.get("price_vs_ema20",0)>0: ls+=1
+                if x15.get("price_vs_ema20",0)<0: ss+=1
+                if x15.get("touch_20_50") and x15.get("turn_up"): ls+=2
+                if x15.get("touch_20_50") and x15.get("turn_down"): ss+=2
+                if x15.get("turn_up"): ls+=1
+                if x15.get("turn_down"): ss+=1
+                if p.get("hh",0)>0 and p.get("hl",0)>0: ls+=1
+                if p.get("lh",0)>0 and p.get("ll",0)>0: ss+=1
+                if p.get("signal")=="LONG READY": ls+=1
+                if p.get("signal")=="SHORT READY": ss+=1
+                side="LONG" if ls>ss else "SHORT" if ss>ls else "WAIT"
+                priority=max(ls,ss)+float(p.get("score",0))/20.0
+                return {"pair":pair,"symbol":symbol,"price":price,"d15":d15,"v33_pullback":p,"pre_side":side,"pre_score":priority},None
             except Exception as exc:
-                return {
-                    "status": "ERROR", "pair": pair, "symbol": symbol, "price": price,
-                    "d15": pd.DataFrame(),
-                    "v33_pullback": {"signal": "WAIT", "score": 0},
-                    "error": f"{pair}: {type(exc).__name__}: {exc}"
-                }
+                return None,f"{pair}: {type(exc).__name__}: {exc}"
 
-        total = len(items)
+        # ALL coins are scanned here. Only MTF confirmation is narrowed later.
         with ThreadPoolExecutor(max_workers=v34_workers) as ex:
-            futures = [ex.submit(scan15, item) for item in items]
-            for i, future in enumerate(as_completed(futures), 1):
-                rr = future.result()
-
-                if rr.get("status") == "ERROR":
-                    stats["errors"] += 1
-                    if len(errors) < 25:
-                        errors.append(rr.get("error", "unknown error"))
+            fs=[ex.submit(scan15,x) for x in items]
+            for i,f in enumerate(as_completed(fs),1):
+                rr,err=f.result()
+                if rr:
+                    phase1.append(rr); stats["data_ok"]+=1
                 else:
-                    stats["data_ok"] += 1
-                    sig = (rr.get("v36_ema") or {}).get("signal") or (rr.get("v33_pullback") or {}).get("signal", "WAIT")
-                    if sig.startswith("LONG"):
-                        stats["directional"] += 1
-                        stats["ready" if sig == "LONG READY" else "watch"] += 1
-                        results.append(rr)
-                    elif sig.startswith("SHORT"):
-                        stats["directional"] += 1
-                        stats["ready" if sig == "SHORT READY" else "watch"] += 1
-                        results.append(rr)
-                    else:
-                        stats["wait"] += 1
-                    # Cache every successful analysis for the fallback path.
-                    if rr.get("d15") is not None and not rr.get("d15").empty:
-                        results_cache.append(rr)
+                    stats["errors"]+=1
+                    if err and len(errors)<25: errors.append(err)
+                bar.progress(int(5+i/max(total,1)*35),text=f"Phase 1/2 — 15m EMA + structure {i}/{total}…")
 
-                bar.progress(
-                    int(i / max(total, 1) * 100),
-                    text=f"15m + 1H + 4H + 1D EMA analysis {i}/{total}…"
-                )
+        phase1.sort(key=lambda r:(-float(r.get("pre_score",0)),r.get("symbol","")))
+        mtf_limit=min(80,max(30,v31_candidates*2))
+        targets=phase1[:mtf_limit]
 
-        # If strict EMA20 pullback logic produces no candidates, use the
-        # already-fetched 15m data. Never refetch the whole market here.
+        def add_mtf(rr):
+            try:
+                pair=rr["pair"]; d1h=get_tf(pair,"1H",8); d4h=get_tf(pair,"4H",45); d1d=get_tf(pair,"1D",180)
+                rr["d1h"],rr["d4h"],rr["d1d"]=d1h,d4h,d1d
+                rr["v36_ema"]=v36_ema_pattern_engine(rr["d15"],d1h,d4h,d1d,rr["v33_pullback"])
+                rr["today_structure"]=simple_today_structure(rr["d15"],bars=96)
+            except Exception as exc:
+                rr["v36_ema"]={"signal":"WAIT","score":0,"long_score":0,"short_score":0}
+                rr["error"]=f"{rr.get('pair')}: MTF {type(exc).__name__}: {exc}"
+            return rr
+
+        with ThreadPoolExecutor(max_workers=min(v34_workers,6)) as ex:
+            fs=[ex.submit(add_mtf,rr) for rr in targets]
+            for i,f in enumerate(as_completed(fs),1):
+                rr=f.result(); sig=(rr.get("v36_ema") or {}).get("signal","WAIT")
+                if sig.startswith("LONG") or sig.startswith("SHORT"):
+                    results.append(rr); stats["directional"]+=1; stats["ready" if sig.endswith("READY") else "watch"]+=1
+                else: stats["wait"]+=1
+                if rr.get("error") and len(errors)<25: errors.append(rr["error"])
+                bar.progress(40+int(i/max(len(targets),1)*50),text=f"Phase 2/2 — MTF confirmation {i}/{len(targets)}…")
+
         if not results:
-            fallback = []
-            for rr in results_cache:
-                try:
-                    stx = rr.get("today_structure") or {}
-                    p = dict(rr.get("v33_pullback") or {})
-                    ema = rr.get("v36_ema") or {}
-                    side = "LONG" if (ema.get("signal", "").startswith("LONG")) else "SHORT" if (ema.get("signal", "").startswith("SHORT")) else stx.get("side")
+            for rr in phase1[:20]:
+                p=dict(rr.get("v33_pullback") or {})
+                if rr.get("pre_side")=="LONG":
+                    p.update({"signal":"LONG WATCH","stage":"15m EMA/STRUCTURE → WAIT FOR MTF CONFIRMATION","reason":"Bullish 15m EMA/structure candidate found across the market; wait for MTF confirmation."})
+                elif rr.get("pre_side")=="SHORT":
+                    p.update({"signal":"SHORT WATCH","stage":"15m EMA/STRUCTURE → WAIT FOR MTF CONFIRMATION","reason":"Bearish 15m EMA/structure candidate found across the market; wait for MTF confirmation."})
+                else: continue
+                rr["v33_pullback"]=p; results.append(rr)
+            stats["watch"]=len(results); stats["directional"]=len(results)
 
-                    if side in ("LONG", "WATCH LONG"):
-                        p.update({
-                            "signal": "LONG WATCH",
-                            "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
-                            "score": max(float(p.get("score", 0)), 55),
-                            "reason": "Recent 15m HH/HL structure detected. Wait for EMA20 pullback, hold, and local-high break."
-                        })
-                        rr2 = dict(rr)
-                        rr2["v33_pullback"] = p
-                        fallback.append(rr2)
-
-                    elif side in ("SHORT", "WATCH SHORT"):
-                        p.update({
-                            "signal": "SHORT WATCH",
-                            "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
-                            "score": max(float(p.get("score", 0)), 55),
-                            "reason": "Recent 15m LH/LL structure detected. Wait for EMA20 retest, rejection, and local-low break."
-                        })
-                        rr2 = dict(rr)
-                        rr2["v33_pullback"] = p
-                        fallback.append(rr2)
-                except Exception:
-                    continue
-            results = fallback
-            stats["watch"] = len(results)
-            stats["directional"] = len(results)
-
-
-        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score", 0)))
-        enrich = results[:20]
-
-        with ThreadPoolExecutor(max_workers=min(v34_workers, 4)) as ex:
-            futures = [ex.submit(v33_attach_mtf_path, r) for r in enrich]
-            for future in as_completed(futures):
-                try:
-                    future.result()
+        results.sort(key=lambda r:-float((r.get("v36_ema") or {}).get("score",0)))
+        enrich=results[:20]
+        with ThreadPoolExecutor(max_workers=min(v34_workers,4)) as ex:
+            fs=[ex.submit(v33_attach_mtf_path,r) for r in enrich]
+            for f in as_completed(fs):
+                try: f.result()
                 except Exception as exc:
-                    if len(errors) < 25:
-                        errors.append(f"MTF enrichment: {type(exc).__name__}: {exc}")
-
-        results = v33_rank(enrich)
-
-        st.session_state["v34_results"] = results
-        st.session_state["v34_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["v34_total"] = total
-        st.session_state["v34_stats"] = stats
-        st.session_state["v34_errors"] = errors
-
-        bar.progress(100, text=f"Complete — {total} Futures checked")
-
+                    if len(errors)<25: errors.append(f"S/R enrichment: {type(exc).__name__}: {exc}")
+        results=v33_rank(enrich)
+        st.session_state["v34_results"]=results
+        st.session_state["v34_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["v34_total"]=total
+        st.session_state["v34_stats"]=stats
+        st.session_state["v34_errors"]=errors
+        bar.progress(100,text=f"Complete — {total} Futures scanned")
     except Exception as e:
         st.error(f"V36 scan failed: {type(e).__name__}: {e}")
 
