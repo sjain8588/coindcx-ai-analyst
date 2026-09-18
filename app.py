@@ -5944,3 +5944,578 @@ st.caption(
     "V36 rule: EMA20/EMA50 touch is a setup, not an entry. The decision combines EMA + structure + RSI + MACD + ADX + volume + ATR/VWAP/Bollinger/OBV + MTF. "
     "READY requires the actual local high/low break. WATCH means the setup is forming but the trigger is missing. WAIT means the evidence is mixed. Manual signals are analysis-only; no live orders are placed."
 )
+
+
+# =============================================================================
+# V36.5 — WALK-FORWARD / DUMMY-TRADE BACKTEST LAB
+# =============================================================================
+# Purpose:
+#   Test the actual V36 READY decision historically using only information that
+#   would have been available at that candle close. Entries occur on the NEXT
+#   15m candle open, so the backtest does not enter on the same candle that
+#   generated the signal.
+#
+#   Higher timeframes are derived from historical 15m candles and aligned only
+#   through the test timestamp. This keeps the test practical and avoids
+#   thousands of extra API calls while preventing future higher-timeframe data
+#   from leaking into an earlier decision.
+#
+#   This is a research/paper-trading simulation, not a profit guarantee.
+# =============================================================================
+
+from datetime import datetime as _dt, timedelta as _td
+
+@st.cache_data(ttl=900, show_spinner=False)
+def v365_historical_15m(pair, start_ts, end_ts, chunk_days=5):
+    """Fetch historical 15m candles in small chunks to avoid API row limits."""
+    frames = []
+    step = int(chunk_days * 86400)
+    cur = int(start_ts)
+    end_ts = int(end_ts)
+    while cur < end_ts:
+        nxt = min(cur + step, end_ts)
+        try:
+            d = candles(pair, "15", cur, nxt)
+            if d is not None and not d.empty:
+                frames.append(d)
+        except Exception:
+            pass
+        cur = nxt
+    if not frames:
+        return pd.DataFrame()
+    x = pd.concat(frames, ignore_index=True)
+    x = x.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    return x
+
+
+def v365_resample_closed_15m(d15, cutoff):
+    """Create completed 1H/4H/1D bars using only 15m data <= cutoff."""
+    if d15 is None or d15.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    x = d15.copy()
+    x["time"] = pd.to_datetime(x["time"], utc=True, errors="coerce")
+    x = x.dropna(subset=["time"])
+    x = x[x["time"] <= cutoff].copy()
+    if x.empty:
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    x = x.set_index("time")
+    agg = {
+        "open":"first", "high":"max", "low":"min",
+        "close":"last", "volume":"sum"
+    }
+    out = []
+    for rule in ("1h", "4h", "1D"):
+        z = x.resample(rule, label="right", closed="right").agg(agg).dropna().reset_index()
+        # A bar ending after the decision time is incomplete and must not be used.
+        z = z[z["time"] <= cutoff].reset_index(drop=True)
+        # v36 functions call completed(), so append a harmless sentinel row.
+        if not z.empty:
+            sent = z.iloc[[-1]].copy()
+            sent["time"] = cutoff + _td(seconds=1)
+            z = pd.concat([z, sent], ignore_index=True)
+        out.append(z)
+    return out[0], out[1], out[2]
+
+
+def v365_prepare_decision_frames(d15_all, idx):
+    """Return frames whose last real candle is exactly the signal candle."""
+    if idx < 1 or idx >= len(d15_all):
+        return None
+    cutoff = pd.to_datetime(d15_all.iloc[idx]["time"], utc=True)
+    # Add the next 15m candle as a sentinel so completed() retains idx.
+    base = d15_all.iloc[:idx+1].copy().reset_index(drop=True)
+    d15 = base.copy()
+    if not d15.empty:
+        sent = d15.iloc[[-1]].copy()
+        sent["time"] = cutoff + _td(seconds=1)
+        d15 = pd.concat([d15, sent], ignore_index=True)
+    d1h, d4h, d1d = v365_resample_closed_15m(base, cutoff)
+    return d15, d1h, d4h, d1d, cutoff
+
+
+def v365_trade_result(side, entry, stop, target, bar, fee_pct, slip_pct):
+    """Return intrabar outcome. If stop and target hit in the same candle,
+    conservatively assume STOP was hit first."""
+    if side == "LONG":
+        if entry <= 0 or stop >= entry or target <= entry:
+            return None
+        stop_hit = float(bar["low"]) <= stop
+        target_hit = float(bar["high"]) >= target
+        if stop_hit and target_hit:
+            exit_price = stop * (1.0 - slip_pct/100.0)
+            reason = "STOP (same-bar conflict)"
+        elif stop_hit:
+            exit_price = stop * (1.0 - slip_pct/100.0)
+            reason = "STOP"
+        elif target_hit:
+            exit_price = target * (1.0 - slip_pct/100.0)
+            reason = "TARGET 2R"
+        else:
+            return None
+        gross = (exit_price / entry - 1.0) * 100.0
+    else:
+        if entry <= 0 or stop <= entry or target >= entry:
+            return None
+        stop_hit = float(bar["high"]) >= stop
+        target_hit = float(bar["low"]) <= target
+        if stop_hit and target_hit:
+            exit_price = stop * (1.0 + slip_pct/100.0)
+            reason = "STOP (same-bar conflict)"
+        elif stop_hit:
+            exit_price = stop * (1.0 + slip_pct/100.0)
+            reason = "STOP"
+        elif target_hit:
+            exit_price = target * (1.0 + slip_pct/100.0)
+            reason = "TARGET 2R"
+        else:
+            return None
+        gross = (entry / exit_price - 1.0) * 100.0
+    # Approximate round-trip fee on notional. Slippage is already reflected in
+    # the execution prices.
+    net = gross - (2.0 * fee_pct)
+    return net, exit_price, reason
+
+
+def v365_backtest_one_coin(pair, symbol, d15, risk_pct=1.0, leverage=10.0,
+                           rr=2.0, fee_pct=0.05, slip_pct=0.02,
+                           max_hold_bars=96, check_every=1):
+    """Backtest V36 READY signals on one coin with next-bar entries."""
+    if d15 is None or d15.empty or len(d15) < 300:
+        return [], f"{symbol}: insufficient 15m history ({len(d15) if d15 is not None else 0})"
+
+    x = d15.copy().sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    trades = []
+    open_trade = None
+    # Start after enough history exists for EMA200 + structure.
+    start = 260
+
+    for i in range(start, len(x) - 1, max(1, int(check_every))):
+        bar = x.iloc[i]
+        # Manage an already-open position first.
+        if open_trade is not None:
+            tr = open_trade
+            result = v365_trade_result(
+                tr["side"], tr["entry"], tr["stop"], tr["target"],
+                bar, fee_pct, slip_pct
+            )
+            bars_held = i - tr["entry_idx"]
+            if result is not None:
+                net_pct, exit_price, reason = result
+                # R multiple is based on the original price risk.
+                if tr["side"] == "LONG":
+                    r_mult = (exit_price - tr["entry"]) / (tr["entry"] - tr["stop"])
+                else:
+                    r_mult = (tr["entry"] - exit_price) / (tr["stop"] - tr["entry"])
+                trades.append({
+                    **tr,
+                    "exit_time": bar["time"],
+                    "exit": exit_price,
+                    "exit_reason": reason,
+                    "bars_held": bars_held,
+                    "net_price_pct": net_pct,
+                    "R": r_mult,
+                })
+                open_trade = None
+                continue
+            if bars_held >= max_hold_bars:
+                exit_price = float(bar["close"])
+                if tr["side"] == "LONG":
+                    gross = (exit_price / tr["entry"] - 1.0) * 100.0
+                    r_mult = (exit_price - tr["entry"]) / (tr["entry"] - tr["stop"])
+                else:
+                    gross = (tr["entry"] / exit_price - 1.0) * 100.0
+                    r_mult = (tr["entry"] - exit_price) / (tr["stop"] - tr["entry"])
+                net_pct = gross - 2.0 * fee_pct
+                trades.append({
+                    **tr,
+                    "exit_time": bar["time"],
+                    "exit": exit_price,
+                    "exit_reason": "TIME EXIT",
+                    "bars_held": bars_held,
+                    "net_price_pct": net_pct,
+                    "R": r_mult,
+                })
+                open_trade = None
+                continue
+
+        # No position: evaluate the decision at this completed candle.
+        if open_trade is not None:
+            continue
+
+        prepared = v365_prepare_decision_frames(x, i)
+        if prepared is None:
+            continue
+        d15_dec, d1h, d4h, d1d, cutoff = prepared
+        try:
+            p = v33_pullback_signal(d15_dec, float(x.iloc[i]["close"]))
+            dec = v36_advanced_decision(d15_dec, d1h, d4h, d1d, p)
+        except Exception:
+            continue
+
+        signal = dec.get("signal", "WAIT")
+        if signal not in ("LONG READY", "SHORT READY"):
+            continue
+
+        # Entry occurs on NEXT candle OPEN, never on the signal candle.
+        next_bar = x.iloc[i+1]
+        entry_raw = float(next_bar["open"])
+        side = "LONG" if signal == "LONG READY" else "SHORT"
+
+        invalidation = v6_num(p.get("invalidation"), np.nan)
+        atr = v6_num((dec.get("indicators") or {}).get("atr"), np.nan)
+        if not np.isfinite(invalidation) or invalidation <= 0:
+            if not np.isfinite(atr) or atr <= 0:
+                continue
+            stop = entry_raw - 1.5 * atr if side == "LONG" else entry_raw + 1.5 * atr
+        else:
+            stop = float(invalidation)
+
+        # Apply a small execution slippage to entry.
+        entry = entry_raw * (1.0 + slip_pct/100.0) if side == "LONG" else entry_raw * (1.0 - slip_pct/100.0)
+
+        risk_per_unit = (entry - stop) if side == "LONG" else (stop - entry)
+        if risk_per_unit <= 0 or entry <= 0:
+            continue
+        risk_pct_price = risk_per_unit / entry
+        if risk_pct_price <= 0 or risk_pct_price > 0.25:
+            # Ignore pathological stops wider than 25% of price.
+            continue
+
+        target = entry + rr * risk_per_unit if side == "LONG" else entry - rr * risk_per_unit
+
+        # Position sizing is risk based, capped by leverage. This lets the
+        # report show what a 1% account-risk model would have done without
+        # pretending that leverage itself creates edge.
+        desired_notional = risk_pct / 100.0 / risk_pct_price
+        notional_cap = max(1.0, float(leverage))
+        effective_notional_multiple = min(desired_notional, notional_cap)
+        effective_risk_pct = effective_notional_multiple * risk_pct_price * 100.0
+
+        open_trade = {
+            "pair": pair, "Coin": symbol, "side": side,
+            "signal_time": cutoff,
+            "entry_time": next_bar["time"],
+            "entry": entry, "stop": stop, "target": target,
+            "score": int(dec.get("score", 0)),
+            "long_score": int(dec.get("long_score", 0)),
+            "short_score": int(dec.get("short_score", 0)),
+            "why": dec.get("why", "—"),
+            "next_step": dec.get("next_step", "—"),
+            "risk_pct": effective_risk_pct,
+            "notional_multiple": effective_notional_multiple,
+            "entry_idx": i+1,
+        }
+
+    # Close any final open trade at the last available close.
+    if open_trade is not None:
+        last = x.iloc[-1]
+        tr = open_trade
+        exit_price = float(last["close"])
+        if tr["side"] == "LONG":
+            gross = (exit_price / tr["entry"] - 1.0) * 100.0
+            r_mult = (exit_price - tr["entry"]) / (tr["entry"] - tr["stop"])
+        else:
+            gross = (tr["entry"] / exit_price - 1.0) * 100.0
+            r_mult = (tr["entry"] - exit_price) / (tr["stop"] - tr["entry"])
+        trades.append({
+            **tr,
+            "exit_time": last["time"],
+            "exit": exit_price,
+            "exit_reason": "END OF TEST",
+            "bars_held": len(x) - 1 - tr["entry_idx"],
+            "net_price_pct": gross - 2.0 * fee_pct,
+            "R": r_mult,
+        })
+    return trades, ""
+
+
+def v365_backtest_summary(trades):
+    if not trades:
+        return {
+            "trades":0, "wins":0, "losses":0, "win_rate":0.0,
+            "net_R":0.0, "profit_factor":np.nan, "expectancy_R":0.0,
+            "max_dd_R":0.0, "avg_win_R":0.0, "avg_loss_R":0.0,
+            "longs":0, "shorts":0
+        }
+    r = pd.to_numeric(pd.Series([t.get("R", np.nan) for t in trades]), errors="coerce").dropna()
+    wins = r[r > 0]
+    losses = r[r <= 0]
+    gross_win = float(wins.sum()) if len(wins) else 0.0
+    gross_loss = abs(float(losses.sum())) if len(losses) else 0.0
+    pf = gross_win / gross_loss if gross_loss > 0 else np.inf
+    equity = r.cumsum()
+    peak = equity.cummax()
+    dd = equity - peak
+    return {
+        "trades":len(r), "wins":len(wins), "losses":len(losses),
+        "win_rate":100.0*len(wins)/len(r),
+        "net_R":float(r.sum()),
+        "profit_factor":pf,
+        "expectancy_R":float(r.mean()),
+        "max_dd_R":abs(float(dd.min())) if len(dd) else 0.0,
+        "avg_win_R":float(wins.mean()) if len(wins) else 0.0,
+        "avg_loss_R":float(losses.mean()) if len(losses) else 0.0,
+        "longs":sum(1 for t in trades if t.get("side")=="LONG"),
+        "shorts":sum(1 for t in trades if t.get("side")=="SHORT"),
+    }
+
+
+def v365_backtest_portfolio(trade_rows, starting_equity=10000.0):
+    """Convert each trade's R into a simple sequential paper-equity curve.
+
+    R is the cleanest cross-coin comparison. This curve intentionally treats
+    trades sequentially for reporting; it is NOT a simultaneous portfolio
+    capital-allocation simulation.
+    """
+    if not trade_rows:
+        return pd.DataFrame(), 0.0
+    rows = sorted(trade_rows, key=lambda z: pd.to_datetime(z["exit_time"], utc=True))
+    equity = float(starting_equity)
+    curve = []
+    for t in rows:
+        risk_dollars = equity * max(0.0, float(t.get("risk_pct", 1.0))) / 100.0
+        pnl = risk_dollars * float(t.get("R", 0.0))
+        equity += pnl
+        curve.append({"time":pd.to_datetime(t["exit_time"], utc=True), "equity":equity})
+    return pd.DataFrame(curve), equity
+
+
+st.divider()
+st.header("🧪 V36.5 — Dummy-Trade Backtest")
+st.caption(
+    "This section tests the actual V36 READY signal historically. "
+    "The signal is evaluated at a completed 15m candle, the dummy trade enters "
+    "at the NEXT 15m candle open, and stop/target are checked candle-by-candle. "
+    "No live orders are placed."
+)
+
+bt1, bt2, bt3 = st.columns(3)
+with bt1:
+    bt_days = st.selectbox("Backtest history", [7, 14, 30, 45], index=2, key="v365_days")
+with bt2:
+    bt_universe = st.selectbox(
+        "Backtest universe",
+        ["Current V36 candidates", "10 active Futures", "20 active Futures", "50 active Futures"],
+        index=0, key="v365_universe"
+    )
+with bt3:
+    bt_workers = st.slider("Backtest workers", 1, 6, 4, 1, key="v365_workers")
+
+bt4, bt5, bt6 = st.columns(3)
+with bt4:
+    bt_risk = st.number_input("Risk per trade (%)", min_value=0.25, max_value=3.0, value=1.0, step=0.25, key="v365_risk")
+with bt5:
+    bt_leverage = st.selectbox("Leverage cap", [1, 3, 5, 10], index=3, key="v365_lev")
+with bt6:
+    bt_rr = st.selectbox("Take-profit (R)", [1.5, 2.0, 2.5, 3.0], index=1, key="v365_rr")
+
+bt7, bt8, bt9 = st.columns(3)
+with bt7:
+    bt_fee = st.number_input("Fee per side (%)", min_value=0.0, max_value=0.20, value=0.05, step=0.01, key="v365_fee")
+with bt8:
+    bt_slip = st.number_input("Slippage per side (%)", min_value=0.0, max_value=0.20, value=0.02, step=0.01, key="v365_slip")
+with bt9:
+    bt_hold = st.selectbox("Max holding time", [24, 48, 96, 192], index=2, key="v365_hold")
+
+bt_pairs_text = st.text_input(
+    "Optional custom Futures pairs (comma separated)",
+    placeholder="BTC_USDT, ETH_USDT, SOL_USDT",
+    key="v365_custom_pairs"
+)
+
+st.info(
+    "Recommended first test: 30–45 days, 10–20 liquid Futures, READY-only entries, "
+    "1% risk, 10x leverage cap, 2R target. The important outputs are trade count, "
+    "win rate, profit factor, expectancy in R and maximum drawdown — not just net profit."
+)
+
+if st.button("🧪 RUN V36.5 BACKTEST — DUMMY TRADES", type="primary", key="v365_run"):
+    bt_bar = st.progress(0, text="Preparing backtest universe…")
+    bt_errors = []
+    try:
+        instruments = active_instruments("USDT")
+        discovered = []
+        seen = set()
+        for inst in instruments:
+            pair = v61_instrument_pair(inst)
+            if not pair:
+                continue
+            pair = str(pair).strip().upper()
+            norm = pair.replace("_","").replace("-","").replace("/","")
+            if norm in seen or "USDT" not in norm:
+                continue
+            seen.add(norm)
+            discovered.append((pair, v61_symbol(inst, pair)))
+
+        custom = [z.strip().upper() for z in bt_pairs_text.split(",") if z.strip()]
+        if custom:
+            universe = []
+            for pair in custom:
+                universe.append((pair, pair))
+        elif bt_universe == "Current V36 candidates":
+            current = st.session_state.get("v34_results", [])
+            universe = [(r.get("pair"), r.get("symbol", r.get("pair"))) for r in current if r.get("pair")]
+            if not universe:
+                universe = discovered[:10]
+                bt_universe_label = "10 active Futures (fallback)"
+            else:
+                bt_universe_label = f"{len(universe)} current V36 candidates"
+        else:
+            n = int(bt_universe.split()[0])
+            universe = discovered[:n]
+            bt_universe_label = f"{n} active Futures"
+        if custom:
+            bt_universe_label = f"{len(universe)} custom pairs"
+
+        end_dt = pd.Timestamp.now(tz="UTC")
+        start_dt = end_dt - pd.Timedelta(days=int(bt_days))
+        start_ts = int(start_dt.timestamp())
+        end_ts = int(end_dt.timestamp())
+
+        all_trades = []
+        per_coin = []
+        total = len(universe)
+        if total == 0:
+            raise RuntimeError("No backtest pairs were available.")
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def fetch_and_test(item):
+            pair, symbol = item
+            d = v365_historical_15m(pair, start_ts, end_ts, 5)
+            if d is None or d.empty:
+                return pair, symbol, [], f"{symbol}: no historical 15m data"
+            trades, err = v365_backtest_one_coin(
+                pair, symbol, d,
+                risk_pct=float(bt_risk),
+                leverage=float(bt_leverage),
+                rr=float(bt_rr),
+                fee_pct=float(bt_fee),
+                slip_pct=float(bt_slip),
+                max_hold_bars=int(bt_hold),
+                check_every=1
+            )
+            return pair, symbol, trades, err
+
+        done = 0
+        with ThreadPoolExecutor(max_workers=int(bt_workers)) as ex:
+            futures = [ex.submit(fetch_and_test, u) for u in universe]
+            for f in as_completed(futures):
+                done += 1
+                pair, symbol, trades, err = f.result()
+                all_trades.extend(trades)
+                s = v365_backtest_summary(trades)
+                per_coin.append({
+                    "Coin": symbol, "Trades": s["trades"], "Win rate": f'{s["win_rate"]:.1f}%',
+                    "Net R": f'{s["net_R"]:+.2f}', "PF": "∞" if np.isinf(s["profit_factor"]) else f'{s["profit_factor"]:.2f}',
+                    "Expectancy R": f'{s["expectancy_R"]:+.3f}', "Max DD R": f'{s["max_dd_R"]:.2f}',
+                    "LONG": s["longs"], "SHORT": s["shorts"]
+                })
+                if err:
+                    bt_errors.append(err)
+                bt_bar.progress(int(done/max(total,1)*85), text=f"Backtesting {done}/{total} coins…")
+
+        overall = v365_backtest_summary(all_trades)
+        curve, final_equity = v365_backtest_portfolio(all_trades, 10000.0)
+
+        st.session_state["v365_trades"] = all_trades
+        st.session_state["v365_summary"] = overall
+        st.session_state["v365_per_coin"] = per_coin
+        st.session_state["v365_curve"] = curve
+        st.session_state["v365_final_equity"] = final_equity
+        st.session_state["v365_bt_errors"] = bt_errors
+        st.session_state["v365_label"] = bt_universe_label
+        st.session_state["v365_window"] = f"{start_dt.strftime('%Y-%m-%d')} → {end_dt.strftime('%Y-%m-%d')}"
+        bt_bar.progress(100, text=f"Backtest complete — {overall['trades']} dummy trades")
+    except Exception as exc:
+        bt_bar.progress(100, text="Backtest failed")
+        st.error(f"V36.5 backtest failed: {type(exc).__name__}: {exc}")
+
+_bt_sum = st.session_state.get("v365_summary")
+_bt_trades = st.session_state.get("v365_trades", [])
+if _bt_sum is not None:
+    st.subheader("📊 Backtest Result")
+    st.caption(
+        f"Window: {st.session_state.get('v365_window','—')} | "
+        f"Universe: {st.session_state.get('v365_label','—')} | "
+        f"READY-only entries | Next-bar-open execution"
+    )
+
+    m1,m2,m3,m4,m5,m6 = st.columns(6)
+    m1.metric("Trades", _bt_sum["trades"])
+    m2.metric("Win rate", f'{_bt_sum["win_rate"]:.1f}%')
+    pf = _bt_sum["profit_factor"]
+    m3.metric("Profit factor", "∞" if np.isinf(pf) else f'{pf:.2f}')
+    m4.metric("Net R", f'{_bt_sum["net_R"]:+.2f}')
+    m5.metric("Expectancy", f'{_bt_sum["expectancy_R"]:+.3f} R')
+    m6.metric("Max DD", f'{_bt_sum["max_dd_R"]:.2f} R')
+
+    if _bt_sum["trades"] == 0:
+        st.warning(
+            "No historical V36 READY trades were found in this sample. "
+            "That is a valid result — it means the strategy is very selective, "
+            "or the sample/universe is too small. Increase history/universe before drawing conclusions."
+        )
+    else:
+        st.write(
+            f"**Plain English:** {_bt_sum['wins']} winning trades and {_bt_sum['losses']} losing trades. "
+            f"Average winning trade = {_bt_sum['avg_win_R']:+.2f}R; average losing trade = {_bt_sum['avg_loss_R']:+.2f}R. "
+            f"LONG trades = {_bt_sum['longs']}; SHORT trades = {_bt_sum['shorts']}."
+        )
+        if _bt_sum["expectancy_R"] > 0 and _bt_sum["profit_factor"] > 1:
+            st.success(
+                "The historical sample has positive expectancy and profit factor above 1. "
+                "That is evidence worth further testing, not proof of future profitability."
+            )
+        else:
+            st.warning(
+                "The historical sample does not show positive expectancy and profit factor above 1. "
+                "Treat the current strategy as needing refinement rather than assuming an edge."
+            )
+
+        curve = st.session_state.get("v365_curve")
+        if curve is not None and not curve.empty:
+            st.markdown("### Paper-equity curve")
+            st.line_chart(curve.set_index("time")["equity"])
+            st.caption(
+                "The displayed equity curve applies the configured risk per trade to a sequential "
+                "trade stream. It is for strategy comparison and is not a simultaneous multi-position account simulation."
+            )
+
+        pc = st.session_state.get("v365_per_coin", [])
+        if pc:
+            st.markdown("### Results by coin")
+            st.dataframe(pd.DataFrame(pc).sort_values(["Trades","Net R"], ascending=[False,False]),
+                         use_container_width=True, hide_index=True)
+
+        st.markdown("### Dummy trades")
+        trade_table = []
+        for t in sorted(_bt_trades, key=lambda z: pd.to_datetime(z["entry_time"], utc=True)):
+            trade_table.append({
+                "Coin":t.get("Coin","—"),
+                "Side":t.get("side","—"),
+                "Signal":f'{t.get("side","—")} READY',
+                "Signal time":str(t.get("signal_time","—")),
+                "Entry":v13_format_price(t.get("entry")),
+                "Stop":v13_format_price(t.get("stop")),
+                "Target":v13_format_price(t.get("target")),
+                "Exit":v13_format_price(t.get("exit")),
+                "Result":f'{t.get("R",0):+.2f}R',
+                "Price P/L":f'{t.get("net_price_pct",0):+.2f}%',
+                "Exit reason":t.get("exit_reason","—"),
+                "Score":t.get("score",0),
+                "Why":t.get("why","—"),
+            })
+        st.dataframe(pd.DataFrame(trade_table), use_container_width=True, hide_index=True)
+
+        st.info(
+            "Backtest discipline: no same-candle entries, no future higher-timeframe candles, "
+            "conservative stop-first handling when stop and target are both touched in one candle, "
+            "fees/slippage included, and leverage is capped rather than treated as an edge."
+        )
+
+    errs = st.session_state.get("v365_bt_errors", [])
+    if errs:
+        with st.expander("Backtest data errors"):
+            for e in errs[:50]:
+                st.write(e)
