@@ -5758,7 +5758,28 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                     elif q.get("mdi",0)>q.get("pdi",0): ss+=5
                 side="LONG" if ls>ss else "SHORT" if ss>ls else "WAIT"
                 priority=max(ls,ss)+float(p.get("score",0))/20.0
-                return {"pair":pair,"symbol":symbol,"price":price,"d15":d15,"v33_pullback":p,"pre_side":side,"pre_score":priority},None
+
+                # Reuse the same 15m candles already fetched for the full V36
+                # market scan. This gives Pump Hunter a true 24h mover ranking
+                # without making another 539 candle requests.
+                c15 = completed(d15)
+                pump_24h = np.nan
+                volume_24h = np.nan
+                volume_ratio = q.get("vol_ratio", np.nan)
+                if c15 is not None and len(c15) >= 97:
+                    closes = pd.to_numeric(c15["close"], errors="coerce").dropna()
+                    vols = pd.to_numeric(c15["volume"], errors="coerce").dropna()
+                    if len(closes) >= 97 and float(closes.iloc[-97]) > 0:
+                        pump_24h = (float(closes.iloc[-1]) / float(closes.iloc[-97]) - 1.0) * 100.0
+                    if len(vols) >= 96:
+                        volume_24h = float(vols.tail(96).sum())
+
+                return {
+                    "pair":pair,"symbol":symbol,"price":price,"d15":d15,
+                    "v33_pullback":p,"pre_side":side,"pre_score":priority,
+                    "pump_24h":pump_24h,"volume_24h":volume_24h,
+                    "volume_ratio":volume_ratio
+                },None
             except Exception as exc:
                 return None,f"{pair}: {type(exc).__name__}: {exc}"
 
@@ -5826,6 +5847,21 @@ if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", 
                     if len(errors)<25: errors.append(f"S/R enrichment: {type(exc).__name__}: {exc}")
         results=v33_rank(enrich)
         st.session_state["v34_results"]=results
+
+        # Lightweight snapshot for V36.7 Pump Hunter. We intentionally store
+        # metrics only; the full d15 DataFrames are not kept for every coin.
+        st.session_state["v367_market_snapshot"] = [
+            {
+                "pair": rr.get("pair"),
+                "symbol": rr.get("symbol"),
+                "price": rr.get("price"),
+                "pump_24h": rr.get("pump_24h", np.nan),
+                "volume_24h": rr.get("volume_24h", np.nan),
+                "volume_ratio": rr.get("volume_ratio", np.nan),
+            }
+            for rr in phase1
+            if rr.get("pair")
+        ]
         st.session_state["v34_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         st.session_state["v34_total"]=total
         st.session_state["v34_stats"]=stats
@@ -6840,153 +6876,110 @@ def v366_pump_decision(pair, symbol, price, d15, d1h, d4h, d1d, pump_pct, vol24h
         return None
 
 
-def v366_scan_top_pumps(max_coins=10, workers=6):
-    """Market-wide pump scan.
+def v367_scan_top_pumps(max_coins=10, workers=6):
+    """Fast market-wide Pump Hunter.
 
-    First tries 24h change/volume from the Futures real-time feed. If the feed
-    does not expose usable 24h percentage changes, it falls back to historical
-    15m candles for the whole discovered universe. Only the top movers receive
-    the expensive multi-timeframe pump/reversal analysis.
+    V36 already scans every active Futures contract on 15m. V36.7 reuses those
+    results to rank the strongest 24h movers, then fetches 15m/1H/4H/1D data
+    ONLY for the top movers. This avoids the previous design's 500+ extra
+    historical candle requests, which could appear to hang.
     """
-    instruments = active_instruments("USDT")
-    prices_raw = futures_prices()
-    price_map = v366_normalize_live_map(prices_raw)
+    snapshot = st.session_state.get("v367_market_snapshot", [])
+    if not snapshot:
+        raise RuntimeError(
+            "Run the main V36 market scan once first. V36.7 reuses its 539-coin "
+            "15m scan to identify the highest-pumped Futures without making "
+            "another hundreds-of-requests scan."
+        )
 
-    universe = []
-    seen = set()
-    for inst in instruments:
-        pair = v61_instrument_pair(inst)
-        if not pair:
-            continue
-        pair = str(pair).strip().upper()
-        norm = pair.replace("_","").replace("-","").replace("/","")
-        if norm in seen or "USDT" not in norm:
-            continue
-        seen.add(norm)
-        symbol = v61_symbol(inst, pair)
-        live = v61_price_for_pair(prices_raw, pair)
-        rec = price_map.get(pair, {})
-        chg = v366_extract_24h_change(rec)
-        vol24 = v366_extract_24h_volume(rec)
-        universe.append({"pair":pair, "symbol":symbol, "price":live, "pump":chg, "vol24":vol24})
-
-    # If CoinDCX's ticker payload has 24h change, use it directly. Otherwise
-    # calculate 24h return from 15m candles.
-    usable_change = sum(np.isfinite(x["pump"]) for x in universe)
-    errors = []
-    if usable_change < max(20, int(len(universe) * 0.25)):
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-        def calc24(item):
-            try:
-                d = get_tf(item["pair"], "15m", 3)
-                c = completed(d)
-                if c is None or len(c) < 100:
-                    return item["pair"], np.nan, item["vol24"], "insufficient 15m history"
-                close = pd.to_numeric(c["close"], errors="coerce").dropna()
-                vol = pd.to_numeric(c["volume"], errors="coerce").dropna()
-                if len(close) < 97:
-                    return item["pair"], np.nan, item["vol24"], "insufficient 24h candles"
-                pump = (float(close.iloc[-1]) / float(close.iloc[-97]) - 1.0) * 100.0
-                vol24 = float(vol.tail(96).sum())
-                return item["pair"], pump, vol24, ""
-            except Exception as exc:
-                return item["pair"], np.nan, item["vol24"], f"{type(exc).__name__}: {exc}"
-        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
-            fs = [ex.submit(calc24, x) for x in universe]
-            done = 0
-            for f in as_completed(fs):
-                done += 1
-                pair, pump, vol24, err = f.result()
-                for x in universe:
-                    if x["pair"] == pair:
-                        if np.isfinite(pump): x["pump"] = pump
-                        if np.isfinite(vol24): x["vol24"] = vol24
-                        break
-                if err and len(errors) < 25:
-                    errors.append(f"{pair}: {err}")
-
-    universe = [x for x in universe if np.isfinite(x["pump"]) and np.isfinite(x["price"]) and x["price"] > 0]
-    universe.sort(key=lambda x: x["pump"], reverse=True)
-    top = universe[:max(1, int(max_coins))]
+    valid = [
+        x for x in snapshot
+        if np.isfinite(v6_num(x.get("price"), np.nan))
+        and float(v6_num(x.get("price"), np.nan)) > 0
+        and np.isfinite(v6_num(x.get("pump_24h"), np.nan))
+    ]
+    valid.sort(key=lambda x: float(x["pump_24h"]), reverse=True)
+    top = valid[:max(1, int(max_coins))]
 
     from concurrent.futures import ThreadPoolExecutor, as_completed
     results = []
+    errors = []
+
     def analyze(item):
         try:
-            pair, symbol, price = item["pair"], item["symbol"], float(item["price"])
-            # Enough history for V10's 3D/5D/7D context.
+            pair = item["pair"]
+            symbol = item.get("symbol", pair)
+            price = float(item["price"])
             data = {
                 "15m": get_tf(pair, "15m", 8),
                 "1H": get_tf(pair, "1H", 12),
                 "4H": get_tf(pair, "4H", 35),
                 "1D": get_tf(pair, "1D", 180),
             }
-            return v366_pump_decision(
+            r = v366_pump_decision(
                 pair, symbol, price,
                 data["15m"], data["1H"], data["4H"], data["1D"],
-                float(item["pump"]), item["vol24"]
+                float(item["pump_24h"]), item.get("volume_24h", np.nan)
             )
+            return r, None
         except Exception as exc:
-            return {"pair":item["pair"], "symbol":item["symbol"], "error":f"{type(exc).__name__}: {exc}"}
+            return None, f"{item.get('pair','?')}: {type(exc).__name__}: {exc}"
 
     with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
         fs = [ex.submit(analyze, x) for x in top]
         for f in as_completed(fs):
-            r = f.result()
-            if r and "error" not in r:
+            r, err = f.result()
+            if r:
                 results.append(r)
-            elif r:
-                errors.append(f"{r.get('pair','?')}: {r.get('error','unknown error')}")
+            if err:
+                errors.append(err)
 
     results.sort(key=lambda r: float(r.get("pump_24h", -999999)), reverse=True)
-    return results, len(universe), errors
+    return results, len(valid), errors
 
 
 st.divider()
-st.header("🚀 V36.6 — Highest Pump Hunter")
+st.header("🚀 V36.7 — Highest Pump Hunter")
 st.caption(
-    "This module finds the strongest currently pumping USDT Futures and then "
-    "checks whether the move is setting up a continuation LONG, a confirmed "
-    "reversal SHORT, or simply a WAIT. A pump/high volume alone is never an entry."
+    "Ranks the strongest current USDT Futures using the 15m data already "
+    "collected by the main V36 scan, then deeply analyzes only the top movers."
 )
 
-ph1, ph2, ph3 = st.columns(3)
+ph1, ph2 = st.columns(2)
 with ph1:
-    ph_top = st.selectbox("Top pumped coins", [5, 10, 15], index=1, key="v366_top")
+    ph_top = st.selectbox("Top pumped coins", [5, 10, 15], index=1, key="v367_top")
 with ph2:
-    ph_workers = st.slider("Pump scan workers", 2, 8, 6, 1, key="v366_workers")
-with ph3:
-    ph_refresh = st.caption("Refresh by running the scan again.")
+    ph_workers = st.slider("Pump analysis workers", 2, 8, 6, 1, key="v367_workers")
 
 st.info(
-    "**How to use it:** the highest pump is not automatically a SHORT. "
-    "V36.6 waits for reversal structure (LH + LL), bearish EMA/momentum and a "
-    "local-low break before calling SHORT READY. If the pump remains healthy, "
-    "it can instead show LONG WATCH for a pullback/next leg. This is a fast-move "
-    "research tool, not a promise of quick profit."
+    "**First run the main V36 market scan, then run Pump Hunter.** "
+    "V36.7 reuses the 539-coin 15m scan, so it does not repeat hundreds of "
+    "historical API requests. A large pump is NOT automatically a SHORT: "
+    "SHORT requires reversal structure and a local-low break. A healthy pump "
+    "can instead produce a LONG WATCH/READY continuation setup."
 )
 
-if st.button("🚀 SCAN HIGHEST PUMPED COINS NOW", type="primary", key="v366_run"):
-    ph_bar = st.progress(0, text="Finding the strongest current Futures movers…")
+if st.button("🚀 SCAN HIGHEST PUMPED COINS NOW", type="primary", key="v367_run"):
+    ph_bar = st.progress(0, text="Ranking the 24h movers from the V36 market scan…")
     try:
-        ph_bar.progress(15, text="Loading active USDT Futures…")
-        ph_results, ph_universe, ph_errors = v366_scan_top_pumps(
+        ph_bar.progress(20, text="Selecting the highest-pumped Futures…")
+        ph_results, ph_universe, ph_errors = v367_scan_top_pumps(
             max_coins=int(ph_top), workers=int(ph_workers)
         )
-        st.session_state["v366_results"] = ph_results
-        st.session_state["v366_universe"] = ph_universe
-        st.session_state["v366_errors"] = ph_errors
-        st.session_state["v366_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ph_bar.progress(100, text=f"Complete — analyzed top {len(ph_results)} pumped coins")
+        st.session_state["v367_results"] = ph_results
+        st.session_state["v367_universe"] = ph_universe
+        st.session_state["v367_errors"] = ph_errors
+        st.session_state["v367_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ph_bar.progress(100, text=f"Complete — deeply analyzed {len(ph_results)} top movers")
     except Exception as exc:
-        ph_bar.progress(100, text="Pump scan failed")
-        st.error(f"V36.6 pump scan failed: {type(exc).__name__}: {exc}")
+        ph_bar.progress(100, text="Pump scan stopped")
+        st.error(f"V36.7 Pump Hunter: {type(exc).__name__}: {exc}")
 
-_ph = st.session_state.get("v366_results", [])
+_ph = st.session_state.get("v367_results", [])
 if _ph:
     st.caption(
-        f"Last pump scan: {st.session_state.get('v366_time','—')} | "
-        f"USDT Futures ranked: {st.session_state.get('v366_universe','—')} | "
+        f"Last pump scan: {st.session_state.get('v367_time','—')} | "
+        f"24h movers ranked from: {st.session_state.get('v367_universe','—')} Futures | "
         f"Top movers analyzed: {len(_ph)}"
     )
 
@@ -7009,16 +7002,16 @@ if _ph:
         })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-    st.markdown("### 🧠 Why is the highest-pumped coin getting this decision?")
+    st.markdown("### 🧠 Simple explanation")
     for r in _ph:
         with st.expander(
             f"{r.get('symbol','—')} — {r.get('decision','WAIT')} — 24h {r.get('pump_24h',0):+.1f}%",
             expanded=(r is _ph[0])
         ):
             st.write(f"**Why:** {r.get('why','—')}")
-            st.write(f"**Next step:** {r.get('next_step','—')}")
+            st.write(f"**What to wait for:** {r.get('next_step','—')}")
             st.write(
-                f"**Indicator snapshot:** RSI {r.get('rsi',np.nan):.1f} | "
+                f"**Indicators:** RSI {r.get('rsi',np.nan):.1f} | "
                 f"MACD {'bullish' if r.get('macd_hist',0) > 0 else 'bearish'} | "
                 f"ADX {r.get('adx',np.nan):.1f} | "
                 f"15m volume {r.get('volume_ratio',np.nan):.1f}x | "
@@ -7026,11 +7019,10 @@ if _ph:
             )
             if r.get("warnings"):
                 st.warning("**Caution:** " + "; ".join(r["warnings"]))
-else:
-    st.info("Run the pump scan to identify the strongest current Futures movers.")
 
-_ph_err = st.session_state.get("v366_errors", [])
+_ph_err = st.session_state.get("v367_errors", [])
 if _ph_err:
-    with st.expander("Pump scan data errors"):
+    with st.expander("Pump Hunter data errors"):
         for e in _ph_err[:25]:
             st.write(e)
+
