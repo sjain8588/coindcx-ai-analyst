@@ -6519,3 +6519,518 @@ if _bt_sum is not None:
         with st.expander("Backtest data errors"):
             for e in errs[:50]:
                 st.write(e)
+
+
+# =============================================================================
+# V36.6 — LIVE PUMP HUNTER / PUMP REVERSAL & NEXT-LEG MODULE
+# =============================================================================
+# Finds the strongest currently pumping USDT Futures contracts and then asks:
+#   1) Is the pump still healthy and potentially setting up a next leg LONG?
+#   2) Has the pump started reversing, creating a SHORT setup?
+#   3) Is it simply too extended / not confirmed yet?
+#
+# A large pump or high volume NEVER creates a trade by itself.
+# The module requires price structure + EMA + RSI + MACD + ADX + volume and
+# higher-timeframe context before calling a setup actionable.
+# =============================================================================
+
+def v366_pick_number(rec, keys):
+    if not isinstance(rec, dict):
+        return np.nan
+    for k in keys:
+        if k in rec:
+            val = v6_num(rec.get(k), np.nan)
+            if np.isfinite(val):
+                return float(val)
+    return np.nan
+
+
+def v366_extract_24h_change(rec):
+    """Flexible extraction for CoinDCX ticker field-name variations."""
+    pct = v366_pick_number(rec, [
+        "change_24h_pct", "change24h_pct", "price_change_percent_24h",
+        "price_change_pct_24h", "change_percent_24h", "change_24h",
+        "change24h", "percent_change_24h", "price_change_percent",
+        "change_percent", "change_pct"
+    ])
+    # Some feeds return absolute 24h change rather than percent. Only use
+    # clearly named percent fields first; absolute fields are intentionally
+    # excluded to avoid treating a price difference as a percentage.
+    return pct
+
+
+def v366_extract_24h_volume(rec):
+    return v366_pick_number(rec, [
+        "volume_24h", "quote_volume_24h", "turnover_24h",
+        "volume24h", "quoteVolume24h", "volume"
+    ])
+
+
+def v366_normalize_live_map(prices):
+    out = {}
+    if isinstance(prices, dict):
+        for key, rec in prices.items():
+            if isinstance(rec, dict):
+                pair = rec.get("pair") or rec.get("symbol") or rec.get("mkt") or rec.get("market") or key
+                out[str(pair).strip().upper()] = rec
+            else:
+                out[str(key).strip().upper()] = {"pair": key, "price": rec}
+    elif isinstance(prices, list):
+        for rec in prices:
+            if not isinstance(rec, dict):
+                continue
+            pair = rec.get("pair") or rec.get("symbol") or rec.get("mkt") or rec.get("market")
+            if pair:
+                out[str(pair).strip().upper()] = rec
+    return out
+
+
+def v366_pump_decision(pair, symbol, price, d15, d1h, d4h, d1d, pump_pct, vol24h=np.nan):
+    """Plain-English decision for a currently pumped coin."""
+    try:
+        c15 = completed(d15)
+        if c15 is None or c15.empty:
+            return None
+
+        ind15 = indicators(c15)
+        if ind15.empty:
+            return None
+        r = ind15.iloc[-1]
+        rsi = v6_num(r.get("rsi"), np.nan)
+        adx = v6_num(r.get("adx"), np.nan)
+        pdi = v6_num(r.get("pdi"), np.nan)
+        mdi = v6_num(r.get("mdi"), np.nan)
+        macd = v6_num(r.get("macd"), np.nan)
+        macds = v6_num(r.get("macd_signal"), np.nan)
+        hist = v6_num(r.get("macd_hist"), np.nan)
+        vr = v6_num(r.get("vol_ratio"), np.nan)
+        atrp = v6_num(r.get("atr_pct"), np.nan)
+        vwap_dist = v6_num(r.get("vwap_dist_pct"), np.nan)
+        bbwidth = v6_num(r.get("bb_width_pct"), np.nan)
+
+        s15 = v71_structure_tf(c15, "15m")
+        c1h = completed(d1h)
+        c4 = completed(d4h)
+        c1d = completed(d1d)
+        s1h = v71_structure_tf(c1h, "1H") if c1h is not None and not c1h.empty else {}
+        s4 = v71_structure_tf(c4, "4H") if c4 is not None and not c4.empty else {}
+
+        e15 = v71_ema_transition(c15, 8)
+        e4 = v71_ema_transition(c4, 6) if c4 is not None and not c4.empty else {}
+        e1d = v71_ema_transition(c1d, 6) if c1d is not None and not c1d.empty else {}
+
+        # Recent 15m move and distance from recent high.
+        close = pd.to_numeric(c15["close"], errors="coerce").dropna()
+        recent_high = float(pd.to_numeric(c15["high"], errors="coerce").tail(96).max()) if len(c15) else np.nan
+        from_recent_high = (price / recent_high - 1.0) * 100.0 if np.isfinite(recent_high) and recent_high > 0 else np.nan
+
+        # Use V10's mature pump/reversal logic when enough history exists.
+        v10 = None
+        try:
+            v10 = v10_extreme_move_signal(
+                pair, symbol,
+                {"15m": d15, "1H": d1h, "4H": d4h, "1D": d1d},
+                price
+            )
+        except Exception:
+            v10 = None
+
+        long_score = 0
+        short_score = 0
+        long_reasons = []
+        short_reasons = []
+        blockers = []
+
+        # Pump context: this module is intentionally about the strongest movers.
+        if np.isfinite(pump_pct):
+            if pump_pct >= 30: long_score += 15; short_score += 15
+            elif pump_pct >= 20: long_score += 12; short_score += 12
+            elif pump_pct >= 10: long_score += 8; short_score += 8
+            long_reasons.append(f"24h pump +{pump_pct:.1f}%")
+            short_reasons.append(f"24h pump +{pump_pct:.1f}%")
+
+        # LONG = continuation / next-leg after a healthy pullback.
+        if s15.get("hh") and s15.get("hl"):
+            long_score += 20; long_reasons.append("15m HH + HL intact")
+        elif s15.get("hh") or s15.get("hl"):
+            long_score += 10; long_reasons.append("15m structure improving")
+        else:
+            blockers.append("15m does not yet show a clean HH + HL continuation structure")
+
+        if e15.get("bullish"):
+            long_score += 12; long_reasons.append("15m EMA structure bullish")
+        if e4.get("bullish"):
+            long_score += 8; long_reasons.append("4H EMA structure bullish")
+        if e1d.get("bullish"):
+            long_score += 5; long_reasons.append("1D EMA structure bullish")
+
+        if np.isfinite(rsi):
+            if 52 <= rsi <= 68:
+                long_score += 10; long_reasons.append(f"RSI {rsi:.0f} shows healthy bullish momentum")
+            elif 68 < rsi <= 75:
+                long_score += 4; long_reasons.append(f"RSI {rsi:.0f} is strong but becoming extended")
+            elif rsi > 75:
+                blockers.append(f"RSI {rsi:.0f} is very extended; avoid chasing the pump")
+            elif rsi < 45:
+                blockers.append(f"RSI {rsi:.0f} does not confirm bullish momentum")
+
+        if np.isfinite(macd) and np.isfinite(macds):
+            if macd > macds and hist > 0:
+                long_score += 10; long_reasons.append("MACD confirms bullish momentum")
+            elif macd < macds:
+                blockers.append("MACD has not confirmed the bullish continuation")
+
+        if np.isfinite(adx):
+            if adx >= 25:
+                long_score += 8; long_reasons.append(f"ADX {adx:.0f} confirms trend strength")
+            elif adx >= 20:
+                long_score += 4; long_reasons.append(f"ADX {adx:.0f} shows a developing trend")
+            else:
+                blockers.append(f"ADX {adx:.0f} is weak")
+
+        if np.isfinite(vr):
+            if vr >= 1.5:
+                long_score += 8; long_reasons.append(f"15m volume is {vr:.1f}x its average")
+            elif vr >= 1.2:
+                long_score += 4; long_reasons.append(f"15m volume is {vr:.1f}x average")
+
+        if np.isfinite(vwap_dist) and vwap_dist > 0:
+            long_score += 4; long_reasons.append("price is above rolling VWAP")
+
+        if np.isfinite(bbwidth) and np.isfinite(atrp):
+            if bbwidth > 5 and atrp > 1:
+                long_score += 5; long_reasons.append("volatility is expanding")
+
+        # SHORT = reversal after the pump. We deliberately require structure.
+        if s15.get("lh") and s15.get("ll"):
+            short_score += 25; short_reasons.append("15m LH + LL confirms reversal")
+        elif s15.get("lh") or s15.get("ll"):
+            short_score += 10; short_reasons.append("15m structure is weakening")
+        else:
+            blockers.append("no confirmed 15m LH + LL yet; do not short the pump")
+
+        if e15.get("bearish"):
+            short_score += 12; short_reasons.append("15m EMA structure turned bearish")
+        if e15.get("fresh_bearish"):
+            short_score += 8; short_reasons.append("fresh bearish EMA transition")
+        if e4.get("bearish"):
+            short_score += 8; short_reasons.append("4H EMA structure bearish")
+
+        if np.isfinite(rsi):
+            if 30 <= rsi <= 48:
+                short_score += 10; short_reasons.append(f"RSI {rsi:.0f} confirms weakening momentum")
+            elif rsi < 30:
+                short_score += 3; short_reasons.append(f"RSI {rsi:.0f} is oversold; short is becoming late")
+            elif rsi > 60:
+                blockers.append(f"RSI {rsi:.0f} is still strong; short confirmation is weak")
+
+        if np.isfinite(macd) and np.isfinite(macds):
+            if macd < macds and hist < 0:
+                short_score += 10; short_reasons.append("MACD confirms bearish momentum")
+            elif macd > macds:
+                blockers.append("MACD remains bullish; no confirmed short")
+
+        if np.isfinite(adx):
+            if adx >= 25:
+                short_score += 8; short_reasons.append(f"ADX {adx:.0f} confirms trend strength")
+            elif adx >= 20:
+                short_score += 4; short_reasons.append(f"ADX {adx:.0f} shows a developing trend")
+
+        if np.isfinite(mdi) and np.isfinite(pdi) and mdi > pdi:
+            short_score += 5; short_reasons.append("-DI is above +DI")
+
+        if np.isfinite(vr) and vr >= 1.5:
+            short_score += 6; short_reasons.append(f"reversal volume is {vr:.1f}x average")
+
+        if np.isfinite(from_recent_high):
+            if from_recent_high <= -3:
+                short_score += 6; short_reasons.append(f"price is {abs(from_recent_high):.1f}% below the recent 15m high")
+            elif from_recent_high > -1:
+                blockers.append("price is still very close to the high; short trigger has not developed")
+
+        # MTF context: used as confirmation, not automatic reversal.
+        mtf_bull = sum(bool(x.get("bullish")) for x in (e4, e1d, e15))
+        mtf_bear = sum(bool(x.get("bearish")) for x in (e4, e1d, e15))
+        if mtf_bull >= 2:
+            long_score += 8; long_reasons.append("higher-timeframe trend supports continuation")
+        if mtf_bear >= 2:
+            short_score += 8; short_reasons.append("higher-timeframe trend supports the reversal")
+
+        # V10 result is a secondary sanity check, not a replacement for V36.
+        v10_side = v10.get("side") if v10 else None
+        v10_score = int(v10.get("score", 0)) if v10 else 0
+        if v10_side == "SHORT" and v10_score >= V10_MIN_SCORE:
+            short_score += 5; short_reasons.append("multi-day pump/reversal model also sees SHORT risk")
+        elif v10_side == "LONG" and v10_score >= V10_MIN_SCORE:
+            long_score += 5; long_reasons.append("multi-day pump model sees a possible next leg")
+
+        # Final state: no automatic short just because the coin pumped.
+        # LONG READY requires bullish structure + confirmation + local-high break.
+        local_hi = float(pd.to_numeric(c15["high"], errors="coerce").tail(20).iloc[:-1].max()) if len(c15) >= 22 else np.nan
+        local_lo = float(pd.to_numeric(c15["low"], errors="coerce").tail(20).iloc[:-1].min()) if len(c15) >= 22 else np.nan
+        long_break = np.isfinite(local_hi) and price > local_hi
+        short_break = np.isfinite(local_lo) and price < local_lo
+
+        # Avoid using generic blockers to suppress the opposite side incorrectly.
+        long_ready = long_score >= 65 and long_break and s15.get("hh") and s15.get("hl") and not (np.isfinite(rsi) and rsi > 78)
+        short_ready = short_score >= 65 and short_break and s15.get("lh") and s15.get("ll")
+
+        if long_ready and long_score >= short_score:
+            decision = "🟢 LONG READY"
+            next_step = "Bullish breakout confirmed. If trading, define stop below the latest structural HL."
+            chosen = long_score
+            reasons = long_reasons
+        elif short_ready and short_score > long_score:
+            decision = "🔴 SHORT READY"
+            next_step = "Bearish breakdown confirmed. If trading, define stop above the latest structural LH."
+            chosen = short_score
+            reasons = short_reasons
+        elif short_score >= 55 and short_score > long_score and (s15.get("lh") or s15.get("ll")):
+            decision = "🔴 SHORT WATCH"
+            next_step = "Do NOT short the pump yet. Wait for confirmed LH + LL and a local-low break."
+            chosen = short_score
+            reasons = short_reasons
+        elif long_score >= 55 and long_score >= short_score:
+            decision = "🟡 LONG WATCH"
+            next_step = "Do NOT chase the pump. Wait for a controlled pullback/EMA20-50 hold and local-high break."
+            chosen = long_score
+            reasons = long_reasons
+        else:
+            decision = "⚪ WAIT"
+            next_step = "No clean confirmation. Let the pump develop before considering either side."
+            chosen = max(long_score, short_score)
+            reasons = long_reasons if long_score >= short_score else short_reasons
+
+        # A pump that is extremely stretched should explicitly warn the user.
+        if np.isfinite(rsi) and rsi > 75:
+            blockers.append("pump is overextended on RSI; do not chase LONG")
+        if np.isfinite(vwap_dist) and vwap_dist > 8:
+            blockers.append(f"price is {vwap_dist:.1f}% above rolling VWAP; move is stretched")
+
+        why_parts = []
+        for q in reasons:
+            if q not in why_parts:
+                why_parts.append(q)
+        why = "; ".join(why_parts[:6]) if why_parts else "Indicators are mixed."
+        if blockers:
+            why += ". Caution: " + "; ".join(dict.fromkeys(blockers)[:3])
+
+        return {
+            "pair": pair, "symbol": symbol, "price": float(price),
+            "pump_24h": float(pump_pct) if np.isfinite(pump_pct) else np.nan,
+            "volume_24h": float(vol24h) if np.isfinite(vol24h) else np.nan,
+            "decision": decision,
+            "score": int(max(0, min(100, chosen))),
+            "long_score": int(max(0, min(100, long_score))),
+            "short_score": int(max(0, min(100, short_score))),
+            "rsi": rsi, "adx": adx, "volume_ratio": vr,
+            "macd_hist": hist, "atr_pct": atrp, "vwap_dist_pct": vwap_dist,
+            "from_recent_high": from_recent_high,
+            "ema20": v6_num(r.get("ema20"), np.nan),
+            "ema50": v6_num(r.get("ema50"), np.nan),
+            "next_step": next_step,
+            "why": why + ".",
+            "reasons": reasons[:10],
+            "warnings": list(dict.fromkeys(blockers))[:8],
+            "local_high": local_hi, "local_low": local_lo,
+            "long_break": bool(long_break), "short_break": bool(short_break),
+            "v10_side": v10_side or "—", "v10_score": v10_score,
+        }
+    except Exception:
+        return None
+
+
+def v366_scan_top_pumps(max_coins=10, workers=6):
+    """Market-wide pump scan.
+
+    First tries 24h change/volume from the Futures real-time feed. If the feed
+    does not expose usable 24h percentage changes, it falls back to historical
+    15m candles for the whole discovered universe. Only the top movers receive
+    the expensive multi-timeframe pump/reversal analysis.
+    """
+    instruments = active_instruments("USDT")
+    prices_raw = futures_prices()
+    price_map = v366_normalize_live_map(prices_raw)
+
+    universe = []
+    seen = set()
+    for inst in instruments:
+        pair = v61_instrument_pair(inst)
+        if not pair:
+            continue
+        pair = str(pair).strip().upper()
+        norm = pair.replace("_","").replace("-","").replace("/","")
+        if norm in seen or "USDT" not in norm:
+            continue
+        seen.add(norm)
+        symbol = v61_symbol(inst, pair)
+        live = v61_price_for_pair(prices_raw, pair)
+        rec = price_map.get(pair, {})
+        chg = v366_extract_24h_change(rec)
+        vol24 = v366_extract_24h_volume(rec)
+        universe.append({"pair":pair, "symbol":symbol, "price":live, "pump":chg, "vol24":vol24})
+
+    # If CoinDCX's ticker payload has 24h change, use it directly. Otherwise
+    # calculate 24h return from 15m candles.
+    usable_change = sum(np.isfinite(x["pump"]) for x in universe)
+    errors = []
+    if usable_change < max(20, int(len(universe) * 0.25)):
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        def calc24(item):
+            try:
+                d = get_tf(item["pair"], "15m", 3)
+                c = completed(d)
+                if c is None or len(c) < 100:
+                    return item["pair"], np.nan, item["vol24"], "insufficient 15m history"
+                close = pd.to_numeric(c["close"], errors="coerce").dropna()
+                vol = pd.to_numeric(c["volume"], errors="coerce").dropna()
+                if len(close) < 97:
+                    return item["pair"], np.nan, item["vol24"], "insufficient 24h candles"
+                pump = (float(close.iloc[-1]) / float(close.iloc[-97]) - 1.0) * 100.0
+                vol24 = float(vol.tail(96).sum())
+                return item["pair"], pump, vol24, ""
+            except Exception as exc:
+                return item["pair"], np.nan, item["vol24"], f"{type(exc).__name__}: {exc}"
+        with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+            fs = [ex.submit(calc24, x) for x in universe]
+            done = 0
+            for f in as_completed(fs):
+                done += 1
+                pair, pump, vol24, err = f.result()
+                for x in universe:
+                    if x["pair"] == pair:
+                        if np.isfinite(pump): x["pump"] = pump
+                        if np.isfinite(vol24): x["vol24"] = vol24
+                        break
+                if err and len(errors) < 25:
+                    errors.append(f"{pair}: {err}")
+
+    universe = [x for x in universe if np.isfinite(x["pump"]) and np.isfinite(x["price"]) and x["price"] > 0]
+    universe.sort(key=lambda x: x["pump"], reverse=True)
+    top = universe[:max(1, int(max_coins))]
+
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    results = []
+    def analyze(item):
+        try:
+            pair, symbol, price = item["pair"], item["symbol"], float(item["price"])
+            # Enough history for V10's 3D/5D/7D context.
+            data = {
+                "15m": get_tf(pair, "15m", 8),
+                "1H": get_tf(pair, "1H", 12),
+                "4H": get_tf(pair, "4H", 35),
+                "1D": get_tf(pair, "1D", 180),
+            }
+            return v366_pump_decision(
+                pair, symbol, price,
+                data["15m"], data["1H"], data["4H"], data["1D"],
+                float(item["pump"]), item["vol24"]
+            )
+        except Exception as exc:
+            return {"pair":item["pair"], "symbol":item["symbol"], "error":f"{type(exc).__name__}: {exc}"}
+
+    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
+        fs = [ex.submit(analyze, x) for x in top]
+        for f in as_completed(fs):
+            r = f.result()
+            if r and "error" not in r:
+                results.append(r)
+            elif r:
+                errors.append(f"{r.get('pair','?')}: {r.get('error','unknown error')}")
+
+    results.sort(key=lambda r: float(r.get("pump_24h", -999999)), reverse=True)
+    return results, len(universe), errors
+
+
+st.divider()
+st.header("🚀 V36.6 — Highest Pump Hunter")
+st.caption(
+    "This module finds the strongest currently pumping USDT Futures and then "
+    "checks whether the move is setting up a continuation LONG, a confirmed "
+    "reversal SHORT, or simply a WAIT. A pump/high volume alone is never an entry."
+)
+
+ph1, ph2, ph3 = st.columns(3)
+with ph1:
+    ph_top = st.selectbox("Top pumped coins", [5, 10, 15], index=1, key="v366_top")
+with ph2:
+    ph_workers = st.slider("Pump scan workers", 2, 8, 6, 1, key="v366_workers")
+with ph3:
+    ph_refresh = st.caption("Refresh by running the scan again.")
+
+st.info(
+    "**How to use it:** the highest pump is not automatically a SHORT. "
+    "V36.6 waits for reversal structure (LH + LL), bearish EMA/momentum and a "
+    "local-low break before calling SHORT READY. If the pump remains healthy, "
+    "it can instead show LONG WATCH for a pullback/next leg. This is a fast-move "
+    "research tool, not a promise of quick profit."
+)
+
+if st.button("🚀 SCAN HIGHEST PUMPED COINS NOW", type="primary", key="v366_run"):
+    ph_bar = st.progress(0, text="Finding the strongest current Futures movers…")
+    try:
+        ph_bar.progress(15, text="Loading active USDT Futures…")
+        ph_results, ph_universe, ph_errors = v366_scan_top_pumps(
+            max_coins=int(ph_top), workers=int(ph_workers)
+        )
+        st.session_state["v366_results"] = ph_results
+        st.session_state["v366_universe"] = ph_universe
+        st.session_state["v366_errors"] = ph_errors
+        st.session_state["v366_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        ph_bar.progress(100, text=f"Complete — analyzed top {len(ph_results)} pumped coins")
+    except Exception as exc:
+        ph_bar.progress(100, text="Pump scan failed")
+        st.error(f"V36.6 pump scan failed: {type(exc).__name__}: {exc}")
+
+_ph = st.session_state.get("v366_results", [])
+if _ph:
+    st.caption(
+        f"Last pump scan: {st.session_state.get('v366_time','—')} | "
+        f"USDT Futures ranked: {st.session_state.get('v366_universe','—')} | "
+        f"Top movers analyzed: {len(_ph)}"
+    )
+
+    rows = []
+    for r in _ph:
+        rows.append({
+            "Coin": r.get("symbol","—"),
+            "24h Pump": f'{r.get("pump_24h",0):+.1f}%',
+            "Decision": r.get("decision","WAIT"),
+            "Score": r.get("score",0),
+            "LONG": r.get("long_score",0),
+            "SHORT": r.get("short_score",0),
+            "RSI": f'{r.get("rsi",np.nan):.1f}' if np.isfinite(r.get("rsi",np.nan)) else "—",
+            "MACD": "BULL" if r.get("macd_hist",0) > 0 else "BEAR",
+            "ADX": f'{r.get("adx",np.nan):.1f}' if np.isfinite(r.get("adx",np.nan)) else "—",
+            "Vol": f'{r.get("volume_ratio",np.nan):.1f}x' if np.isfinite(r.get("volume_ratio",np.nan)) else "—",
+            "EMA20/50": f'{v13_format_price(r.get("ema20"))}/{v13_format_price(r.get("ema50"))}',
+            "From 15m High": f'{r.get("from_recent_high",np.nan):+.1f}%' if np.isfinite(r.get("from_recent_high",np.nan)) else "—",
+            "Next": r.get("next_step","—"),
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.markdown("### 🧠 Why is the highest-pumped coin getting this decision?")
+    for r in _ph:
+        with st.expander(
+            f"{r.get('symbol','—')} — {r.get('decision','WAIT')} — 24h {r.get('pump_24h',0):+.1f}%",
+            expanded=(r is _ph[0])
+        ):
+            st.write(f"**Why:** {r.get('why','—')}")
+            st.write(f"**Next step:** {r.get('next_step','—')}")
+            st.write(
+                f"**Indicator snapshot:** RSI {r.get('rsi',np.nan):.1f} | "
+                f"MACD {'bullish' if r.get('macd_hist',0) > 0 else 'bearish'} | "
+                f"ADX {r.get('adx',np.nan):.1f} | "
+                f"15m volume {r.get('volume_ratio',np.nan):.1f}x | "
+                f"EMA20 {v13_format_price(r.get('ema20'))} | EMA50 {v13_format_price(r.get('ema50'))}"
+            )
+            if r.get("warnings"):
+                st.warning("**Caution:** " + "; ".join(r["warnings"]))
+else:
+    st.info("Run the pump scan to identify the strongest current Futures movers.")
+
+_ph_err = st.session_state.get("v366_errors", [])
+if _ph_err:
+    with st.expander("Pump scan data errors"):
+        for e in _ph_err[:25]:
+            st.write(e)
