@@ -30,13 +30,25 @@ def coindcx_signed_post(path, api_key, api_secret, payload=None):
     """
     CoinDCX private API request.
 
-    IMPORTANT:
-    - Use a READ-ONLY API key for this app.
-    - Do not give the key withdrawal/order permissions.
-    - The API secret is used only in memory for the request.
+    Returns:
+        {
+          "ok": bool,
+          "status_code": int,
+          "payload": parsed JSON or None,
+          "error": str or None,
+          "request_body_keys": [...]
+        }
+
+    The diagnostic data deliberately excludes API key/secret/signature.
     """
     if not api_key or not api_secret:
-        raise RuntimeError("CoinDCX API key/secret not provided.")
+        return {
+            "ok": False,
+            "status_code": 0,
+            "payload": None,
+            "error": "CoinDCX API key/secret not provided.",
+            "request_body_keys": [],
+        }
 
     body = dict(payload or {})
     body["timestamp"] = int(time.time() * 1000)
@@ -54,29 +66,176 @@ def coindcx_signed_post(path, api_key, api_secret, payload=None):
         "X-AUTH-SIGNATURE": signature,
     }
 
-    response = requests.post(
-        API + path,
-        data=raw,
-        headers=headers,
-        timeout=30,
-    )
-
-    if response.status_code >= 400:
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text[:500]
-        raise RuntimeError(
-            f"CoinDCX private API HTTP {response.status_code}: {detail}"
+    try:
+        response = requests.post(
+            API + path,
+            data=raw,
+            headers=headers,
+            timeout=30,
         )
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status_code": 0,
+            "payload": None,
+            "error": f"Network/request error: {exc}",
+            "request_body_keys": sorted(body.keys()),
+        }
 
     try:
-        return response.json()
+        parsed = response.json()
     except Exception:
-        raise RuntimeError(
-            f"CoinDCX private API returned non-JSON response: "
-            f"{response.text[:500]}"
+        parsed = None
+
+    if response.status_code >= 400:
+        # Do not expose credentials. Return only a compact API error.
+        detail = ""
+        if isinstance(parsed, dict):
+            for k in ["code", "message", "msg", "error"]:
+                if k in parsed:
+                    detail = str(parsed[k])
+                    break
+        if not detail:
+            detail = response.text[:300]
+
+        return {
+            "ok": False,
+            "status_code": response.status_code,
+            "payload": parsed,
+            "error": f"HTTP {response.status_code}: {detail}",
+            "request_body_keys": sorted(body.keys()),
+        }
+
+    return {
+        "ok": True,
+        "status_code": response.status_code,
+        "payload": parsed,
+        "error": None,
+        "request_body_keys": sorted(body.keys()),
+    }
+
+
+def _response_shape(payload):
+    """
+    Return safe structural diagnostics only — no credentials and no raw
+    position values.
+    """
+    info = {
+        "top_type": type(payload).__name__,
+        "top_keys": [],
+        "data_type": "",
+        "data_count": None,
+        "item_keys": [],
+        "status_fields": {},
+    }
+
+    if isinstance(payload, dict):
+        info["top_keys"] = sorted(str(k) for k in payload.keys())
+
+        for k in ["code", "message", "msg", "status", "success"]:
+            if k in payload:
+                value = payload[k]
+                # Safe scalar metadata only.
+                if isinstance(value, (str, int, float, bool)):
+                    info["status_fields"][k] = value
+
+        for key in ["data", "positions", "result", "active_positions"]:
+            if key in payload:
+                value = payload[key]
+                info["data_type"] = type(value).__name__
+                if isinstance(value, list):
+                    info["data_count"] = len(value)
+                    if value and isinstance(value[0], dict):
+                        info["item_keys"] = sorted(
+                            str(k) for k in value[0].keys()
+                        )
+                elif isinstance(value, dict):
+                    info["item_keys"] = sorted(
+                        str(k) for k in value.keys()
+                    )
+                break
+
+    elif isinstance(payload, list):
+        info["data_type"] = "list"
+        info["data_count"] = len(payload)
+        if payload and isinstance(payload[0], dict):
+            info["item_keys"] = sorted(
+                str(k) for k in payload[0].keys()
+            )
+
+    return info
+
+
+def fetch_open_positions_diagnostic(api_key, api_secret):
+    """
+    Try the common CoinDCX Futures position request bodies.
+
+    We stop at the first response that contains a non-empty position-like
+    collection. If all are empty, diagnostics are returned so the user can
+    see whether authentication, endpoint shape, or parsing is the problem.
+    """
+    attempts = [
+        {},
+        {"page": 1, "size": 100},
+        {"page": 1, "size": 100, "margin_currency_short_name": "USDT"},
+    ]
+
+    diagnostics = []
+
+    for request_body in attempts:
+        result = coindcx_signed_post(
+            PRIVATE_POSITIONS_ENDPOINT,
+            api_key,
+            api_secret,
+            request_body,
         )
+
+        shape = _response_shape(result.get("payload"))
+        diagnostics.append({
+            "request_keys": sorted(request_body.keys()),
+            "http_status": result.get("status_code"),
+            "ok": result.get("ok"),
+            "error": result.get("error"),
+            "shape": shape,
+        })
+
+        if not result.get("ok"):
+            # Authentication/permission errors are useful to show directly.
+            continue
+
+        rows = extract_position_rows(result.get("payload"))
+
+        if rows:
+            return rows, diagnostics
+
+    return [], diagnostics
+
+
+def diagnostic_text(diagnostics):
+    lines = []
+
+    for i, d in enumerate(diagnostics, 1):
+        shape = d.get("shape", {})
+        line = (
+            f"Attempt {i}: HTTP {d.get('http_status')} | "
+            f"ok={d.get('ok')} | "
+            f"top={shape.get('top_type')} | "
+            f"data_type={shape.get('data_type')} | "
+            f"data_count={shape.get('data_count')} | "
+            f"top_keys={shape.get('top_keys')}"
+        )
+
+        if d.get("error"):
+            line += f" | error={d['error']}"
+
+        if shape.get("item_keys"):
+            line += f" | item_keys={shape['item_keys']}"
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
+
 
 
 def _first_number(obj, keys, default=np.nan):
@@ -225,14 +384,9 @@ def extract_position_rows(payload):
 
 
 def fetch_open_positions(api_key, api_secret):
-    payload = coindcx_signed_post(
-        PRIVATE_POSITIONS_ENDPOINT,
-        api_key,
-        api_secret,
-        {},
+    rows, diagnostics = fetch_open_positions_diagnostic(
+        api_key, api_secret
     )
-
-    rows = extract_position_rows(payload)
 
     positions = []
     for row in rows:
@@ -241,13 +395,15 @@ def fetch_open_positions(api_key, api_secret):
 
         p = normalize_position(row)
 
-        # Ignore zero/closed positions where the API exposes a size.
+        # Keep non-zero active positions. If the API does not expose a size,
+        # retain the row so we can inspect it instead of silently discarding it.
         if np.isfinite(p["quantity"]) and abs(p["quantity"]) < 1e-15:
             continue
 
         positions.append(p)
 
-    return positions
+    return positions, diagnostics
+
 
 
 def current_price_from_15m(pair):
@@ -910,6 +1066,13 @@ st.caption(
     "15m / 4H / 1D / 1M structure, support/resistance and position risk."
 )
 
+if scan and live_mode:
+    st.info(
+        "The app now tests multiple supported Futures-position request "
+        "formats and reports the response structure if CoinDCX returns no "
+        "active positions."
+    )
+
 with st.sidebar:
     st.header("🔐 CoinDCX Live Positions")
 
@@ -968,6 +1131,7 @@ with st.sidebar:
 
 pairs = []
 live_positions = []
+position_diagnostics = []
 
 if live_mode and scan:
     try:
@@ -977,14 +1141,28 @@ if live_mode and scan:
                 "COINDCX_API_KEY and COINDCX_API_SECRET environment variables."
             )
 
-        live_positions = fetch_open_positions(api_key, api_secret)
+        live_positions, position_diagnostics = fetch_open_positions(
+            api_key, api_secret
+        )
 
         if not live_positions:
-            st.info(
-                "CoinDCX returned no open Futures positions. "
-                "If you expected positions, verify the API key permissions "
-                "and that the positions are open in the Futures account."
+            st.warning(
+                "CoinDCX did not return a non-zero open Futures position. "
+                "Open the diagnostic panel below — it will show the HTTP "
+                "status and response structure without exposing your API key "
+                "or secret."
             )
+
+            with st.expander("🔧 CoinDCX Position API Diagnostics", expanded=True):
+                st.code(
+                    diagnostic_text(position_diagnostics),
+                    language="text",
+                )
+
+                st.caption(
+                    "No API key, API secret, signature, or credential value "
+                    "is displayed here."
+                )
 
         for pos in live_positions:
             if pos["pair"] and pos["pair"] not in pairs:
