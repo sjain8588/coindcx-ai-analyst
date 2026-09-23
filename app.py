@@ -24,9 +24,6 @@ PUBLIC = "https://public.coindcx.com"
 # ============================================================
 
 PRIVATE_POSITIONS_ENDPOINT = "/exchange/v1/derivatives/futures/positions"
-PRIVATE_ACTIVE_POSITIONS_ENDPOINT = (
-    "/exchange/v1/derivatives/futures/positions/active_positions"
-)
 
 
 def coindcx_signed_post(path, api_key, api_secret, payload=None):
@@ -177,39 +174,23 @@ def _response_shape(payload):
 
 def fetch_open_positions_diagnostic(api_key, api_secret):
     """
-    Query the dedicated active-positions endpoint first.
+    Try the common CoinDCX Futures position request bodies.
 
-    The /positions endpoint can return a catalogue of futures position
-    records (one row per contract) with active_pos=0. That is not the same
-    thing as "my open positions". The dedicated active_positions endpoint is
-    therefore preferred.
-
-    We retain the older endpoint as a fallback and show which endpoint
-    produced each diagnostic result.
+    We stop at the first response that contains a non-empty position-like
+    collection. If all are empty, diagnostics are returned so the user can
+    see whether authentication, endpoint shape, or parsing is the problem.
     """
-    endpoint_attempts = [
-        (
-            "active_positions",
-            PRIVATE_ACTIVE_POSITIONS_ENDPOINT,
-            {"margin_currency_short_name": "USDT", "page": 1, "size": 100},
-        ),
-        (
-            "active_positions_minimal",
-            PRIVATE_ACTIVE_POSITIONS_ENDPOINT,
-            {},
-        ),
-        (
-            "positions",
-            PRIVATE_POSITIONS_ENDPOINT,
-            {"margin_currency_short_name": "USDT", "page": 1, "size": 100},
-        ),
+    attempts = [
+        {},
+        {"page": 1, "size": 100},
+        {"page": 1, "size": 100, "margin_currency_short_name": "USDT"},
     ]
 
     diagnostics = []
 
-    for label, endpoint, request_body in endpoint_attempts:
+    for request_body in attempts:
         result = coindcx_signed_post(
-            endpoint,
+            PRIVATE_POSITIONS_ENDPOINT,
             api_key,
             api_secret,
             request_body,
@@ -217,8 +198,6 @@ def fetch_open_positions_diagnostic(api_key, api_secret):
 
         shape = _response_shape(result.get("payload"))
         diagnostics.append({
-            "label": label,
-            "endpoint": endpoint,
             "request_keys": sorted(request_body.keys()),
             "http_status": result.get("status_code"),
             "ok": result.get("ok"),
@@ -227,29 +206,15 @@ def fetch_open_positions_diagnostic(api_key, api_secret):
         })
 
         if not result.get("ok"):
+            # Authentication/permission errors are useful to show directly.
             continue
 
         rows = extract_position_rows(result.get("payload"))
 
-        # Prefer a response containing an actually non-zero active position.
-        normalized_nonzero = []
-        for row in rows:
-            if not isinstance(row, dict):
-                continue
-            p = normalize_position(row)
-            if np.isfinite(p["active_pos"]) and abs(p["active_pos"]) > 1e-15:
-                normalized_nonzero.append(row)
-
-        if normalized_nonzero:
-            return normalized_nonzero, diagnostics
-
-        # Dedicated active_positions endpoint may already return only active
-        # positions even if quantity is represented under a different field.
-        if label.startswith("active_positions") and rows:
+        if rows:
             return rows, diagnostics
 
     return [], diagnostics
-
 
 
 def diagnostic_text(diagnostics):
@@ -260,8 +225,7 @@ def diagnostic_text(diagnostics):
         status_fields = shape.get("status_fields", {}) or {}
 
         line = (
-            f"Attempt {i} [{d.get('label', 'unknown')}] "
-            f"{d.get('endpoint', '')}: HTTP {d.get('http_status')} | "
+            f"Attempt {i}: HTTP {d.get('http_status')} | "
             f"ok={d.get('ok')} | "
             f"top={shape.get('top_type')} | "
             f"data_type={shape.get('data_type')} | "
@@ -1207,162 +1171,143 @@ def pattern_text(results):
 # APP
 # ============================================================
 
-st.title("🎯 CoinDCX Live Position Monitor")
+st.title("📌 CoinDCX My Trade Monitor")
 st.caption(
     "Reads your open CoinDCX Futures positions (read-only), then checks "
     "15m / 4H / 1D / 1M structure, support/resistance and position risk."
 )
 
 with st.sidebar:
-    st.header("🔐 CoinDCX Live Positions")
+    st.header("📌 My Current Trades")
 
     st.caption(
-        "Use a CoinDCX API key with read-only permissions. "
-        "Never enable withdrawals. This app does not place orders."
-    )
-
-    env_key = os.getenv("COINDCX_API_KEY", "")
-    env_secret = os.getenv("COINDCX_API_SECRET", "")
-
-    api_key = st.text_input(
-        "CoinDCX API Key",
-        value=env_key,
-        type="password",
-    )
-
-    api_secret = st.text_input(
-        "CoinDCX API Secret",
-        value=env_secret,
-        type="password",
-    )
-
-    live_mode = st.checkbox(
-        "Read my open Futures positions automatically",
-        value=True,
-    )
-
-    manual_mode = st.checkbox(
-        "Also allow manual coin list",
-        value=False,
+        "Enter up to 5 trades you are currently holding. "
+        "The agent reads live market data and analyzes each position."
     )
 
     manual_raw = st.text_area(
-        "Manual pairs (optional)",
-        value="B-BTC_USDT\nB-ETH_USDT",
+        "CoinDCX Futures pairs — one per line",
+        value="B-CHR_USDT\nB-BTC_USDT\nB-AKE_USDT",
         height=100,
+        help="Example: B-CHR_USDT",
     )
 
+    st.markdown("### Position details")
+
+    st.caption(
+        "Enter the side and entry price for each coin. "
+        "Leverage is optional and is shown for context."
+    )
+
+    # Parse up to 5 unique pairs from the text box.
+    manual_pairs_ui = []
+    for p in manual_raw.replace(",", "\n").splitlines():
+        p = p.strip().upper()
+        if p and p not in manual_pairs_ui:
+            manual_pairs_ui.append(p)
+
+    manual_pairs_ui = manual_pairs_ui[:5]
+
+    manual_positions = {}
+
+    for i, pair in enumerate(manual_pairs_ui):
+        st.markdown(f"**{i+1}. {pair}**")
+
+        c1, c2 = st.columns(2)
+
+        side = c1.selectbox(
+            f"Side — {pair}",
+            ["LONG", "SHORT"],
+            key=f"manual_side_{i}_{pair}",
+        )
+
+        entry = c2.number_input(
+            f"Entry — {pair}",
+            min_value=0.0,
+            value=0.0,
+            format="%.12f",
+            key=f"manual_entry_{i}_{pair}",
+        )
+
+        leverage = st.number_input(
+            f"Leverage — {pair}",
+            min_value=0.0,
+            value=0.0,
+            step=1.0,
+            format="%.1f",
+            key=f"manual_leverage_{i}_{pair}",
+        )
+
+        manual_positions[pair] = {
+            "pair": pair,
+            "side": side,
+            "entry": float(entry) if entry > 0 else np.nan,
+            "leverage": float(leverage) if leverage > 0 else np.nan,
+            "quantity": np.nan,
+            "active_pos": np.nan,
+            "mark": np.nan,
+            "liquidation": np.nan,
+            "margin": np.nan,
+            "unrealized_pnl": np.nan,
+            "realized_pnl": np.nan,
+            "take_profit": np.nan,
+            "stop_loss": np.nan,
+        }
+
     scan = st.button(
-        "🔎 READ POSITIONS + SCAN",
+        "🔎 SCAN MY CURRENT TRADES",
         type="primary",
         use_container_width=True,
     )
 
     st.markdown("---")
-    st.write("Analysis")
+    st.write("The agent checks:")
     st.write("• 15m — immediate structure")
     st.write("• 4H — primary trend")
     st.write("• 1D — major trend")
     st.write("• 1M — macro trend")
     st.write("• S1/S2/S3 + R1/R2/R3")
+    st.write("• EMA20 / RSI / volume")
+    st.write("• Position-specific P/L and risk")
 
 
 
 
-
-if scan and live_mode:
-    st.info(
-        "The app will test multiple supported Futures-position request "
-        "formats and report the response structure if CoinDCX returns no "
-        "active positions."
-    )
-
-pairs = []
+pairs = list(manual_positions.keys())
 live_positions = []
 position_diagnostics = []
 raw_position_rows = []
 
-if live_mode and scan:
-    try:
-        if not api_key or not api_secret:
-            raise RuntimeError(
-                "Enter your CoinDCX API key and secret, or set "
-                "COINDCX_API_KEY and COINDCX_API_SECRET environment variables."
-            )
+if scan:
+    missing_entry = [
+        p for p, pos in manual_positions.items()
+        if not np.isfinite(pos["entry"])
+    ]
 
-        live_positions, position_diagnostics, raw_position_rows = (
-            fetch_open_positions(api_key, api_secret)
+    if missing_entry:
+        st.warning(
+            "Please enter an entry price for: "
+            + ", ".join(missing_entry)
         )
 
-        if not live_positions:
-            st.warning(
-                "The broad positions endpoint returned contract records, but they were not your open trades. V7 first queries the dedicated active-positions endpoint. "
-                "Open the diagnostic panel below — it will show the HTTP "
-                "status and response structure without exposing your API key "
-                "or secret."
-            )
+    for p, pos in manual_positions.items():
+        if np.isfinite(pos["entry"]):
+            live_positions.append(pos)
 
-            with st.expander("🔧 CoinDCX Position API Diagnostics", expanded=True):
-                st.code(
-                    diagnostic_text(position_diagnostics),
-                    language="text",
-                )
+if len(pairs) > 5:
+    pairs = pairs[:5]
 
-                st.caption(
-                    "No API key, API secret, signature, or credential value "
-                    "is displayed here."
-                )
-
-                if raw_position_rows:
-                    st.markdown("**Safe position-row inspection (fallback endpoint)**")
-                    st.dataframe(
-                        pd.DataFrame(
-                            inspect_position_rows(raw_position_rows, limit=15)
-                        ),
-                        use_container_width=True,
-                        hide_index=True,
-                    )
-                    st.caption(
-                        "This shows position-related fields only. "
-                        "Credentials and signatures are never displayed."
-                    )
-
-                if any(
-                    d.get("http_status") == 401
-                    for d in position_diagnostics
-                ):
-                    st.error(
-                        "CoinDCX is returning HTTP 401 Unauthorized. "
-                        "This means the private API request is being rejected "
-                        "before a position list can be read. The most likely "
-                        "causes are an invalid/mismatched API key-secret pair, "
-                        "an API permission issue, or a signing/API-version "
-                        "mismatch. The exact safe response message above will "
-                        "tell us which one CoinDCX is reporting."
-                    )
-
-        for pos in live_positions:
-            if pos["pair"] and pos["pair"] not in pairs:
-                pairs.append(pos["pair"])
-
-    except Exception as exc:
-        st.error(f"Could not read CoinDCX open positions: {exc}")
-
-if manual_mode:
-    for p in manual_raw.replace(",", "\n").splitlines():
-        p = p.strip().upper()
-        if p and p not in pairs:
-            pairs.append(p)
 
 if len(pairs) > 5:
     st.warning("Only the first 5 unique pairs will be scanned.")
     pairs = pairs[:5]
 
 if not pairs:
-    st.info(
-        "Enter API credentials and click 'READ POSITIONS + SCAN', "
-        "or enable manual pairs."
-    )
+    st.info("Enter at least one Futures pair in the sidebar.")
+    st.stop()
+
+if not scan:
+    st.info("Enter your current trades in the sidebar and click **SCAN MY CURRENT TRADES**.")
     st.stop()
 
 if scan or "position_results" not in st.session_state:
