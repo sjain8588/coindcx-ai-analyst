@@ -301,38 +301,59 @@ def _first_text(obj, keys, default=""):
 
 def normalize_position(row):
     """
-    Normalize several CoinDCX position field names into one internal schema.
-    The endpoint response has changed field naming across API versions,
-    so the normalizer deliberately accepts common aliases.
+    Normalize CoinDCX Futures position records.
+
+    CoinDCX can return active position quantity under active_pos/quantity/qty/
+    size/position_size and can expose side separately or through the sign of
+    the active position.
     """
     pair = _first_text(
         row,
-        ["pair", "symbol", "instrument", "market", "contract"],
+        [
+            "pair",
+            "symbol",
+            "instrument",
+            "market",
+            "contract",
+            "market_pair",
+            "pair_name",
+        ],
         "",
     ).upper().strip()
+
+    # Preserve raw active position separately because this is the field most
+    # likely to tell us whether a returned row is actually open.
+    active_pos = _first_number(
+        row,
+        [
+            "active_pos",
+            "active_position",
+            "position_size",
+            "positionSize",
+            "quantity",
+            "qty",
+            "size",
+            "net_quantity",
+            "net_qty",
+        ],
+    )
 
     side = _first_text(
         row,
-        ["side", "position_side", "direction"],
+        ["side", "position_side", "positionSide", "direction", "position_type"],
         "",
     ).upper().strip()
-
-    qty = _first_number(
-        row,
-        ["quantity", "qty", "size", "position_size", "active_pos"],
-    )
-
-    # Some APIs expose signed active_pos instead of side.
-    if not side and np.isfinite(qty):
-        if qty > 0:
-            side = "LONG"
-        elif qty < 0:
-            side = "SHORT"
 
     if side in ("BUY", "B"):
         side = "LONG"
     elif side in ("SELL", "S"):
         side = "SHORT"
+
+    if not side and np.isfinite(active_pos):
+        if active_pos > 0:
+            side = "LONG"
+        elif active_pos < 0:
+            side = "SHORT"
 
     entry = _first_number(
         row,
@@ -347,7 +368,7 @@ def normalize_position(row):
 
     mark = _first_number(
         row,
-        ["mark_price", "markPrice", "last_price", "price"],
+        ["mark_price", "markPrice", "last_price", "price", "mark"],
     )
 
     liq = _first_number(
@@ -362,7 +383,7 @@ def normalize_position(row):
 
     margin = _first_number(
         row,
-        ["margin", "initial_margin", "position_margin"],
+        ["margin", "initial_margin", "position_margin", "locked_margin"],
     )
 
     unrealized = _first_number(
@@ -388,7 +409,8 @@ def normalize_position(row):
     return {
         "pair": pair,
         "side": side or "UNKNOWN",
-        "quantity": qty,
+        "quantity": active_pos,
+        "active_pos": active_pos,
         "entry": entry,
         "mark": mark,
         "liquidation": liq,
@@ -400,6 +422,7 @@ def normalize_position(row):
         "stop_loss": sl,
         "raw": row,
     }
+
 
 
 def extract_position_rows(payload):
@@ -422,6 +445,49 @@ def extract_position_rows(payload):
     return []
 
 
+def inspect_position_rows(rows, limit=15):
+    """
+    Safe diagnostics: show only position-relevant fields and never secrets.
+    """
+    safe = []
+
+    for row in rows[:limit]:
+        if not isinstance(row, dict):
+            continue
+
+        normalized = normalize_position(row)
+
+        # Include common raw field values only for position debugging.
+        raw_active = _first_number(
+            row,
+            [
+                "active_pos",
+                "active_position",
+                "position_size",
+                "positionSize",
+                "quantity",
+                "qty",
+                "size",
+                "net_quantity",
+                "net_qty",
+            ],
+        )
+
+        safe.append({
+            "pair": normalized["pair"],
+            "active_pos": raw_active,
+            "side": normalized["side"],
+            "entry": normalized["entry"],
+            "mark": normalized["mark"],
+            "unrealized_pnl": normalized["unrealized_pnl"],
+            "leverage": normalized["leverage"],
+            "raw_keys": sorted(str(k) for k in row.keys()),
+        })
+
+    return safe
+
+
+
 def fetch_open_positions(api_key, api_secret):
     rows, diagnostics = fetch_open_positions_diagnostic(
         api_key, api_secret
@@ -434,14 +500,20 @@ def fetch_open_positions(api_key, api_secret):
 
         p = normalize_position(row)
 
-        # Keep non-zero active positions. If the API does not expose a size,
-        # retain the row so we can inspect it instead of silently discarding it.
-        if np.isfinite(p["quantity"]) and abs(p["quantity"]) < 1e-15:
-            continue
+        # If active_pos is present and non-zero, it is an open position.
+        if np.isfinite(p["active_pos"]):
+            if abs(p["active_pos"]) > 1e-15:
+                positions.append(p)
+        else:
+            # Some response variants may omit quantity. Retain the row if it
+            # has clear position fields rather than silently discarding it.
+            if p["pair"] and (
+                np.isfinite(p["entry"])
+                or np.isfinite(p["unrealized_pnl"])
+            ):
+                positions.append(p)
 
-        positions.append(p)
-
-    return positions, diagnostics
+    return positions, diagnostics, rows
 
 
 
@@ -1172,6 +1244,7 @@ if scan and live_mode:
 pairs = []
 live_positions = []
 position_diagnostics = []
+raw_position_rows = []
 
 if live_mode and scan:
     try:
@@ -1181,13 +1254,13 @@ if live_mode and scan:
                 "COINDCX_API_KEY and COINDCX_API_SECRET environment variables."
             )
 
-        live_positions, position_diagnostics = fetch_open_positions(
-            api_key, api_secret
+        live_positions, position_diagnostics, raw_position_rows = (
+            fetch_open_positions(api_key, api_secret)
         )
 
         if not live_positions:
             st.warning(
-                "CoinDCX did not return a non-zero open Futures position. "
+                "CoinDCX returned position records, but the app did not identify a non-zero open position yet. "
                 "Open the diagnostic panel below — it will show the HTTP "
                 "status and response structure without exposing your API key "
                 "or secret."
@@ -1203,6 +1276,20 @@ if live_mode and scan:
                     "No API key, API secret, signature, or credential value "
                     "is displayed here."
                 )
+
+                if raw_position_rows:
+                    st.markdown("**Safe position-row inspection**")
+                    st.dataframe(
+                        pd.DataFrame(
+                            inspect_position_rows(raw_position_rows, limit=15)
+                        ),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "This shows position-related fields only. "
+                        "Credentials and signatures are never displayed."
+                    )
 
                 if any(
                     d.get("http_status") == 401
