@@ -22,112 +22,116 @@ MEME_WORDS = {
     "1000LUNC","PONKE","MYRO","SLERF","LADYS","DEGEN","MOTHER","MAGA","TRUMP"
 }
 
-@st.cache_data(ttl=30, show_spinner=False)
 def active_instruments(margin="USDT"):
-    """Discover a complete, validated CoinDCX Futures universe.
+    """Discover the complete active CoinDCX Futures universe robustly.
 
-    We do not accept a tiny non-empty API response as the whole market.  We
-    try the documented endpoint with several encodings, validate that returned
-    values actually look like Futures pairs, and compare the result with the
-    public realtime Futures feed.  The largest valid USDT universe is used.
+    CoinDCX responses have appeared in several shapes (plain list, nested data,
+    keyed dictionaries and price-feed objects).  This function normalizes all
+    of them.  It never converts an API failure into a fake empty market.
     """
     url = f"{API}/exchange/v1/derivatives/futures/data/active_instruments"
     errors = []
 
-    def norm_pair(v):
-        return str(v or "").upper().replace("/", "").replace("-", "").replace("_", "").strip()
+    def flatten_records(obj):
+        out = []
+        if isinstance(obj, list):
+            for item in obj:
+                if isinstance(item, dict):
+                    out.append(item)
+                elif isinstance(item, str):
+                    out.append({"pair": item, "symbol": item})
+        elif isinstance(obj, dict):
+            # Normal documented/nested response containers.
+            for key in ("data", "instruments", "active_instruments", "result", "markets", "items"):
+                if key in obj:
+                    out.extend(flatten_records(obj[key]))
+            # Also support keyed dictionaries such as {"B-BTC_USDT": {...}}.
+            for key, value in obj.items():
+                if isinstance(value, dict):
+                    rec = dict(value)
+                    if not any(rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name")):
+                        if isinstance(key, str) and ("_USDT" in key.upper() or "USDT" in key.upper()):
+                            rec["pair"] = key
+                    if any(rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name")):
+                        out.append(rec)
+        return out
 
-    def extract_pairs(obj):
-        found = []
-        def add(v):
-            if not isinstance(v, str):
-                return
-            v = v.strip()
-            u = v.upper()
-            # A valid USDT futures pair normally contains USDT and has a
-            # recognizable separator or suffix. Reject response metadata.
-            if "USDT" not in u:
-                return
-            if len(u) < 6 or len(u) > 80:
-                return
-            if v not in found:
-                found.append(v)
-        def walk(obj, depth=0):
-            if depth > 5:
-                return
-            if isinstance(obj, str):
-                add(obj); return
-            if isinstance(obj, list):
-                for x in obj: walk(x, depth+1)
-                return
-            if isinstance(obj, dict):
-                # Prefer explicit pair-like fields.
-                for k in ("pair","symbol","market","instrument","coindcx_name","id","futures_pair"):
-                    v=obj.get(k)
-                    if isinstance(v,str): add(v)
-                # Handle nested containers and keyed maps.
-                for k in ("data","instruments","active_instruments","result","markets","items","prices"):
-                    if k in obj: walk(obj[k], depth+1)
-                for k,v in obj.items():
-                    if isinstance(k,str) and "USDT" in k.upper(): add(k)
-                    if isinstance(v,(dict,list)) and k not in {"data","instruments","active_instruments","result","markets","items","prices"}:
-                        walk(v, depth+1)
-        walk(obj)
-        return found
-
-    candidate_sets=[]
     attempts = [
-        [("margin_currency_short_name[]", margin)],
-        [("margin_currency_short_name", margin)],
-        [("margin_currency_short_name[]", margin), ("margin_currency_short_name[]", margin)],
-        [],
+        {"margin_currency_short_name[]": margin},
+        {"margin_currency_short_name": margin},
+        {"margin_currency_short_name[]": [margin]},
+        {},
     ]
     for params in attempts:
         try:
-            r=requests.get(url, params=params, timeout=12)
+            r = requests.get(url, params=params, timeout=25)
             r.raise_for_status()
-            payload=r.json()
-            pairs=extract_pairs(payload)
-            if pairs:
-                candidate_sets.append((len(pairs), pairs, f"active_instruments params={params or 'none'}"))
-            else:
-                errors.append(f"active endpoint returned no valid USDT pairs params={params or 'none'}")
+            payload = r.json()
+            rows = flatten_records(payload)
+            if rows:
+                # Keep the legacy V5 contract: callers expect a list of pair strings.
+                # V6/V6.2 also accepts strings via v61_instrument_pair().
+                pairs = []
+                seen_pairs = set()
+                for rec in rows:
+                    if isinstance(rec, str):
+                        pair = rec.strip()
+                    elif isinstance(rec, dict):
+                        pair = next((rec.get(k) for k in ("pair", "symbol", "market", "instrument", "coindcx_name", "id") if isinstance(rec.get(k), str) and rec.get(k).strip()), None)
+                    else:
+                        pair = None
+                    if pair and pair not in seen_pairs:
+                        seen_pairs.add(pair)
+                        pairs.append(pair)
+                if pairs:
+                    return pairs
+            errors.append(f"empty response params={params}; payload_type={type(payload).__name__}")
         except Exception as exc:
-            errors.append(f"active endpoint {type(exc).__name__} params={params or 'none'}: {exc}")
+            errors.append(f"instrument endpoint {type(exc).__name__}: {exc}")
 
-    # Public realtime feed is also a useful independent market-universe source.
+    # Robust fallback: the public real-time Futures feed itself is a live market
+    # universe. This is especially useful if the active_instruments schema changes.
     try:
-        raw=requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=12)
+        raw = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
         raw.raise_for_status()
-        payload=raw.json()
-        pairs=extract_pairs(payload)
-        if pairs:
-            candidate_sets.append((len(pairs), pairs, "realtime_futures_feed"))
+        payload = raw.json()
+        feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
+        derived = []
+        if isinstance(feed, dict):
+            iterator = feed.items()
+        elif isinstance(feed, list):
+            iterator = []
+            for item in feed:
+                if isinstance(item, dict):
+                    key = item.get("pair") or item.get("symbol") or item.get("mkt") or item.get("market")
+                    if key:
+                        iterator.append((key, item))
         else:
-            errors.append("realtime Futures feed returned no valid USDT pairs")
+            iterator = []
+        seen = set()
+        for key, value in iterator:
+            pair = None
+            if isinstance(value, dict):
+                pair = value.get("pair") or value.get("symbol") or value.get("mkt") or value.get("market") or key
+            else:
+                pair = key
+            if isinstance(pair, str):
+                pair = pair.strip()
+                up = pair.upper()
+                if pair and ("USDT" in up or margin.upper() in up) and pair not in seen:
+                    seen.add(pair)
+                    derived.append({"pair": pair, "symbol": pair, "margin_currency_short_name": margin})
+        if derived:
+            return [x["pair"] for x in derived if isinstance(x, dict) and x.get("pair")]
+        errors.append(f"price-feed fallback returned no {margin} Futures pairs; payload_type={type(feed).__name__}")
     except Exception as exc:
-        errors.append(f"realtime Futures feed {type(exc).__name__}: {exc}")
+        errors.append(f"price-feed fallback {type(exc).__name__}: {exc}")
 
-    if not candidate_sets:
-        raise RuntimeError("CoinDCX Futures universe discovery failed. " + " | ".join(errors[-5:]))
+    raise RuntimeError("CoinDCX Futures universe discovery failed. " + " | ".join(errors[-5:]))
 
-    # Do not blindly trust the first response. Pick the largest validated set.
-    candidate_sets.sort(key=lambda x:x[0], reverse=True)
-    best_count,best_pairs,best_source=candidate_sets[0]
-
-    # A healthy USDT market should normally be much larger than a handful of
-    # contracts. If the largest source is tiny, expose that fact rather than
-    # pretending it is the whole market.
-    if best_count < 20:
-        sources="; ".join(f"{n} from {src}" for n,_,src in candidate_sets[:4])
-        raise RuntimeError(f"CoinDCX returned only {best_count} validated USDT Futures pairs ({sources}). Refusing to treat a tiny response as the full market.")
-
-    return best_pairs
-
-@st.cache_data(ttl=15, show_spinner=False)
 def futures_prices():
     """Return current Futures prices normalized to {pair: price-record}."""
-    r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=10)
+    r = requests.get(f"{PUBLIC}/market_data/v3/current_prices/futures/rt", timeout=25)
     r.raise_for_status()
     payload = r.json()
     feed = payload.get("prices", payload) if isinstance(payload, dict) else payload
@@ -170,10 +174,9 @@ def futures_prices():
         raise RuntimeError(f"CoinDCX Futures price feed returned no usable prices (payload_type={type(feed).__name__})")
     return out
 
-@st.cache_data(ttl=60, show_spinner=False)
 def candles(pair, resolution, start_ts, end_ts):
     params = {"pair": pair, "from": int(start_ts), "to": int(end_ts), "resolution": resolution, "pcode": "f"}
-    r = requests.get(f"{PUBLIC}/market_data/candlesticks", params=params, timeout=10)
+    r = requests.get(f"{PUBLIC}/market_data/candlesticks", params=params, timeout=30)
     r.raise_for_status()
     x = r.json()
     rows = x.get("data", []) if isinstance(x, dict) else x
@@ -189,7 +192,6 @@ def candles(pair, resolution, start_ts, end_ts):
     d["time"] = pd.to_datetime(d["time"], unit="ms", errors="coerce", utc=True)
     return d.dropna(subset=["time","open","high","low","close","volume"]).sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
-@st.cache_data(ttl=60, show_spinner=False)
 def get_tf(pair, tf, days):
     now = int(time.time())
     if tf == "1W":
@@ -233,20 +235,6 @@ def indicators(d):
     x["mdi"] = 100 * minus.ewm(alpha=1/14, adjust=False).mean() / atr
     dx = 100 * (x.pdi-x.mdi).abs() / (x.pdi+x.mdi).replace(0, np.nan)
     x["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
-    x["macd_hist"] = x["macd"] - x["macd_signal"]
-    x["roc"] = x.close.pct_change(10) * 100
-    direction = np.sign(x.close.diff()).fillna(0)
-    x["obv"] = (direction * x.volume).cumsum()
-    x["obv_ma"] = x.obv.rolling(10).mean()
-    x["obv_slope"] = x.obv.pct_change(5)
-    pv = ((x.high + x.low + x.close) / 3.0) * x.volume
-    x["vwap20"] = pv.rolling(20).sum() / x.volume.rolling(20).sum().replace(0, np.nan)
-    x["vwap_dist_pct"] = (x.close / x.vwap20.replace(0, np.nan) - 1) * 100
-    x["bb_width_pct"] = ((x.bbup - x.bblow) / x.bbmid.replace(0, np.nan)) * 100
-    x["bb_width_ma"] = x.bb_width_pct.rolling(20).mean()
-    mfm = ((x.close - x.low) - (x.high - x.close)) / (x.high - x.low).replace(0, np.nan)
-    mfv = mfm.fillna(0) * x.volume
-    x["cmf20"] = mfv.rolling(20).sum() / x.volume.rolling(20).sum().replace(0, np.nan)
     return x
 
 def resample_weekly(d):
@@ -2745,13 +2733,6 @@ def v61_signal_card(t):
     st.write(f"**Entry:** `{v61_fmt_price(t.get('entry'))}`  |  **SL:** `{v61_fmt_price(t.get('stop'))}`  |  **TP1:** `{v61_fmt_price(t.get('tp1'))}`  |  **TP2:** `{v61_fmt_price(t.get('tp2'))}`")
     st.write(f"**R:R:** 1:{t.get('rr1',0):.2f} / 1:{t.get('rr2',0):.2f}  |  **Reason:** {t.get('reason','')}")
 
-margin=st.selectbox("Futures margin market",["USDT","INR"],index=0)
-
-meme_only=st.checkbox("Use meme-focused learning universe",value=False)
-
-peer_limit=st.slider("Historical comparison universe",20,150,100,10,help="More contracts provide more historical examples but require more CoinDCX API calls.")
-
-coin=st.text_input("Coin / Futures pair",placeholder="USELESS, DOGE, PEPE, B-DOGE_USDT")
 
 def v71_early_structure_transition(d15, d1h=None):
     """Detect the *chronological* start of a trend reversal, not just the
@@ -4431,9 +4412,6 @@ def v22_render_market(results):
             })
         st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
-v22_workers = st.slider("Concurrent workers", 2, 6, 4, 1, key="v24_workers")
-
-_v22_results = st.session_state.get("v22_market_results", [])
 
 V31_LOOKBACK_15M = 192
 
@@ -5114,234 +5092,6 @@ def v30_render_ema20_break_table(rows):
         "within the last 24 hours. This is a short-entry candidate list, not an automatic trade."
     )
 
-
-# =============================================================================
-# V36 EMA PATTERN ENGINE
-# =============================================================================
-# EMA20/50/100 is treated as a pattern/confirmation engine, not a standalone
-# crossover signal.  EMA20 -> EMA50 contact is a setup; the entry still needs
-# structure confirmation (HL/LH) and a local high/low break.
-V36_EMA_TOUCH_PCT = 0.75
-V36_EMA_LOOKBACK = 16
-V36_EMA_SLOPE_LOOKBACK = 5
-
-
-def v36_ema_tf_state(df, side=None):
-    """Return the EMA20/50/100 state for one completed timeframe."""
-    out = {
-        "direction": "NEUTRAL", "close": np.nan, "ema20": np.nan,
-        "ema50": np.nan, "ema100": np.nan, "ema200": np.nan, "ema20_slope": np.nan,
-        "price_vs_ema20": np.nan, "ema20_50_spread": np.nan,
-        "touch_20_50": False, "turn_up": False, "turn_down": False,
-    }
-    try:
-        x = indicators(completed(df)).dropna(subset=["close","ema20","ema50","ema100"]).reset_index(drop=True)
-        if len(x) < 25:
-            return out
-        r = x.iloc[-1]
-        close = float(r.close); e20 = float(r.ema20); e50 = float(r.ema50); e100 = float(r.ema100); e200 = float(r.ema200)
-        n = min(V36_EMA_SLOPE_LOOKBACK, len(x)-1)
-        prev20 = float(x.iloc[-1-n].ema20)
-        slope = ((e20 / prev20) - 1.0) * 100.0 if prev20 > 0 else np.nan
-        spread = abs(e20/e50 - 1.0) * 100.0 if e50 > 0 else np.nan
-        price_dist = (close/e20 - 1.0) * 100.0 if e20 > 0 else np.nan
-
-        # Detect a genuine recent EMA20/EMA50 interaction, rather than merely
-        # checking whether the two averages happen to be close on the last bar.
-        tail = x.tail(V36_EMA_LOOKBACK)
-        pair_spread = ((tail.ema20 / tail.ema50 - 1.0).abs() * 100.0)
-        touch = bool(pair_spread.min() <= V36_EMA_TOUCH_PCT)
-        turn_up = bool(np.isfinite(slope) and slope > 0.05)
-        turn_down = bool(np.isfinite(slope) and slope < -0.05)
-        direction = "BULLISH" if close > e20 and e20 > e50 and e50 > e100 else \
-                    "BEARISH" if close < e20 and e20 < e50 and e50 < e100 else "MIXED"
-        out.update({"direction":direction, "close":close, "ema20":e20, "ema50":e50,
-                    "ema100":e100, "ema200":e200, "ema20_slope":slope, "price_vs_ema20":price_dist,
-                    "ema20_50_spread":spread, "touch_20_50":touch,
-                    "turn_up":turn_up, "turn_down":turn_down})
-    except Exception:
-        pass
-    return out
-
-
-def v36_indicator_snapshot(df):
-    out={"rsi":np.nan,"macd":np.nan,"macd_signal":np.nan,"macd_hist":np.nan,"adx":np.nan,
-         "pdi":np.nan,"mdi":np.nan,"vol_ratio":np.nan,"atr":np.nan,"atr_pct":np.nan,
-         "roc":np.nan,"obv_slope":np.nan,"vwap":np.nan,"vwap_dist_pct":np.nan,
-         "bb_width_pct":np.nan,"bb_width_ma":np.nan,"cmf20":np.nan,"close":np.nan}
-    try:
-        x=indicators(completed(df))
-        if x.empty: return out
-        r=x.iloc[-1]
-        mapping={"rsi":"rsi","macd":"macd","macd_signal":"macd_signal","macd_hist":"macd_hist",
-                 "adx":"adx","pdi":"pdi","mdi":"mdi","vol_ratio":"vol_ratio","atr":"atr",
-                 "atr_pct":"atr_pct","roc":"roc","obv_slope":"obv_slope","vwap":"vwap20",
-                 "vwap_dist_pct":"vwap_dist_pct","bb_width_pct":"bb_width_pct","bb_width_ma":"bb_width_ma",
-                 "cmf20":"cmf20","close":"close"}
-        for k,src in mapping.items(): out[k]=v6_num(r.get(src))
-    except Exception: pass
-    return out
-
-
-def v36_explain_decision(signal, score, ema, ind, pullback, mtf):
-    side="LONG" if signal.startswith("LONG") else "SHORT" if signal.startswith("SHORT") else ("LONG" if score["long"]>=score["short"] else "SHORT")
-    reasons=[]
-    rsi,adx,hist,vr=ind.get("rsi",np.nan),ind.get("adx",np.nan),ind.get("macd_hist",np.nan),ind.get("vol_ratio",np.nan)
-    roc,vd,cmf=ind.get("roc",np.nan),ind.get("vwap_dist_pct",np.nan),ind.get("cmf20",np.nan)
-    if side=="LONG":
-        if ema.get("direction")=="BULLISH": reasons.append("EMA20 > EMA50 > EMA100 shows a bullish trend")
-        elif ema.get("ema20",0)>ema.get("ema50",0): reasons.append("EMA20 is above EMA50")
-        if ema.get("touch_20_50") and ema.get("turn_up"): reasons.append("EMA20 touched EMA50 and turned upward")
-        if pullback.get("hh",0) and pullback.get("hl",0): reasons.append("price structure is HH + HL")
-        if np.isfinite(rsi) and 50<=rsi<=68: reasons.append(f"RSI {rsi:.0f} confirms healthy bullish momentum")
-        elif np.isfinite(rsi) and rsi>68: reasons.append(f"RSI {rsi:.0f} is strong but getting extended")
-        elif np.isfinite(rsi): reasons.append(f"RSI {rsi:.0f} has not fully confirmed bullish momentum")
-        if np.isfinite(hist) and hist>0: reasons.append("MACD momentum is bullish")
-        elif np.isfinite(hist): reasons.append("MACD is not yet bullish")
-        if np.isfinite(adx) and adx>=25: reasons.append(f"ADX {adx:.0f} confirms trend strength")
-        elif np.isfinite(adx) and adx>=20: reasons.append(f"ADX {adx:.0f} shows the trend is developing")
-        elif np.isfinite(adx): reasons.append(f"ADX {adx:.0f} is weak")
-        if np.isfinite(vr) and vr>=1.2: reasons.append(f"volume is {vr:.1f}x average")
-        if np.isfinite(vd) and vd>=0: reasons.append("price is above rolling VWAP")
-        if np.isfinite(cmf) and cmf>0.05: reasons.append("CMF shows buying pressure")
-        if np.isfinite(roc) and roc>0: reasons.append(f"10-bar momentum is positive ({roc:+.1f}%)")
-        if mtf.get("bullish",0)>=2: reasons.append(f"{mtf['bullish']}/3 higher timeframes support LONG")
-        next_step="Wait for the local high to break" if signal=="LONG WATCH" else "Local high break is the trigger"
-    else:
-        if ema.get("direction")=="BEARISH": reasons.append("EMA20 < EMA50 < EMA100 shows a bearish trend")
-        elif ema.get("ema20",0)<ema.get("ema50",0): reasons.append("EMA20 is below EMA50")
-        if ema.get("touch_20_50") and ema.get("turn_down"): reasons.append("EMA20 retested EMA50 and turned downward")
-        if pullback.get("lh",0) and pullback.get("ll",0): reasons.append("price structure is LH + LL")
-        if np.isfinite(rsi) and 32<=rsi<=50: reasons.append(f"RSI {rsi:.0f} confirms bearish momentum")
-        elif np.isfinite(rsi) and rsi<32: reasons.append(f"RSI {rsi:.0f} is weak but oversold risk is rising")
-        elif np.isfinite(rsi): reasons.append(f"RSI {rsi:.0f} has not fully confirmed bearish momentum")
-        if np.isfinite(hist) and hist<0: reasons.append("MACD momentum is bearish")
-        elif np.isfinite(hist): reasons.append("MACD is not yet bearish")
-        if np.isfinite(adx) and adx>=25: reasons.append(f"ADX {adx:.0f} confirms trend strength")
-        elif np.isfinite(adx) and adx>=20: reasons.append(f"ADX {adx:.0f} shows the trend is developing")
-        elif np.isfinite(adx): reasons.append(f"ADX {adx:.0f} is weak")
-        if np.isfinite(vr) and vr>=1.2: reasons.append(f"volume is {vr:.1f}x average")
-        if np.isfinite(vd) and vd<=0: reasons.append("price is below rolling VWAP")
-        if np.isfinite(cmf) and cmf<-0.05: reasons.append("CMF shows selling pressure")
-        if np.isfinite(roc) and roc<0: reasons.append(f"10-bar momentum is negative ({roc:+.1f}%)")
-        if mtf.get("bearish",0)>=2: reasons.append(f"{mtf['bearish']}/3 higher timeframes support SHORT")
-        next_step="Wait for the local low to break" if signal=="SHORT WATCH" else "Local low break is the trigger"
-    seen=[]
-    for x in reasons:
-        if x not in seen: seen.append(x)
-    why="; ".join(seen[:6]) if seen else "The indicators are mixed, so there is no clean setup."
-    return why+".",next_step
-
-
-def v36_advanced_decision(d15,d1h=None,d4h=None,d1d=None,pullback=None):
-    """Unified V36: Structure + EMA + RSI + MACD + ADX + Volume + ATR/VWAP/Bollinger/OBV + MTF."""
-    p=pullback or v33_pullback_signal(d15)
-    x15=v36_ema_tf_state(d15); x1h=v36_ema_tf_state(d1h) if d1h is not None and not d1h.empty else {}; x4h=v36_ema_tf_state(d4h) if d4h is not None and not d4h.empty else {}; x1d=v36_ema_tf_state(d1d) if d1d is not None and not d1d.empty else {}
-    ind=v36_indicator_snapshot(d15)
-    scores={"LONG":0,"SHORT":0}; modules={"LONG":{},"SHORT":{}}; reasons={"LONG":[],"SHORT":[]}
-    def add(side,module,pts,text=""):
-        modules[side][module]=min(modules[side].get(module,0)+pts, {"EMA":25,"Structure":25,"Momentum":15,"ADX":10,"Volume":10,"Volatility":5,"MTF":10}[module])
-        scores[side]+=pts
-        if text: reasons[side].append(text)
-    # EMA 25
-    for side,bull in (("LONG",True),("SHORT",False)):
-        aligned=x15.get("direction")==("BULLISH" if bull else "BEARISH")
-        ema20=x15.get("ema20",np.nan); ema50=x15.get("ema50",np.nan); ema100=x15.get("ema100",np.nan)
-        price_ok=(x15.get("price_vs_ema20",0)>0) if bull else (x15.get("price_vs_ema20",0)<0)
-        touch_turn=x15.get("touch_20_50") and (x15.get("turn_up") if bull else x15.get("turn_down"))
-        ema200_ok=(ema100>0 and ((ema20>ema100) if bull else (ema20<ema100)))
-        price_200_ok=(x15.get("close",0)>x15.get("ema200",np.nan)) if bull else (x15.get("close",0)<x15.get("ema200",np.nan))
-        if aligned: add(side,"EMA",8,"EMA20/50/100 aligned")
-        elif ((ema20>ema50) if bull else (ema20<ema50)): add(side,"EMA",4,"EMA20/50 direction agrees")
-        if price_ok: add(side,"EMA",3,"price is on the correct side of EMA20")
-        if touch_turn: add(side,"EMA",5,"EMA20/50 pullback turn")
-        elif x15.get("touch_20_50"): add(side,"EMA",2,"EMA20/50 pullback zone reached")
-        if (x15.get("turn_up") if bull else x15.get("turn_down")): add(side,"EMA",2,"EMA20 slope supports direction")
-        if ema200_ok: add(side,"EMA",3,"EMA20/EMA100 direction agrees")
-        if price_200_ok: add(side,"EMA",4,"price is on the correct side of EMA200")
-    # Structure 25
-    if p.get("hh") and p.get("hl"): add("LONG","Structure",10,"HH + HL structure")
-    elif p.get("hh") or p.get("hl"): add("LONG","Structure",5,"bullish structure developing")
-    if p.get("lh") and p.get("ll"): add("SHORT","Structure",10,"LH + LL structure")
-    elif p.get("lh") or p.get("ll"): add("SHORT","Structure",5,"bearish structure developing")
-    if p.get("signal")=="LONG READY": add("LONG","Structure",10,"local high broken")
-    elif p.get("signal")=="LONG WATCH" and p.get("retests",0)>0: add("LONG","Structure",5,"EMA20 pullback tested")
-    if p.get("signal")=="SHORT READY": add("SHORT","Structure",10,"local low broken")
-    elif p.get("signal")=="SHORT WATCH" and p.get("retests",0)>0: add("SHORT","Structure",5,"EMA20 retest tested")
-    # Momentum 15
-    rsi=ind.get("rsi",np.nan); hist=ind.get("macd_hist",np.nan); roc=ind.get("roc",np.nan)
-    if np.isfinite(rsi):
-        if 50<=rsi<=68: add("LONG","Momentum",5,"RSI healthy bullish")
-        elif 68<rsi<=75: add("LONG","Momentum",3,"RSI bullish but extended")
-        if 32<=rsi<=50: add("SHORT","Momentum",5,"RSI bearish")
-        elif 25<=rsi<32: add("SHORT","Momentum",3,"RSI weak but oversold risk")
-    if np.isfinite(hist):
-        if hist>0: add("LONG","Momentum",5,"MACD bullish")
-        elif hist<0: add("SHORT","Momentum",5,"MACD bearish")
-    if np.isfinite(roc):
-        if roc>0.20: add("LONG","Momentum",5,"ROC positive")
-        elif roc>0: add("LONG","Momentum",2,"ROC positive")
-        if roc<-0.20: add("SHORT","Momentum",5,"ROC negative")
-        elif roc<0: add("SHORT","Momentum",2,"ROC negative")
-    # ADX 10
-    adx,pdi,mdi=ind.get("adx",np.nan),ind.get("pdi",np.nan),ind.get("mdi",np.nan)
-    if np.isfinite(adx) and adx>=25:
-        if np.isfinite(pdi) and np.isfinite(mdi) and pdi>mdi: add("LONG","ADX",6,"ADX strong +DI > -DI")
-        elif np.isfinite(pdi) and np.isfinite(mdi) and mdi>pdi: add("SHORT","ADX",6,"ADX strong -DI > +DI")
-    elif np.isfinite(adx) and adx>=20:
-        if np.isfinite(pdi) and np.isfinite(mdi) and pdi>mdi: add("LONG","ADX",3,"ADX developing +DI > -DI")
-        elif np.isfinite(pdi) and np.isfinite(mdi) and mdi>pdi: add("SHORT","ADX",3,"ADX developing -DI > +DI")
-    if np.isfinite(pdi) and np.isfinite(mdi):
-        if pdi>mdi: add("LONG","ADX",4,"+DI above -DI")
-        elif mdi>pdi: add("SHORT","ADX",4,"-DI above +DI")
-    # Volume 10
-    vr,obv,cmf=ind.get("vol_ratio",np.nan),ind.get("obv_slope",np.nan),ind.get("cmf20",np.nan)
-    if np.isfinite(vr):
-        pts=5 if vr>=1.5 else 3 if vr>=1.2 else 2 if vr>=1.0 else 0
-        if pts: add("LONG","Volume",pts,f"volume {vr:.1f}x average"); add("SHORT","Volume",pts,f"volume {vr:.1f}x average")
-    if np.isfinite(obv):
-        if obv>0: add("LONG","Volume",3,"OBV rising")
-        elif obv<0: add("SHORT","Volume",3,"OBV falling")
-    if np.isfinite(cmf):
-        if cmf>0.05: add("LONG","Volume",2,"CMF buying pressure")
-        elif cmf<-0.05: add("SHORT","Volume",2,"CMF selling pressure")
-    # Volatility/location 5
-    vd,bb,bbma,atrp=ind.get("vwap_dist_pct",np.nan),ind.get("bb_width_pct",np.nan),ind.get("bb_width_ma",np.nan),ind.get("atr_pct",np.nan)
-    if np.isfinite(vd) and vd>=0: add("LONG","Volatility",2,"price above rolling VWAP")
-    if np.isfinite(vd) and vd<=0: add("SHORT","Volatility",2,"price below rolling VWAP")
-    if np.isfinite(bb) and np.isfinite(bbma) and bb>bbma*1.05:
-        add("LONG","Volatility",2,"Bollinger width expanding"); add("SHORT","Volatility",2,"Bollinger width expanding")
-    if np.isfinite(atrp): add("LONG","Volatility",1,f"ATR {atrp:.2f}%"); add("SHORT","Volatility",1,f"ATR {atrp:.2f}%")
-    # MTF 10
-    states=(x1h,x4h,x1d); bull=sum(z.get("direction")=="BULLISH" for z in states); bear=sum(z.get("direction")=="BEARISH" for z in states)
-    if bull==3: add("LONG","MTF",10,"1H + 4H + 1D bullish")
-    elif bull==2: add("LONG","MTF",7,"2/3 higher timeframes bullish")
-    elif bull==1: add("LONG","MTF",3,"1/3 higher timeframes bullish")
-    if bear==3: add("SHORT","MTF",10,"1H + 4H + 1D bearish")
-    elif bear==2: add("SHORT","MTF",7,"2/3 higher timeframes bearish")
-    elif bear==1: add("SHORT","MTF",3,"1/3 higher timeframes bearish")
-    # Extreme oscillator caution
-    if np.isfinite(rsi) and rsi>=75: scores["LONG"]-=6
-    if np.isfinite(rsi) and rsi<=25: scores["SHORT"]-=6
-    scores={k:int(max(0,min(100,v))) for k,v in scores.items()}
-    if scores["LONG"]>=72 and p.get("signal")=="LONG READY" and bear==0: signal="LONG READY"
-    elif scores["SHORT"]>=72 and p.get("signal")=="SHORT READY" and bull==0: signal="SHORT READY"
-    elif scores["LONG"]>=58 and bull>=1 and bear<=1 and scores["LONG"]>scores["SHORT"]+5: signal="LONG WATCH"
-    elif scores["SHORT"]>=58 and bear>=1 and bull<=1 and scores["SHORT"]>scores["LONG"]+5: signal="SHORT WATCH"
-    else: signal="WAIT"
-    stage={"LONG READY":"CONFIRMED → LOCAL HIGH BREAK","LONG WATCH":"EMA/STRUCTURE + MOMENTUM → WAIT FOR HIGH BREAK","SHORT READY":"CONFIRMED → LOCAL LOW BREAK","SHORT WATCH":"EMA/STRUCTURE + MOMENTUM → WAIT FOR LOW BREAK","WAIT":"NO CLEAN MULTI-FACTOR SETUP"}[signal]
-    why,next_step=v36_explain_decision(signal,{"long":scores["LONG"],"short":scores["SHORT"]},x15,ind,p,{"bullish":bull,"bearish":bear})
-    chosen="LONG" if scores["LONG"]>=scores["SHORT"] else "SHORT"
-    return {"signal":signal,"stage":stage,"score":max(scores.values()),"long_score":scores["LONG"],"short_score":scores["SHORT"],"modules":modules,
-            "reasons":reasons[chosen],"long_reasons":reasons["LONG"],"short_reasons":reasons["SHORT"],"why":why,"next_step":next_step,"chosen_side":chosen,
-            "1H":x1h,"4H":x4h,"1D":x1d,"mtf_long_confirmations":bull,"mtf_short_confirmations":bear,"volume_ratio":vr,
-            "ema20":x15.get("ema20"),"ema50":x15.get("ema50"),"ema100":x15.get("ema100"),"ema200":x15.get("ema200"),"ema20_slope":x15.get("ema20_slope"),"ema20_50_touch":x15.get("touch_20_50"),
-            "indicators":ind,"rsi":rsi,"macd_hist":hist,"adx":adx,"roc":roc,"atr_pct":atrp,"vwap":ind.get("vwap"),"bb_width_pct":bb,"obv_slope":obv,"cmf20":cmf}
-
-
-def v36_ema_pattern_engine(d15,d1h=None,d4h=None,d1d=None,pullback=None):
-    return v36_advanced_decision(d15,d1h,d4h,d1d,pullback)
-
 V33_EMA_NEAR_PCT = 1.25
 
 V33_MIN_SWING_PCT = 0.25
@@ -5539,11 +5289,8 @@ def v33_attach_mtf_path(r, max_days=180):
 
         # Target/room depends on direction.
         sig = r["v33_pullback"]
-        ema_sig = (r.get("v36_ema") or {}).get("signal", "")
-        effective_signal = ema_sig if ema_sig else sig.get("signal", "WAIT")
-        side = "LONG" if effective_signal.startswith("LONG") else "SHORT" if effective_signal.startswith("SHORT") else None
+        side = "LONG" if sig["signal"].startswith("LONG") else "SHORT" if sig["signal"].startswith("SHORT") else None
         r["v33_side"] = side
-        r["v36_effective_signal"] = effective_signal
         if side == "SHORT":
             s4 = (sr.get("4H") or {}).get("S1")
             s1d = (sr.get("1D") or {}).get("S1")
@@ -5567,12 +5314,8 @@ def v33_rank(records):
     scored=[]
     for r in records:
         p=r.get("v33_pullback") or {}
-        ema=r.get("v36_ema") or {}
-        sig=ema.get("signal", p.get("signal","WAIT"))
-        # The advanced V36 score is now the primary decision score. The older
-        # structure score remains a small supporting component so the ranking
-        # still respects the proven HH/HL or LH/LL path logic.
-        score=float(ema.get("score",0))*0.80 + float(p.get("score",0))*0.20
+        sig=p.get("signal","WAIT")
+        score=float(p.get("score",0))
         room=float(r.get("v33_room_4h_pct",np.nan))
         if np.isfinite(room):
             if room >= 5: score += 10
@@ -5619,295 +5362,184 @@ def v33_render_tables(records):
         if rows: st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
         else: st.info("No fresh candidates on this side.")
 
-v31_workers = st.slider("V31 path scanner workers", 2, 6, 4, 1, key="v31_path_workers")
-
-v31_candidates = st.slider("V31 MTF candidates", 20, 80, 40, 5, key="v31_path_candidates")
-
-_v31_saved = st.session_state.get("v31_path_results", [])
-
-v30_workers = st.slider("EMA20 scanner workers", 2, 6, 4, 1, key="v30_ema_workers")
-
-v30_filter = st.radio(
-    "Show",
-    ["15m OR 4H", "15m only", "4H only", "15m AND 4H"],
-    horizontal=True,
-    key="v30_ema_filter"
-)
-
-_v30_rows = st.session_state.get("v30_ema_rows", [])
-
-_v22_sr_coin = st.text_input("Coin / Futures pair", placeholder="LSK_USDT, B-LSK_USDT, DOGE_USDT", key="v22_mtf_sr_coin")
 
 # =============================================================================
 # V34 PRIMARY UI — CLEAN SYMMETRIC HEALTHY-PULLBACK / STRUCTURE PATH AGENT
 # =============================================================================
 st.divider()
-st.header("🧠 V36 — Healthy Pullback / Structure Path Agent")
+st.header("🧠 V37 — Healthy Pullback / Structure Path Agent")
 st.caption(
-    "One core model for both directions: LONG = HH → HL → EMA20/50 pullback → momentum confirmation → local-high break. "
-    "SHORT = LH → LL → EMA20/50 retest → momentum confirmation → local-low break. The agent explains each decision using EMA, structure, RSI, MACD, ADX, volume, volatility and MTF."
+    "One core model for both directions: LONG = HH → HL → EMA20 test → hold → local-high break. "
+    "SHORT = LH → LL → EMA20 test → reject → local-low break. Do not chase extended moves. "
+    "4H and 1D levels are reaction/target zones, not automatic reversals."
 )
 
-v34_workers = st.slider("V36 scan workers", 2, 8, 6, 1, key="v36_workers")
+v34_workers = st.slider("V37 scan workers", 2, 8, 6, 1, key="v37_workers")
 
-if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v36_scan_button"):
-    bar=st.progress(0,text="Loading active Futures…")
+if st.button("🧠 SCAN MARKET — FRESH LONG / SHORT ENTRIES", type="primary", key="v37_scan_button"):
+    bar = st.progress(0, text="Loading active Futures…")
     try:
-        instruments=active_instruments("USDT")
-        discovered_count=len(instruments)
-        bar.progress(5,text=f"Discovered {discovered_count} active USDT Futures…")
-        prices=futures_prices()
+        instruments = active_instruments("USDT")
+        prices = futures_prices()
 
-        def _norm_pair(v):
-            # CoinDCX commonly represents perpetuals as B-BTC_USDT while
-            # realtime feeds may expose BTCUSDT/BTC_USDT. Treat these as the
-            # same market for price lookup without changing the actual candle pair.
-            x=str(v or "").upper().replace("/","").replace("_","").replace("-","").strip()
-            if x.startswith("B") and x.endswith("USDT"):
-                x=x[1:]
-            return x
+        items = []
+        universe_failures = 0
 
-        def _aliases(v):
-            raw=str(v or "").upper().strip()
-            variants={raw, raw.replace("/",""), raw.replace("_",""), raw.replace("-","")}
-            if raw.startswith("B-"):
-                variants.add(raw[2:])
-                variants.add(raw[2:].replace("_",""))
-            if raw.startswith("B") and "USDT" in raw and not raw.startswith("BTC"):
-                variants.add(raw[1:])
-            return {_norm_pair(x) for x in variants if x}
-
-        def _raw_price(v):
-            if isinstance(v,dict):
-                for kk in ("price","last_price","last","close","p","lp","mark_price","mp"):
-                    q=v6_num(v.get(kk))
-                    if np.isfinite(q) and q>0: return q
-            else:
-                q=v6_num(v)
-                if np.isfinite(q) and q>0: return q
-            return np.nan
-
-        price_map={}
-        for k,v in (prices or {}).items():
-            ident=str(k)
-            if isinstance(v,dict):
-                ident=str(v.get("pair") or v.get("symbol") or v.get("mkt") or v.get("market") or k)
-            q=_raw_price(v)
-            if np.isfinite(q):
-                for a in _aliases(ident): price_map.setdefault(a,q)
-
-        # IMPORTANT: do not require a live-price match before scanning a contract.
-        # The 15m candle close is a valid fallback current price. This prevents a
-        # symbol-format mismatch in the realtime feed from reducing a 500+ market
-        # to a handful of contracts.
-        items=[]; seen=set(); price_matched=0
         for raw in instruments:
             try:
-                pair=v61_instrument_pair(raw) if isinstance(raw,dict) else str(raw)
-                if not pair or "USDT" not in pair.upper(): continue
-                symbol=v61_symbol(raw,pair) if isinstance(raw,dict) else pair
-                price=v61_price_for_pair(prices,pair)
-                if not (np.isfinite(price) and price>0):
-                    for a in _aliases(pair):
-                        if a in price_map:
-                            price=price_map[a]; break
-                if np.isfinite(price) and price>0: price_matched += 1
-                key=_norm_pair(pair)
-                if key not in seen:
-                    items.append((pair,symbol,float(price) if np.isfinite(price) and price>0 else np.nan))
-                    seen.add(key)
+                pair = v61_instrument_pair(raw)
+                if not pair:
+                    universe_failures += 1
+                    continue
+                symbol = v61_symbol(raw, pair)
+                price = v61_price_for_pair(prices, pair)
+
+                if not np.isfinite(price) or price <= 0:
+                    try:
+                        d = completed(get_tf(pair, "15m", 2))
+                        if d is not None and not d.empty:
+                            price = v6_num(d.iloc[-1].get("close"), np.nan)
+                    except Exception:
+                        price = np.nan
+
+                if np.isfinite(price) and price > 0:
+                    items.append((pair, symbol, float(price)))
+                else:
+                    universe_failures += 1
             except Exception:
-                continue
+                universe_failures += 1
 
-        total=len(items)
-        if total==0:
-            raise RuntimeError("CoinDCX returned no usable USDT Futures symbols. The Futures instrument feed may be temporarily unavailable.")
+        results = []
+        results_cache = []
+        errors = []
+        stats = {
+            "universe": len(items), "data_ok": 0, "directional": 0,
+            "ready": 0, "watch": 0, "wait": 0, "errors": universe_failures
+        }
 
-        from concurrent.futures import ThreadPoolExecutor,as_completed
-        phase1=[]; results=[]; errors=[]
-        stats={"universe":total,"discovered":discovered_count,"price_matched":price_matched,
-                "data_ok":0,"directional":0,"mtf_analyzed":0,
-                "ready":0,"watch":0,"wait":0,"errors":0,"phase1_long":0,"phase1_short":0}
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
         def scan15(item):
-            pair,symbol,price=item
+            pair, symbol, price = item
             try:
-                d15=get_tf(pair,"15m",10)
-                if d15 is None or d15.empty: return None,f"{pair}: no 15m candles"
-                # Use the latest completed 15m close when the realtime price feed
-                # could not be matched by symbol format. The scan must not discard
-                # a valid contract just because the live ticker uses another name.
-                if not (np.isfinite(price) and price>0):
-                    price=float(d15.iloc[-1]["close"])
-                p=v33_pullback_signal(d15,price); x15=v36_ema_tf_state(d15); q=v36_indicator_snapshot(d15)
-                ls=ss=0
-                if x15.get("direction")=="BULLISH": ls+=8
-                if x15.get("direction")=="BEARISH": ss+=8
-                if x15.get("price_vs_ema20",0)>0: ls+=3
-                if x15.get("price_vs_ema20",0)<0: ss+=3
-                if x15.get("touch_20_50") and x15.get("turn_up"): ls+=5
-                if x15.get("touch_20_50") and x15.get("turn_down"): ss+=5
-                if p.get("hh") and p.get("hl"): ls+=10
-                if p.get("lh") and p.get("ll"): ss+=10
-                if np.isfinite(q.get("rsi",np.nan)) and 50<=q["rsi"]<=68: ls+=5
-                if np.isfinite(q.get("rsi",np.nan)) and 32<=q["rsi"]<=50: ss+=5
-                if np.isfinite(q.get("macd_hist",np.nan)) and q["macd_hist"]>0: ls+=5
-                if np.isfinite(q.get("macd_hist",np.nan)) and q["macd_hist"]<0: ss+=5
-                if np.isfinite(q.get("adx",np.nan)) and q["adx"]>=20:
-                    if q.get("pdi",0)>q.get("mdi",0): ls+=5
-                    elif q.get("mdi",0)>q.get("pdi",0): ss+=5
-                side="LONG" if ls>ss else "SHORT" if ss>ls else "WAIT"
-                priority=max(ls,ss)+float(p.get("score",0))/20.0
+                # More history = more confirmed 15m pivots and fewer false
+                # "no structure" results across newer/volatile Futures contracts.
+                d15 = get_tf(pair, "15m", 10)
+                if d15 is None or d15.empty:
+                    return {"status": "WAIT", "error": f"{pair}: no 15m candles"}
 
-                # Reuse the same 15m candles already fetched for the full V36
-                # market scan. This gives Pump Hunter a true 24h mover ranking
-                # without making another 539 candle requests.
-                c15 = completed(d15)
-                pump_24h = np.nan
-                volume_24h = np.nan
-                volume_ratio = q.get("vol_ratio", np.nan)
-                if c15 is not None and len(c15) >= 97:
-                    closes = pd.to_numeric(c15["close"], errors="coerce").dropna()
-                    vols = pd.to_numeric(c15["volume"], errors="coerce").dropna()
-                    if len(closes) >= 97 and float(closes.iloc[-97]) > 0:
-                        pump_24h = (float(closes.iloc[-1]) / float(closes.iloc[-97]) - 1.0) * 100.0
-                    if len(vols) >= 96:
-                        volume_24h = float(vols.tail(96).sum())
+                p = v33_pullback_signal(d15, price)
+                sig = p.get("signal", "WAIT")
+                status = "LONG" if sig.startswith("LONG") else "SHORT" if sig.startswith("SHORT") else "WAIT"
+                today = simple_today_structure(d15, bars=96)
 
                 return {
-                    "pair":pair,"symbol":symbol,"price":price,"d15":d15,
-                    "v33_pullback":p,"pre_side":side,"pre_score":priority,
-                    "pump_24h":pump_24h,"volume_24h":volume_24h,
-                    "volume_ratio":volume_ratio
-                },None
+                    "status": status, "pair": pair, "symbol": symbol, "price": price,
+                    "d15": d15, "v33_pullback": p, "today_structure": today,
+                    "error": None
+                }
             except Exception as exc:
-                return None,f"{pair}: {type(exc).__name__}: {exc}"
+                return {
+                    "status": "ERROR", "pair": pair, "symbol": symbol, "price": price,
+                    "d15": pd.DataFrame(),
+                    "v33_pullback": {"signal": "WAIT", "score": 0},
+                    "error": f"{pair}: {type(exc).__name__}: {exc}"
+                }
 
-        # ALL coins are scanned here. Only MTF confirmation is narrowed later.
+        total = len(items)
         with ThreadPoolExecutor(max_workers=v34_workers) as ex:
-            fs=[ex.submit(scan15,x) for x in items]
-            for i,f in enumerate(as_completed(fs),1):
-                rr,err=f.result()
-                if rr:
-                    phase1.append(rr); stats["data_ok"]+=1
+            futures = [ex.submit(scan15, item) for item in items]
+            for i, future in enumerate(as_completed(futures), 1):
+                rr = future.result()
+
+                if rr.get("status") == "ERROR":
+                    stats["errors"] += 1
+                    if len(errors) < 25:
+                        errors.append(rr.get("error", "unknown error"))
                 else:
-                    stats["errors"]+=1
-                    if err and len(errors)<25: errors.append(err)
-                bar.progress(int(5+i/max(total,1)*35),text=f"Phase 1/2 — 15m EMA + structure {i}/{total}…")
+                    stats["data_ok"] += 1
+                    sig = (rr.get("v33_pullback") or {}).get("signal", "WAIT")
+                    if sig.startswith("LONG"):
+                        stats["directional"] += 1
+                        stats["ready" if sig == "LONG READY" else "watch"] += 1
+                        results.append(rr)
+                    elif sig.startswith("SHORT"):
+                        stats["directional"] += 1
+                        stats["ready" if sig == "SHORT READY" else "watch"] += 1
+                        results.append(rr)
+                    else:
+                        stats["wait"] += 1
+                    # Cache every successful analysis for the fallback path.
+                    if rr.get("d15") is not None and not rr.get("d15").empty:
+                        results_cache.append(rr)
 
-        phase1.sort(key=lambda r:(-float(r.get("pre_score",0)),r.get("symbol","")))
-        stats["phase1_long"] = sum(1 for r in phase1 if r.get("pre_side") == "LONG")
-        stats["phase1_short"] = sum(1 for r in phase1 if r.get("pre_side") == "SHORT")
-        mtf_limit=min(80,max(30,v31_candidates*2))
-        targets=phase1[:mtf_limit]
+                bar.progress(
+                    int(i / max(total, 1) * 100),
+                    text=f"15m structure {i}/{total}…"
+                )
 
-        def add_mtf(rr):
-            try:
-                pair=rr["pair"]; d1h=get_tf(pair,"1H",8); d4h=get_tf(pair,"4H",45); d1d=get_tf(pair,"1D",180)
-                rr["d1h"],rr["d4h"],rr["d1d"]=d1h,d4h,d1d
-                rr["v36_ema"]=v36_ema_pattern_engine(rr["d15"],d1h,d4h,d1d,rr["v33_pullback"])
-                rr["today_structure"]=simple_today_structure(rr["d15"],bars=96)
-            except Exception as exc:
-                rr["v36_ema"]={"signal":"WAIT","score":0,"long_score":0,"short_score":0}
-                rr["error"]=f"{rr.get('pair')}: MTF {type(exc).__name__}: {exc}"
-            return rr
-
-        with ThreadPoolExecutor(max_workers=min(v34_workers,6)) as ex:
-            fs=[ex.submit(add_mtf,rr) for rr in targets]
-            for i,f in enumerate(as_completed(fs),1):
-                rr=f.result(); sig=(rr.get("v36_ema") or {}).get("signal","WAIT")
-                stats["mtf_analyzed"] += 1
-                if sig.startswith("LONG") or sig.startswith("SHORT"):
-                    results.append(rr); stats["directional"] += 1
-                    if sig.endswith("READY"): stats["ready"] += 1
-                    else: stats["watch"] += 1
-                else:
-                    stats["wait"] += 1
-                if rr.get("error") and len(errors)<25: errors.append(rr["error"])
-                bar.progress(40+int(i/max(len(targets),1)*50),text=f"Phase 2/2 — MTF confirmation {i}/{len(targets)}…")
-
+        # If strict EMA20 pullback logic produces no candidates, use the
+        # already-fetched 15m data. Never refetch the whole market here.
         if not results:
-            for rr in phase1[:20]:
-                p=dict(rr.get("v33_pullback") or {})
-                if rr.get("pre_side")=="LONG":
-                    p.update({"signal":"LONG WATCH","stage":"15m EMA/STRUCTURE → WAIT FOR MTF CONFIRMATION","reason":"Bullish 15m EMA/structure candidate found across the market; wait for MTF confirmation."})
-                elif rr.get("pre_side")=="SHORT":
-                    p.update({"signal":"SHORT WATCH","stage":"15m EMA/STRUCTURE → WAIT FOR MTF CONFIRMATION","reason":"Bearish 15m EMA/structure candidate found across the market; wait for MTF confirmation."})
-                else: continue
-                rr["v33_pullback"]=p; results.append(rr)
-            stats["watch"]=len(results); stats["wait"]=0; stats["directional"]=len(results)
-
-        results.sort(key=lambda r:-float((r.get("v36_ema") or {}).get("score",0)))
-        enrich=results[:20]
-        with ThreadPoolExecutor(max_workers=min(v34_workers,4)) as ex:
-            fs=[ex.submit(v33_attach_mtf_path,r) for r in enrich]
-            for f in as_completed(fs):
-                try: f.result()
-                except Exception as exc:
-                    if len(errors)<25: errors.append(f"S/R enrichment: {type(exc).__name__}: {exc}")
-        results=v33_rank(enrich)
-        st.session_state["v34_results"]=results
-
-        # ------------------------------------------------------------------
-        # V36.8 Pump Hunter source data
-        # IMPORTANT: phase1 contains the 15m DataFrame for every successfully
-        # scanned Futures contract. Calculate the 24h return HERE, while that
-        # data is already in memory. The previous V36.7 snapshot expected
-        # pump_24h to already exist, so every value was NaN and Pump Hunter
-        # had nothing to rank.
-        # ------------------------------------------------------------------
-        pump_snapshot = []
-        for rr in phase1:
-            if not rr.get("pair") or rr.get("d15") is None:
-                continue
-            try:
-                c15 = completed(rr["d15"])
-                if c15 is None or len(c15) < 97:
-                    continue
-                close = pd.to_numeric(c15["close"], errors="coerce").dropna()
-                vol = pd.to_numeric(c15["volume"], errors="coerce").dropna()
-                if len(close) < 97 or float(close.iloc[-97]) <= 0:
-                    continue
-
-                # 96 x 15m candles = approximately 24 hours.
-                pump24 = (float(close.iloc[-1]) / float(close.iloc[-97]) - 1.0) * 100.0
-                vol24 = float(vol.tail(96).sum()) if len(vol) >= 96 else np.nan
-
-                # Reuse V36's calculated indicator volume ratio when possible.
-                vr = np.nan
+            fallback = []
+            for rr in results_cache:
                 try:
-                    ind = indicators(c15)
-                    if ind is not None and not ind.empty:
-                        vr = v6_num(ind.iloc[-1].get("vol_ratio"), np.nan)
+                    stx = rr.get("today_structure") or {}
+                    p = dict(rr.get("v33_pullback") or {})
+                    side = stx.get("side")
+
+                    if side in ("LONG", "WATCH LONG"):
+                        p.update({
+                            "signal": "LONG WATCH",
+                            "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
+                            "score": max(float(p.get("score", 0)), 55),
+                            "reason": "Recent 15m HH/HL structure detected. Wait for EMA20 pullback, hold, and local-high break."
+                        })
+                        rr2 = dict(rr)
+                        rr2["v33_pullback"] = p
+                        fallback.append(rr2)
+
+                    elif side in ("SHORT", "WATCH SHORT"):
+                        p.update({
+                            "signal": "SHORT WATCH",
+                            "stage": "STRUCTURE CONFIRMED — WAIT FOR EMA20 TEST",
+                            "score": max(float(p.get("score", 0)), 55),
+                            "reason": "Recent 15m LH/LL structure detected. Wait for EMA20 retest, rejection, and local-low break."
+                        })
+                        rr2 = dict(rr)
+                        rr2["v33_pullback"] = p
+                        fallback.append(rr2)
                 except Exception:
-                    pass
+                    continue
+            results = fallback
+            stats["watch"] = len(results)
+            stats["directional"] = len(results)
 
-                price_now = v6_num(rr.get("price"), np.nan)
-                if not np.isfinite(price_now) or price_now <= 0:
-                    price_now = float(close.iloc[-1])
 
-                pump_snapshot.append({
-                    "pair": rr.get("pair"),
-                    "symbol": rr.get("symbol"),
-                    "price": float(price_now),
-                    "pump_24h": float(pump24),
-                    "volume_24h": float(vol24) if np.isfinite(vol24) else np.nan,
-                    "volume_ratio": float(vr) if np.isfinite(vr) else np.nan,
-                })
-            except Exception as exc:
-                if len(errors) < 25:
-                    errors.append(f"Pump metrics {rr.get('symbol','?')}: {type(exc).__name__}: {exc}")
+        results.sort(key=lambda r: -float((r.get("v33_pullback") or {}).get("score", 0)))
+        enrich = results[:20]
 
-        # Store metrics only, not 539 DataFrames.
-        st.session_state["v367_market_snapshot"] = pump_snapshot
-        st.session_state["v367_snapshot_count"] = len(pump_snapshot)
-        st.session_state["v34_time"]=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        st.session_state["v34_total"]=total
-        st.session_state["v34_stats"]=stats
-        st.session_state["v34_errors"]=errors
-        bar.progress(100,text=f"Complete — {total} Futures scanned")
+        with ThreadPoolExecutor(max_workers=min(v34_workers, 4)) as ex:
+            futures = [ex.submit(v33_attach_mtf_path, r) for r in enrich]
+            for future in as_completed(futures):
+                try:
+                    future.result()
+                except Exception as exc:
+                    if len(errors) < 25:
+                        errors.append(f"MTF enrichment: {type(exc).__name__}: {exc}")
+
+        results = v33_rank(enrich)
+
+        st.session_state["v34_results"] = results
+        st.session_state["v34_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        st.session_state["v34_total"] = total
+        st.session_state["v34_stats"] = stats
+        st.session_state["v34_errors"] = errors
+
+        bar.progress(100, text=f"Complete — {total} Futures checked")
+
     except Exception as e:
-        st.error(f"V36 scan failed: {type(e).__name__}: {e}")
+        st.error(f"V37 scan failed: {type(e).__name__}: {e}")
 
 _saved = st.session_state.get("v34_results", [])
 _stats = st.session_state.get("v34_stats", {})
@@ -5916,11 +5548,11 @@ _scan_errors = st.session_state.get("v34_errors", [])
 if _stats:
     st.caption(
         f"Scan diagnostics — Futures discovered: {_stats.get('universe', 0)} | "
-        f"Live prices matched: {_stats.get('price_matched', 0)} | "
         f"15m data OK: {_stats.get('data_ok', 0)} | "
-        f"15m LONG: {_stats.get('phase1_long', 0)} | 15m SHORT: {_stats.get('phase1_short', 0)} | "
-        f"MTF analyzed: {_stats.get('mtf_analyzed', 0)} | "
-        f"READY: {_stats.get('ready', 0)} | WATCH: {_stats.get('watch', 0)} | WAIT: {_stats.get('wait', 0)} | "
+        f"Directional: {_stats.get('directional', 0)} | "
+        f"READY: {_stats.get('ready', 0)} | "
+        f"WATCH: {_stats.get('watch', 0)} | "
+        f"WAIT: {_stats.get('wait', 0)} | "
         f"Errors: {_stats.get('errors', 0)}"
     )
 
@@ -5932,12 +5564,9 @@ if _scan_errors:
 
 if _saved:
     st.caption(
-        f"Last V36 scan: {st.session_state.get('v34_time', '—')} | "
+        f"Last V37 scan: {st.session_state.get('v34_time', '—')} | "
         f"Futures checked: {st.session_state.get('v34_total', '—')} | candidates: {len(_saved)}"
     )
-
-    st.info("**How V36 decides:** it checks price structure, EMA20/50/100/200, RSI, MACD, ADX, volume/OBV/CMF, ATR, VWAP, Bollinger expansion and 1H/4H/1D trend. The **Why** column translates those checks into plain English. EMA20/50 touch alone never creates an entry; READY still needs the local high/low break.")
-    st.caption("Market scan design: every discovered Futures contract gets the 15m screening pass; only the strongest 15m candidates receive 1H/4H/1D confirmation. READY/WATCH/WAIT counts refer to that MTF-confirmed candidate set, not the entire market.")
 
     for side, title, emoji in (
         ("LONG", "🟢 LONG — FRESH PULLBACK / NEXT-LEG ENTRIES", "🟢"),
@@ -5960,43 +5589,20 @@ if _saved:
                 zone1 = d1.get("S1")
                 sequence = "LH → LL → EMA20 TEST → REJECT → LOCAL LOW BREAK"
 
-            ema = r.get("v36_ema") or {}
-            effective_signal = ema.get("signal") or p.get("signal", "WAIT")
-            stage = ema.get("stage") or p.get("stage", "—")
-            if effective_signal == "WAIT":
+            stage = p.get("stage", "—")
+            if stage == "WAIT":
                 continue
-            # Use the V36 EMA engine as the authoritative EMA source.
-            # The older pullback object can legitimately have NaN EMA fields
-            # after MTF enrichment, while the EMA engine has already computed
-            # the completed 15m EMA20/50/100 state.
-            ema20_value = ema.get("ema20", np.nan)
-            ema50_value = ema.get("ema50", np.nan)
-            ema_dist = ((float(r.get("price")) / float(ema20_value)) - 1.0) * 100.0 \
-                if np.isfinite(ema20_value) and float(ema20_value) > 0 and float(r.get("price", 0)) > 0 else np.nan
+            ema_dist = p.get("ema_distance_pct", np.nan)
             room4 = r.get("v33_room_4h_pct", np.nan)
             side_rows.append({
                 "Coin": r.get("symbol", "—"),
-                "Signal": effective_signal,
+                "Signal": p.get("signal", "WAIT"),
                 "Stage": stage,
                 "Score": r.get("v33_score", 0),
-                "Decision Score": f"L{ema.get('long_score',0)}/S{ema.get('short_score',0)}",
-                "Modules": " / ".join(f"{k[:3]}:{v}" for k,v in (ema.get("modules",{}).get("LONG" if side=="LONG" else "SHORT",{})).items()),
-                "EMA20/50": "TOUCH → UP" if ema.get("ema20_50_touch") and ema.get("ema20_slope",0) > 0 else "TOUCH → DOWN" if ema.get("ema20_50_touch") and ema.get("ema20_slope",0) < 0 else "—",
-                "1H/4H/1D": "/".join([(ema.get(k) or {}).get("direction","—")[:4] for k in ("1H","4H","1D")]),
-                "RSI": f"{ema.get('rsi',np.nan):.1f}" if np.isfinite(ema.get('rsi',np.nan)) else "—",
-                "MACD": "BULL" if ema.get('macd_hist',0)>0 else "BEAR" if ema.get('macd_hist',0)<0 else "—",
-                "ADX": f"{ema.get('adx',np.nan):.1f}" if np.isfinite(ema.get('adx',np.nan)) else "—",
-                "Volume": f"{ema.get('volume_ratio',np.nan):.1f}x" if np.isfinite(ema.get('volume_ratio',np.nan)) else "—",
-                "ATR%": f"{ema.get('atr_pct',np.nan):.2f}" if np.isfinite(ema.get('atr_pct',np.nan)) else "—",
                 "Current": v13_format_price(r.get("price")),
-                "EMA20": v13_format_price(ema20_value),
-                "EMA50": v13_format_price(ema50_value),
-                "EMA100": v13_format_price(ema.get("ema100",np.nan)),
-                "EMA200": v13_format_price(ema.get("ema200",np.nan)),
+                "EMA20": v13_format_price(p.get("ema20")),
                 "EMA dist": f"{ema_dist:.2f}%" if np.isfinite(ema_dist) else "—",
                 "Retests": p.get("retests", 0),
-                "Why": ema.get("why","—"),
-                "Next": ema.get("next_step","—"),
                 "SETUP SEQUENCE": sequence,
                 "Entry trigger": v13_format_price(p.get("local_trigger")),
                 "Invalidation": v13_format_price(p.get("invalidation")),
@@ -6008,1192 +5614,350 @@ if _saved:
         st.subheader(f"{emoji} {title}")
         if side_rows:
             st.dataframe(pd.DataFrame(side_rows[:5]), use_container_width=True, hide_index=True)
-            st.caption("**Why:** V36 does not enter just because an EMA crosses or touches. It waits for agreement between trend, structure, momentum, trend strength, participation, volatility and higher timeframes. **READY** additionally requires the local high/low break.")
         else:
             st.info("No fresh candidates on this side.")
 else:
-    st.info("Run the V36 market scan to find fresh pullback/retest entries.")
+    st.info("Run the V37 market scan to find fresh pullback/retest entries.")
 
 st.divider()
 st.caption(
-    "V36 rule: EMA20/EMA50 touch is a setup, not an entry. The decision combines EMA + structure + RSI + MACD + ADX + volume + ATR/VWAP/Bollinger/OBV + MTF. "
-    "READY requires the actual local high/low break. WATCH means the setup is forming but the trigger is missing. WAIT means the evidence is mixed. Manual signals are analysis-only; no live orders are placed."
+    "Trading rule: READY = trigger is present; WATCH = wait for the EMA20 pullback/retest and confirmation; "
+    "WAIT = no clean structure. Never chase a stretched move. A 4H support/resistance touch is a reaction zone, "
+    "not an automatic entry or reversal. Manual signals are analysis-only; no live orders are placed."
 )
 
 
 # =============================================================================
-# V36.5 — WALK-FORWARD / DUMMY-TRADE BACKTEST LAB
+# V41 — ALL GAINERS / ALL LOSERS PATTERN ANALYZER
 # =============================================================================
-# Purpose:
-#   Test the actual V36 READY decision historically using only information that
-#   would have been available at that candle close. Entries occur on the NEXT
-#   15m candle open, so the backtest does not enter on the same candle that
-#   generated the signal.
-#
-#   Higher timeframes are derived from historical 15m candles and aligned only
-#   through the test timestamp. This keeps the test practical and avoids
-#   thousands of extra API calls while preventing future higher-timeframe data
-#   from leaking into an earlier decision.
-#
-#   This is a research/paper-trading simulation, not a profit guarantee.
-# =============================================================================
-
-from datetime import datetime as _dt, timedelta as _td
-
-@st.cache_data(ttl=900, show_spinner=False)
-def v365_historical_15m(pair, start_ts, end_ts, chunk_days=5):
-    """Fetch historical 15m candles in small chunks to avoid API row limits."""
-    frames = []
-    step = int(chunk_days * 86400)
-    cur = int(start_ts)
-    end_ts = int(end_ts)
-    while cur < end_ts:
-        nxt = min(cur + step, end_ts)
-        try:
-            d = candles(pair, "15", cur, nxt)
-            if d is not None and not d.empty:
-                frames.append(d)
-        except Exception:
-            pass
-        cur = nxt
-    if not frames:
-        return pd.DataFrame()
-    x = pd.concat(frames, ignore_index=True)
-    x = x.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    return x
-
-
-def v365_resample_closed_15m(d15, cutoff):
-    """Create completed 1H/4H/1D bars using only 15m data <= cutoff."""
-    if d15 is None or d15.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    x = d15.copy()
-    x["time"] = pd.to_datetime(x["time"], utc=True, errors="coerce")
-    x = x.dropna(subset=["time"])
-    x = x[x["time"] <= cutoff].copy()
-    if x.empty:
-        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
-    x = x.set_index("time")
-    agg = {
-        "open":"first", "high":"max", "low":"min",
-        "close":"last", "volume":"sum"
-    }
-    out = []
-    for rule in ("1h", "4h", "1D"):
-        z = x.resample(rule, label="right", closed="right").agg(agg).dropna().reset_index()
-        # A bar ending after the decision time is incomplete and must not be used.
-        z = z[z["time"] <= cutoff].reset_index(drop=True)
-        # v36 functions call completed(), so append a harmless sentinel row.
-        if not z.empty:
-            sent = z.iloc[[-1]].copy()
-            sent["time"] = cutoff + _td(seconds=1)
-            z = pd.concat([z, sent], ignore_index=True)
-        out.append(z)
-    return out[0], out[1], out[2]
-
-
-def v365_prepare_decision_frames(d15_all, idx):
-    """Return frames whose last real candle is exactly the signal candle."""
-    if idx < 1 or idx >= len(d15_all):
-        return None
-    cutoff = pd.to_datetime(d15_all.iloc[idx]["time"], utc=True)
-    # Add the next 15m candle as a sentinel so completed() retains idx.
-    base = d15_all.iloc[:idx+1].copy().reset_index(drop=True)
-    d15 = base.copy()
-    if not d15.empty:
-        sent = d15.iloc[[-1]].copy()
-        sent["time"] = cutoff + _td(seconds=1)
-        d15 = pd.concat([d15, sent], ignore_index=True)
-    d1h, d4h, d1d = v365_resample_closed_15m(base, cutoff)
-    return d15, d1h, d4h, d1d, cutoff
-
-
-def v365_trade_result(side, entry, stop, target, bar, fee_pct, slip_pct):
-    """Return intrabar outcome. If stop and target hit in the same candle,
-    conservatively assume STOP was hit first."""
-    if side == "LONG":
-        if entry <= 0 or stop >= entry or target <= entry:
-            return None
-        stop_hit = float(bar["low"]) <= stop
-        target_hit = float(bar["high"]) >= target
-        if stop_hit and target_hit:
-            exit_price = stop * (1.0 - slip_pct/100.0)
-            reason = "STOP (same-bar conflict)"
-        elif stop_hit:
-            exit_price = stop * (1.0 - slip_pct/100.0)
-            reason = "STOP"
-        elif target_hit:
-            exit_price = target * (1.0 - slip_pct/100.0)
-            reason = "TARGET 2R"
-        else:
-            return None
-        gross = (exit_price / entry - 1.0) * 100.0
-    else:
-        if entry <= 0 or stop <= entry or target >= entry:
-            return None
-        stop_hit = float(bar["high"]) >= stop
-        target_hit = float(bar["low"]) <= target
-        if stop_hit and target_hit:
-            exit_price = stop * (1.0 + slip_pct/100.0)
-            reason = "STOP (same-bar conflict)"
-        elif stop_hit:
-            exit_price = stop * (1.0 + slip_pct/100.0)
-            reason = "STOP"
-        elif target_hit:
-            exit_price = target * (1.0 + slip_pct/100.0)
-            reason = "TARGET 2R"
-        else:
-            return None
-        gross = (entry / exit_price - 1.0) * 100.0
-    # Approximate round-trip fee on notional. Slippage is already reflected in
-    # the execution prices.
-    net = gross - (2.0 * fee_pct)
-    return net, exit_price, reason
-
-
-def v365_backtest_one_coin(pair, symbol, d15, risk_pct=1.0, leverage=10.0,
-                           rr=2.0, fee_pct=0.05, slip_pct=0.02,
-                           max_hold_bars=96, check_every=1):
-    """Backtest V36 READY signals on one coin with next-bar entries."""
-    if d15 is None or d15.empty or len(d15) < 300:
-        return [], f"{symbol}: insufficient 15m history ({len(d15) if d15 is not None else 0})"
-
-    x = d15.copy().sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    trades = []
-    open_trade = None
-    # Start after enough history exists for EMA200 + structure.
-    start = 260
-
-    for i in range(start, len(x) - 1, max(1, int(check_every))):
-        bar = x.iloc[i]
-        # Manage an already-open position first.
-        if open_trade is not None:
-            tr = open_trade
-            result = v365_trade_result(
-                tr["side"], tr["entry"], tr["stop"], tr["target"],
-                bar, fee_pct, slip_pct
-            )
-            bars_held = i - tr["entry_idx"]
-            if result is not None:
-                net_pct, exit_price, reason = result
-                # R multiple is based on the original price risk.
-                if tr["side"] == "LONG":
-                    r_mult = (exit_price - tr["entry"]) / (tr["entry"] - tr["stop"])
-                else:
-                    r_mult = (tr["entry"] - exit_price) / (tr["stop"] - tr["entry"])
-                trades.append({
-                    **tr,
-                    "exit_time": bar["time"],
-                    "exit": exit_price,
-                    "exit_reason": reason,
-                    "bars_held": bars_held,
-                    "net_price_pct": net_pct,
-                    "R": r_mult,
-                })
-                open_trade = None
-                continue
-            if bars_held >= max_hold_bars:
-                exit_price = float(bar["close"])
-                if tr["side"] == "LONG":
-                    gross = (exit_price / tr["entry"] - 1.0) * 100.0
-                    r_mult = (exit_price - tr["entry"]) / (tr["entry"] - tr["stop"])
-                else:
-                    gross = (tr["entry"] / exit_price - 1.0) * 100.0
-                    r_mult = (tr["entry"] - exit_price) / (tr["stop"] - tr["entry"])
-                net_pct = gross - 2.0 * fee_pct
-                trades.append({
-                    **tr,
-                    "exit_time": bar["time"],
-                    "exit": exit_price,
-                    "exit_reason": "TIME EXIT",
-                    "bars_held": bars_held,
-                    "net_price_pct": net_pct,
-                    "R": r_mult,
-                })
-                open_trade = None
-                continue
-
-        # No position: evaluate the decision at this completed candle.
-        if open_trade is not None:
-            continue
-
-        prepared = v365_prepare_decision_frames(x, i)
-        if prepared is None:
-            continue
-        d15_dec, d1h, d4h, d1d, cutoff = prepared
-        try:
-            p = v33_pullback_signal(d15_dec, float(x.iloc[i]["close"]))
-            dec = v36_advanced_decision(d15_dec, d1h, d4h, d1d, p)
-        except Exception:
-            continue
-
-        signal = dec.get("signal", "WAIT")
-        if signal not in ("LONG READY", "SHORT READY"):
-            continue
-
-        # Entry occurs on NEXT candle OPEN, never on the signal candle.
-        next_bar = x.iloc[i+1]
-        entry_raw = float(next_bar["open"])
-        side = "LONG" if signal == "LONG READY" else "SHORT"
-
-        invalidation = v6_num(p.get("invalidation"), np.nan)
-        atr = v6_num((dec.get("indicators") or {}).get("atr"), np.nan)
-        if not np.isfinite(invalidation) or invalidation <= 0:
-            if not np.isfinite(atr) or atr <= 0:
-                continue
-            stop = entry_raw - 1.5 * atr if side == "LONG" else entry_raw + 1.5 * atr
-        else:
-            stop = float(invalidation)
-
-        # Apply a small execution slippage to entry.
-        entry = entry_raw * (1.0 + slip_pct/100.0) if side == "LONG" else entry_raw * (1.0 - slip_pct/100.0)
-
-        risk_per_unit = (entry - stop) if side == "LONG" else (stop - entry)
-        if risk_per_unit <= 0 or entry <= 0:
-            continue
-        risk_pct_price = risk_per_unit / entry
-        if risk_pct_price <= 0 or risk_pct_price > 0.25:
-            # Ignore pathological stops wider than 25% of price.
-            continue
-
-        target = entry + rr * risk_per_unit if side == "LONG" else entry - rr * risk_per_unit
-
-        # Position sizing is risk based, capped by leverage. This lets the
-        # report show what a 1% account-risk model would have done without
-        # pretending that leverage itself creates edge.
-        desired_notional = risk_pct / 100.0 / risk_pct_price
-        notional_cap = max(1.0, float(leverage))
-        effective_notional_multiple = min(desired_notional, notional_cap)
-        effective_risk_pct = effective_notional_multiple * risk_pct_price * 100.0
-
-        open_trade = {
-            "pair": pair, "Coin": symbol, "side": side,
-            "signal_time": cutoff,
-            "entry_time": next_bar["time"],
-            "entry": entry, "stop": stop, "target": target,
-            "score": int(dec.get("score", 0)),
-            "long_score": int(dec.get("long_score", 0)),
-            "short_score": int(dec.get("short_score", 0)),
-            "why": dec.get("why", "—"),
-            "next_step": dec.get("next_step", "—"),
-            "risk_pct": effective_risk_pct,
-            "notional_multiple": effective_notional_multiple,
-            "entry_idx": i+1,
-        }
-
-    # Close any final open trade at the last available close.
-    if open_trade is not None:
-        last = x.iloc[-1]
-        tr = open_trade
-        exit_price = float(last["close"])
-        if tr["side"] == "LONG":
-            gross = (exit_price / tr["entry"] - 1.0) * 100.0
-            r_mult = (exit_price - tr["entry"]) / (tr["entry"] - tr["stop"])
-        else:
-            gross = (tr["entry"] / exit_price - 1.0) * 100.0
-            r_mult = (tr["entry"] - exit_price) / (tr["stop"] - tr["entry"])
-        trades.append({
-            **tr,
-            "exit_time": last["time"],
-            "exit": exit_price,
-            "exit_reason": "END OF TEST",
-            "bars_held": len(x) - 1 - tr["entry_idx"],
-            "net_price_pct": gross - 2.0 * fee_pct,
-            "R": r_mult,
-        })
-    return trades, ""
-
-
-def v365_backtest_summary(trades):
-    if not trades:
-        return {
-            "trades":0, "wins":0, "losses":0, "win_rate":0.0,
-            "net_R":0.0, "profit_factor":np.nan, "expectancy_R":0.0,
-            "max_dd_R":0.0, "avg_win_R":0.0, "avg_loss_R":0.0,
-            "longs":0, "shorts":0
-        }
-    r = pd.to_numeric(pd.Series([t.get("R", np.nan) for t in trades]), errors="coerce").dropna()
-    wins = r[r > 0]
-    losses = r[r <= 0]
-    gross_win = float(wins.sum()) if len(wins) else 0.0
-    gross_loss = abs(float(losses.sum())) if len(losses) else 0.0
-    pf = gross_win / gross_loss if gross_loss > 0 else np.inf
-    equity = r.cumsum()
-    peak = equity.cummax()
-    dd = equity - peak
-    return {
-        "trades":len(r), "wins":len(wins), "losses":len(losses),
-        "win_rate":100.0*len(wins)/len(r),
-        "net_R":float(r.sum()),
-        "profit_factor":pf,
-        "expectancy_R":float(r.mean()),
-        "max_dd_R":abs(float(dd.min())) if len(dd) else 0.0,
-        "avg_win_R":float(wins.mean()) if len(wins) else 0.0,
-        "avg_loss_R":float(losses.mean()) if len(losses) else 0.0,
-        "longs":sum(1 for t in trades if t.get("side")=="LONG"),
-        "shorts":sum(1 for t in trades if t.get("side")=="SHORT"),
-    }
-
-
-def v365_backtest_portfolio(trade_rows, starting_equity=10000.0):
-    """Convert each trade's R into a simple sequential paper-equity curve.
-
-    R is the cleanest cross-coin comparison. This curve intentionally treats
-    trades sequentially for reporting; it is NOT a simultaneous portfolio
-    capital-allocation simulation.
-    """
-    if not trade_rows:
-        return pd.DataFrame(), 0.0
-    rows = sorted(trade_rows, key=lambda z: pd.to_datetime(z["exit_time"], utc=True))
-    equity = float(starting_equity)
-    curve = []
-    for t in rows:
-        risk_dollars = equity * max(0.0, float(t.get("risk_pct", 1.0))) / 100.0
-        pnl = risk_dollars * float(t.get("R", 0.0))
-        equity += pnl
-        curve.append({"time":pd.to_datetime(t["exit_time"], utc=True), "equity":equity})
-    return pd.DataFrame(curve), equity
-
-
 st.divider()
-st.header("🧪 V36.5 — Dummy-Trade Backtest")
+st.markdown("## 🔬 V40 — Top 10 Gainers / Top 10 Losers + BTC Relative Momentum Analyzer")
 st.caption(
-    "This section tests the actual V36 READY signal historically. "
-    "The signal is evaluated at a completed 15m candle, the dummy trade enters "
-    "at the NEXT 15m candle open, and stop/target are checked candle-by-candle. "
-    "No live orders are placed."
+    "Ranks active USDT Futures by the latest completed 24H move, then studies "
+    "their 15m, 4H and 1D charts for structure, EMA20 behavior, RSI acceleration, "
+    "volume and MTF support/resistance. This is pattern research, not a guarantee."
 )
 
-bt1, bt2, bt3 = st.columns(3)
-with bt1:
-    bt_days = st.selectbox("Backtest history", [7, 14, 30, 45], index=2, key="v365_days")
-with bt2:
-    bt_universe = st.selectbox(
-        "Backtest universe",
-        ["Current V36 candidates", "10 active Futures", "20 active Futures", "50 active Futures"],
-        index=0, key="v365_universe"
-    )
-with bt3:
-    bt_workers = st.slider("Backtest workers", 1, 6, 4, 1, key="v365_workers")
+v39_workers = st.slider("V39 scan workers", 2, 10, 6, 1, key="v39_workers")
 
-bt4, bt5, bt6 = st.columns(3)
-with bt4:
-    bt_risk = st.number_input("Risk per trade (%)", min_value=0.25, max_value=3.0, value=1.0, step=0.25, key="v365_risk")
-with bt5:
-    bt_leverage = st.selectbox("Leverage cap", [1, 3, 5, 10], index=3, key="v365_lev")
-with bt6:
-    bt_rr = st.selectbox("Take-profit (R)", [1.5, 2.0, 2.5, 3.0], index=1, key="v365_rr")
+def v39_rsi14(close):
+    close = pd.to_numeric(close, errors="coerce")
+    delta = close.diff()
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - 100 / (1 + rs)
 
-bt7, bt8, bt9 = st.columns(3)
-with bt7:
-    bt_fee = st.number_input("Fee per side (%)", min_value=0.0, max_value=0.20, value=0.05, step=0.01, key="v365_fee")
-with bt8:
-    bt_slip = st.number_input("Slippage per side (%)", min_value=0.0, max_value=0.20, value=0.02, step=0.01, key="v365_slip")
-with bt9:
-    bt_hold = st.selectbox("Max holding time", [24, 48, 96, 192], index=2, key="v365_hold")
-
-bt_pairs_text = st.text_input(
-    "Optional custom Futures pairs (comma separated)",
-    placeholder="BTC_USDT, ETH_USDT, SOL_USDT",
-    key="v365_custom_pairs"
-)
-
-st.info(
-    "Recommended first test: 30–45 days, 10–20 liquid Futures, READY-only entries, "
-    "1% risk, 10x leverage cap, 2R target. The important outputs are trade count, "
-    "win rate, profit factor, expectancy in R and maximum drawdown — not just net profit."
-)
-
-if st.button("🧪 RUN V36.5 BACKTEST — DUMMY TRADES", type="primary", key="v365_run"):
-    bt_bar = st.progress(0, text="Preparing backtest universe…")
-    bt_errors = []
+def v39_num(x, default=np.nan):
     try:
-        instruments = active_instruments("USDT")
-        discovered = []
-        seen = set()
-        for inst in instruments:
-            pair = v61_instrument_pair(inst)
-            if not pair:
-                continue
-            pair = str(pair).strip().upper()
-            norm = pair.replace("_","").replace("-","").replace("/","")
-            if norm in seen or "USDT" not in norm:
-                continue
-            seen.add(norm)
-            discovered.append((pair, v61_symbol(inst, pair)))
+        x = float(x)
+        return x if np.isfinite(x) else default
+    except Exception:
+        return default
 
-        custom = [z.strip().upper() for z in bt_pairs_text.split(",") if z.strip()]
-        if custom:
-            universe = []
-            for pair in custom:
-                universe.append((pair, pair))
-        elif bt_universe == "Current V36 candidates":
-            current = st.session_state.get("v34_results", [])
-            universe = [(r.get("pair"), r.get("symbol", r.get("pair"))) for r in current if r.get("pair")]
-            if not universe:
-                universe = discovered[:10]
-                bt_universe_label = "10 active Futures (fallback)"
-            else:
-                bt_universe_label = f"{len(universe)} current V36 candidates"
-        else:
-            n = int(bt_universe.split()[0])
-            universe = discovered[:n]
-            bt_universe_label = f"{n} active Futures"
-        if custom:
-            bt_universe_label = f"{len(universe)} custom pairs"
-
-        end_dt = pd.Timestamp.now(tz="UTC")
-        start_dt = end_dt - pd.Timedelta(days=int(bt_days))
-        start_ts = int(start_dt.timestamp())
-        end_ts = int(end_dt.timestamp())
-
-        all_trades = []
-        per_coin = []
-        total = len(universe)
-        if total == 0:
-            raise RuntimeError("No backtest pairs were available.")
-
-        from concurrent.futures import ThreadPoolExecutor, as_completed
-
-        def fetch_and_test(item):
-            pair, symbol = item
-            d = v365_historical_15m(pair, start_ts, end_ts, 5)
-            if d is None or d.empty:
-                return pair, symbol, [], f"{symbol}: no historical 15m data"
-            trades, err = v365_backtest_one_coin(
-                pair, symbol, d,
-                risk_pct=float(bt_risk),
-                leverage=float(bt_leverage),
-                rr=float(bt_rr),
-                fee_pct=float(bt_fee),
-                slip_pct=float(bt_slip),
-                max_hold_bars=int(bt_hold),
-                check_every=1
-            )
-            return pair, symbol, trades, err
-
-        done = 0
-        with ThreadPoolExecutor(max_workers=int(bt_workers)) as ex:
-            futures = [ex.submit(fetch_and_test, u) for u in universe]
-            for f in as_completed(futures):
-                done += 1
-                pair, symbol, trades, err = f.result()
-                all_trades.extend(trades)
-                s = v365_backtest_summary(trades)
-                per_coin.append({
-                    "Coin": symbol, "Trades": s["trades"], "Win rate": f'{s["win_rate"]:.1f}%',
-                    "Net R": f'{s["net_R"]:+.2f}', "PF": "∞" if np.isinf(s["profit_factor"]) else f'{s["profit_factor"]:.2f}',
-                    "Expectancy R": f'{s["expectancy_R"]:+.3f}', "Max DD R": f'{s["max_dd_R"]:.2f}',
-                    "LONG": s["longs"], "SHORT": s["shorts"]
-                })
-                if err:
-                    bt_errors.append(err)
-                bt_bar.progress(int(done/max(total,1)*85), text=f"Backtesting {done}/{total} coins…")
-
-        overall = v365_backtest_summary(all_trades)
-        curve, final_equity = v365_backtest_portfolio(all_trades, 10000.0)
-
-        st.session_state["v365_trades"] = all_trades
-        st.session_state["v365_summary"] = overall
-        st.session_state["v365_per_coin"] = per_coin
-        st.session_state["v365_curve"] = curve
-        st.session_state["v365_final_equity"] = final_equity
-        st.session_state["v365_bt_errors"] = bt_errors
-        st.session_state["v365_label"] = bt_universe_label
-        st.session_state["v365_window"] = f"{start_dt.strftime('%Y-%m-%d')} → {end_dt.strftime('%Y-%m-%d')}"
-        bt_bar.progress(100, text=f"Backtest complete — {overall['trades']} dummy trades")
-    except Exception as exc:
-        bt_bar.progress(100, text="Backtest failed")
-        st.error(f"V36.5 backtest failed: {type(exc).__name__}: {exc}")
-
-_bt_sum = st.session_state.get("v365_summary")
-_bt_trades = st.session_state.get("v365_trades", [])
-if _bt_sum is not None:
-    st.subheader("📊 Backtest Result")
-    st.caption(
-        f"Window: {st.session_state.get('v365_window','—')} | "
-        f"Universe: {st.session_state.get('v365_label','—')} | "
-        f"READY-only entries | Next-bar-open execution"
-    )
-
-    m1,m2,m3,m4,m5,m6 = st.columns(6)
-    m1.metric("Trades", _bt_sum["trades"])
-    m2.metric("Win rate", f'{_bt_sum["win_rate"]:.1f}%')
-    pf = _bt_sum["profit_factor"]
-    m3.metric("Profit factor", "∞" if np.isinf(pf) else f'{pf:.2f}')
-    m4.metric("Net R", f'{_bt_sum["net_R"]:+.2f}')
-    m5.metric("Expectancy", f'{_bt_sum["expectancy_R"]:+.3f} R')
-    m6.metric("Max DD", f'{_bt_sum["max_dd_R"]:.2f} R')
-
-    if _bt_sum["trades"] == 0:
-        st.warning(
-            "No historical V36 READY trades were found in this sample. "
-            "That is a valid result — it means the strategy is very selective, "
-            "or the sample/universe is too small. Increase history/universe before drawing conclusions."
-        )
-    else:
-        st.write(
-            f"**Plain English:** {_bt_sum['wins']} winning trades and {_bt_sum['losses']} losing trades. "
-            f"Average winning trade = {_bt_sum['avg_win_R']:+.2f}R; average losing trade = {_bt_sum['avg_loss_R']:+.2f}R. "
-            f"LONG trades = {_bt_sum['longs']}; SHORT trades = {_bt_sum['shorts']}."
-        )
-        if _bt_sum["expectancy_R"] > 0 and _bt_sum["profit_factor"] > 1:
-            st.success(
-                "The historical sample has positive expectancy and profit factor above 1. "
-                "That is evidence worth further testing, not proof of future profitability."
-            )
-        else:
-            st.warning(
-                "The historical sample does not show positive expectancy and profit factor above 1. "
-                "Treat the current strategy as needing refinement rather than assuming an edge."
-            )
-
-        curve = st.session_state.get("v365_curve")
-        if curve is not None and not curve.empty:
-            st.markdown("### Paper-equity curve")
-            st.line_chart(curve.set_index("time")["equity"])
-            st.caption(
-                "The displayed equity curve applies the configured risk per trade to a sequential "
-                "trade stream. It is for strategy comparison and is not a simultaneous multi-position account simulation."
-            )
-
-        pc = st.session_state.get("v365_per_coin", [])
-        if pc:
-            st.markdown("### Results by coin")
-            st.dataframe(pd.DataFrame(pc).sort_values(["Trades","Net R"], ascending=[False,False]),
-                         use_container_width=True, hide_index=True)
-
-        st.markdown("### Dummy trades")
-        trade_table = []
-        for t in sorted(_bt_trades, key=lambda z: pd.to_datetime(z["entry_time"], utc=True)):
-            trade_table.append({
-                "Coin":t.get("Coin","—"),
-                "Side":t.get("side","—"),
-                "Signal":f'{t.get("side","—")} READY',
-                "Signal time":str(t.get("signal_time","—")),
-                "Entry":v13_format_price(t.get("entry")),
-                "Stop":v13_format_price(t.get("stop")),
-                "Target":v13_format_price(t.get("target")),
-                "Exit":v13_format_price(t.get("exit")),
-                "Result":f'{t.get("R",0):+.2f}R',
-                "Price P/L":f'{t.get("net_price_pct",0):+.2f}%',
-                "Exit reason":t.get("exit_reason","—"),
-                "Score":t.get("score",0),
-                "Why":t.get("why","—"),
-            })
-        st.dataframe(pd.DataFrame(trade_table), use_container_width=True, hide_index=True)
-
-        st.info(
-            "Backtest discipline: no same-candle entries, no future higher-timeframe candles, "
-            "conservative stop-first handling when stop and target are both touched in one candle, "
-            "fees/slippage included, and leverage is capped rather than treated as an edge."
-        )
-
-    errs = st.session_state.get("v365_bt_errors", [])
-    if errs:
-        with st.expander("Backtest data errors"):
-            for e in errs[:50]:
-                st.write(e)
-
-
-# =============================================================================
-# V36.6 — LIVE PUMP HUNTER / PUMP REVERSAL & NEXT-LEG MODULE
-# =============================================================================
-# Finds the strongest currently pumping USDT Futures contracts and then asks:
-#   1) Is the pump still healthy and potentially setting up a next leg LONG?
-#   2) Has the pump started reversing, creating a SHORT setup?
-#   3) Is it simply too extended / not confirmed yet?
-#
-# A large pump or high volume NEVER creates a trade by itself.
-# The module requires price structure + EMA + RSI + MACD + ADX + volume and
-# higher-timeframe context before calling a setup actionable.
-# =============================================================================
-
-def v366_pick_number(rec, keys):
-    if not isinstance(rec, dict):
+def v39_pct(a, b):
+    a, b = v39_num(a), v39_num(b)
+    if not np.isfinite(a) or not np.isfinite(b) or b == 0:
         return np.nan
-    for k in keys:
-        if k in rec:
-            val = v6_num(rec.get(k), np.nan)
-            if np.isfinite(val):
-                return float(val)
-    return np.nan
+    return (a / b - 1.0) * 100.0
 
+def v39_metrics(d, lookback):
+    out = {
+        "price": np.nan, "rsi": np.nan, "rsi_change": np.nan,
+        "ema20_dist": np.nan, "vol_ratio": np.nan, "structure": "MIXED",
+        "side": "WAIT"
+    }
+    try:
+        d = completed(d)
+        if d is None or len(d) < 20:
+            return out
+        d = d.reset_index(drop=True)
+        c = pd.to_numeric(d["close"], errors="coerce")
+        h = pd.to_numeric(d["high"], errors="coerce")
+        l = pd.to_numeric(d["low"], errors="coerce")
+        v = pd.to_numeric(d.get("volume", pd.Series(index=d.index)), errors="coerce")
 
-def v366_extract_24h_change(rec):
-    """Flexible extraction for CoinDCX ticker field-name variations."""
-    pct = v366_pick_number(rec, [
-        "change_24h_pct", "change24h_pct", "price_change_percent_24h",
-        "price_change_pct_24h", "change_percent_24h", "change_24h",
-        "change24h", "percent_change_24h", "price_change_percent",
-        "change_percent", "change_pct"
-    ])
-    # Some feeds return absolute 24h change rather than percent. Only use
-    # clearly named percent fields first; absolute fields are intentionally
-    # excluded to avoid treating a price difference as a percentage.
-    return pct
+        out["price"] = v39_num(c.iloc[-1])
+        rsi = v39_rsi14(c)
+        out["rsi"] = v39_num(rsi.iloc[-1])
+        if len(rsi) >= 3:
+            out["rsi_change"] = v39_num(rsi.iloc[-1] - rsi.iloc[-3])
 
+        ema20 = c.ewm(span=20, adjust=False).mean()
+        out["ema20_dist"] = v39_pct(c.iloc[-1], ema20.iloc[-1])
 
-def v366_extract_24h_volume(rec):
-    return v366_pick_number(rec, [
-        "volume_24h", "quote_volume_24h", "turnover_24h",
-        "volume24h", "quoteVolume24h", "volume"
-    ])
+        if len(v) >= 20 and np.isfinite(v.tail(20).mean()) and v.tail(20).mean() != 0:
+            out["vol_ratio"] = v39_num(v.iloc[-1] / v.tail(20).mean())
 
+        highs, lows = [], []
+        for i in range(2, len(d)-2):
+            if np.isfinite(h.iloc[i]) and h.iloc[i] >= h.iloc[i-2:i+3].max() and h.iloc[i] > h.iloc[i-1] and h.iloc[i] >= h.iloc[i+1]:
+                highs.append(float(h.iloc[i]))
+            if np.isfinite(l.iloc[i]) and l.iloc[i] <= l.iloc[i-2:i+3].min() and l.iloc[i] < l.iloc[i-1] and l.iloc[i] <= l.iloc[i+1]:
+                lows.append(float(l.iloc[i]))
 
-def v366_normalize_live_map(prices):
-    out = {}
-    if isinstance(prices, dict):
-        for key, rec in prices.items():
-            if isinstance(rec, dict):
-                pair = rec.get("pair") or rec.get("symbol") or rec.get("mkt") or rec.get("market") or key
-                out[str(pair).strip().upper()] = rec
-            else:
-                out[str(key).strip().upper()] = {"pair": key, "price": rec}
-    elif isinstance(prices, list):
-        for rec in prices:
-            if not isinstance(rec, dict):
-                continue
-            pair = rec.get("pair") or rec.get("symbol") or rec.get("mkt") or rec.get("market")
-            if pair:
-                out[str(pair).strip().upper()] = rec
+        hh = len(highs) >= 2 and highs[-1] > highs[-2]
+        lh = len(highs) >= 2 and highs[-1] < highs[-2]
+        hl = len(lows) >= 2 and lows[-1] > lows[-2]
+        ll = len(lows) >= 2 and lows[-1] < lows[-2]
+
+        if hh and hl:
+            out["structure"], out["side"] = "HH + HL", "LONG"
+        elif lh and ll:
+            out["structure"], out["side"] = "LH + LL", "SHORT"
+        elif hh or hl:
+            out["structure"], out["side"] = "DEVELOPING BULLISH", "WATCH LONG"
+        elif lh or ll:
+            out["structure"], out["side"] = "DEVELOPING BEARISH", "WATCH SHORT"
+    except Exception:
+        pass
     return out
 
+def v39_pattern(m15, h4, move24):
+    if move24 >= 15:
+        if m15["structure"] == "HH + HL" and m15["ema20_dist"] > 3:
+            return "🚀 PUMP + HEALTHY TREND / EXTENDED"
+        if h4["rsi_change"] >= 6 and h4["vol_ratio"] >= 1.5:
+            return "🚀 RSI / VOLUME ACCELERATION"
+        if m15["structure"] == "LH + LL":
+            return "⚠️ PUMP → REVERSAL"
+        return "🚀 STRONG PUMP"
+    if move24 <= -15:
+        if m15["structure"] == "LH + LL" and m15["ema20_dist"] < -3:
+            return "🔻 DUMP + BEARISH CONTINUATION"
+        if h4["rsi_change"] <= -6 and h4["vol_ratio"] >= 1.5:
+            return "🔻 RSI / VOLUME SELLING ACCELERATION"
+        if m15["structure"] == "HH + HL":
+            return "⚠️ DUMP → RECOVERY"
+        return "🔻 STRONG DUMP"
+    if m15["structure"] == "HH + HL":
+        return "🟢 BULLISH STRUCTURE"
+    if m15["structure"] == "LH + LL":
+        return "🔴 BEARISH STRUCTURE"
+    return "⚪ MIXED / CONSOLIDATION"
 
-def v366_pump_decision(pair, symbol, price, d15, d1h, d4h, d1d, pump_pct, vol24h=np.nan):
-    """Pump Hunter decision with explicit continuation/reversal phases.
-
-    IMPORTANT:
-      * Highest pump != automatic SHORT.
-      * LONG READY requires a bullish structure AND breakout AND volume
-        confirmation. A bullish dashboard with weak volume is WATCH, not READY.
-      * SHORT READY requires reversal structure AND breakdown AND selling-volume
-        confirmation.
-    """
-    try:
-        c15 = completed(d15)
-        if c15 is None or len(c15) < 120:
-            return None
-
-        ind15 = indicators(c15)
-        if ind15 is None or ind15.empty:
-            return None
-        r = ind15.iloc[-1]
-
-        rsi = v6_num(r.get("rsi"), np.nan)
-        adx = v6_num(r.get("adx"), np.nan)
-        pdi = v6_num(r.get("pdi"), np.nan)
-        mdi = v6_num(r.get("mdi"), np.nan)
-        macd = v6_num(r.get("macd"), np.nan)
-        macds = v6_num(r.get("macd_signal"), np.nan)
-        hist = v6_num(r.get("macd_hist"), np.nan)
-        vr = v6_num(r.get("vol_ratio"), np.nan)
-        atrp = v6_num(r.get("atr_pct"), np.nan)
-        vwap_dist = v6_num(r.get("vwap_dist_pct"), np.nan)
-        bbwidth = v6_num(r.get("bb_width_pct"), np.nan)
-
-        c1h = completed(d1h)
-        c4 = completed(d4h)
-        c1d = completed(d1d)
-
-        e15 = v71_ema_transition(c15, 8)
-        e4 = v71_ema_transition(c4, 6) if c4 is not None and not c4.empty else {}
-        e1d = v71_ema_transition(c1d, 6) if c1d is not None and not c1d.empty else {}
-        s15 = v71_structure_tf(c15, "15m")
-
-        # Recent highs/lows use PRIOR candles only, so the current price can
-        # genuinely be tested against a trigger level.
-        highs = pd.to_numeric(c15["high"], errors="coerce")
-        lows = pd.to_numeric(c15["low"], errors="coerce")
-        closes = pd.to_numeric(c15["close"], errors="coerce")
-        vols = pd.to_numeric(c15["volume"], errors="coerce")
-
-        prior_hi = float(highs.tail(21).iloc[:-1].max()) if len(highs) >= 22 else np.nan
-        prior_lo = float(lows.tail(21).iloc[:-1].min()) if len(lows) >= 22 else np.nan
-        recent_high_24h = float(highs.tail(96).max()) if len(highs) >= 96 else np.nan
-        recent_low_24h = float(lows.tail(96).min()) if len(lows) >= 96 else np.nan
-
-        long_break = np.isfinite(prior_hi) and price > prior_hi
-        short_break = np.isfinite(prior_lo) and price < prior_lo
-
-        from_recent_high = (
-            (price / recent_high_24h - 1.0) * 100.0
-            if np.isfinite(recent_high_24h) and recent_high_24h > 0 else np.nan
-        )
-
-        # Current volume must be compared with the recent baseline. This is
-        # separate from 24h turnover: high turnover does not mean a breakout
-        # has current participation.
-        volume_confirm = np.isfinite(vr) and vr >= 1.20
-        volume_strong = np.isfinite(vr) and vr >= 1.50
-
-        # Recent volume direction: useful for distinguishing a healthy
-        # continuation from a pump that is fading.
-        vol_rising = False
-        if len(vols) >= 8:
-            v_now = float(vols.tail(3).mean())
-            v_prev = float(vols.iloc[-8:-3].mean())
-            vol_rising = v_prev > 0 and v_now > v_prev * 1.10
-
-        # Pump phase.
-        if np.isfinite(rsi) and rsi >= 78:
-            pump_phase = "EXTENDED"
-        elif long_break and volume_confirm:
-            pump_phase = "BREAKOUT / NEXT LEG"
-        elif s15.get("hh") and s15.get("hl"):
-            pump_phase = "HEALTHY PULLBACK / CONTINUATION"
-        elif (s15.get("lh") or s15.get("ll")) and not e15.get("bullish"):
-            pump_phase = "REVERSAL DEVELOPING"
-        else:
-            pump_phase = "PUMP / CONSOLIDATION"
-
-        v10 = None
+def v40_find_btc_pair():
+    for raw in active_instruments("USDT"):
         try:
-            v10 = v10_extreme_move_signal(
-                pair, symbol,
-                {"15m": d15, "1H": d1h, "4H": d4h, "1D": d1d},
-                price
-            )
+            pair = v61_instrument_pair(raw)
+            symbol = v61_symbol(raw, pair)
+            s = f"{pair} {symbol}".upper().replace("-", "_")
+            if "BTC" in s and "USDT" in s:
+                return pair
         except Exception:
-            pass
+            continue
+    return "B-BTC_USDT"
 
-        long_score = 0
-        short_score = 0
-        long_reasons = []
-        short_reasons = []
-        warnings = []
-
-        # Pump magnitude identifies the coin as a Pump Hunter candidate, but
-        # deliberately gives only modest decision weight.
-        if np.isfinite(pump_pct):
-            long_reasons.append(f"24h pump +{pump_pct:.1f}%")
-            short_reasons.append(f"24h pump +{pump_pct:.1f}%")
-            if pump_pct >= 30:
-                long_score += 10; short_score += 10
-            elif pump_pct >= 20:
-                long_score += 8; short_score += 8
-            elif pump_pct >= 10:
-                long_score += 5; short_score += 5
-
-        # ---------------- LONG continuation ----------------
-        if s15.get("hh") and s15.get("hl"):
-            long_score += 20
-            long_reasons.append("15m HH + HL structure is intact")
-        elif s15.get("hh") or s15.get("hl"):
-            long_score += 10
-            long_reasons.append("15m structure is improving")
-        else:
-            warnings.append("no clean HH + HL continuation structure")
-
-        if e15.get("bullish"):
-            long_score += 12
-            long_reasons.append("15m EMA structure is bullish")
-        if e4.get("bullish"):
-            long_score += 8
-            long_reasons.append("4H EMA structure is bullish")
-        if e1d.get("bullish"):
-            long_score += 5
-            long_reasons.append("1D EMA structure is bullish")
-
-        if np.isfinite(rsi):
-            if 52 <= rsi <= 68:
-                long_score += 10
-                long_reasons.append(f"RSI {rsi:.1f} is healthy")
-            elif 68 < rsi < 75:
-                long_score += 5
-                long_reasons.append(f"RSI {rsi:.1f} is strong but getting extended")
-            elif 75 <= rsi < 78:
-                long_score += 2
-                warnings.append(f"RSI {rsi:.1f} is extended; don't chase")
-            elif rsi >= 78:
-                warnings.append(f"RSI {rsi:.1f} is very extended; don't chase LONG")
-            elif rsi < 45:
-                warnings.append(f"RSI {rsi:.1f} does not confirm bullish momentum")
-
-        if np.isfinite(macd) and np.isfinite(macds):
-            if macd > macds and hist > 0:
-                long_score += 10
-                long_reasons.append("MACD confirms bullish momentum")
-            else:
-                warnings.append("MACD is not confirming the bullish continuation")
-
-        if np.isfinite(adx):
-            if adx >= 25:
-                long_score += 8
-                long_reasons.append(f"ADX {adx:.1f} confirms trend strength")
-            elif adx >= 20:
-                long_score += 4
-                long_reasons.append(f"ADX {adx:.1f} shows a developing trend")
-            else:
-                warnings.append(f"ADX {adx:.1f} is weak")
-
-        if volume_strong:
-            long_score += 8
-            long_reasons.append(f"volume is {vr:.1f}x average")
-        elif volume_confirm:
-            long_score += 5
-            long_reasons.append(f"volume is {vr:.1f}x average")
-        else:
-            warnings.append(
-                f"volume is only {vr:.1f}x average" if np.isfinite(vr)
-                else "volume confirmation is unavailable"
-            )
-
-        if np.isfinite(vwap_dist) and vwap_dist > 0:
-            long_score += 3
-            long_reasons.append("price is above VWAP")
-
-        if np.isfinite(bbwidth) and np.isfinite(atrp) and bbwidth > 5 and atrp > 1:
-            long_score += 4
-            long_reasons.append("volatility is expanding")
-
-        if long_break:
-            long_score += 12
-            long_reasons.append("local 15m high has broken")
-
-        # ---------------- SHORT reversal ----------------
-        if s15.get("lh") and s15.get("ll"):
-            short_score += 25
-            short_reasons.append("15m LH + LL confirms reversal")
-        elif s15.get("lh") or s15.get("ll"):
-            short_score += 10
-            short_reasons.append("15m structure is weakening")
-        else:
-            warnings.append("no confirmed LH + LL; do not short the pump")
-
-        if e15.get("bearish"):
-            short_score += 12
-            short_reasons.append("15m EMA structure turned bearish")
-        if e15.get("fresh_bearish"):
-            short_score += 8
-            short_reasons.append("fresh bearish EMA transition")
-        if e4.get("bearish"):
-            short_score += 8
-            short_reasons.append("4H EMA structure is bearish")
-
-        if np.isfinite(rsi):
-            if 30 <= rsi <= 48:
-                short_score += 10
-                short_reasons.append(f"RSI {rsi:.1f} confirms weakening momentum")
-            elif rsi < 30:
-                short_score += 3
-                warnings.append(f"RSI {rsi:.1f} is oversold; short may be late")
-            elif rsi > 60:
-                warnings.append(f"RSI {rsi:.1f} is still strong for a short")
-
-        if np.isfinite(macd) and np.isfinite(macds):
-            if macd < macds and hist < 0:
-                short_score += 10
-                short_reasons.append("MACD confirms bearish momentum")
-            else:
-                warnings.append("MACD has not confirmed the reversal")
-
-        if np.isfinite(adx):
-            if adx >= 25:
-                short_score += 8
-                short_reasons.append(f"ADX {adx:.1f} confirms trend strength")
-            elif adx >= 20:
-                short_score += 4
-                short_reasons.append(f"ADX {adx:.1f} shows a developing trend")
-            else:
-                warnings.append(f"ADX {adx:.1f} is weak")
-
-        if np.isfinite(mdi) and np.isfinite(pdi) and mdi > pdi:
-            short_score += 5
-            short_reasons.append("-DI is above +DI")
-
-        if volume_strong:
-            short_score += 8
-            short_reasons.append(f"selling volume is {vr:.1f}x average")
-        elif volume_confirm and (vol_rising or short_break):
-            short_score += 5
-            short_reasons.append(f"volume is {vr:.1f}x average")
-        else:
-            warnings.append("selling-volume confirmation is missing")
-
-        if np.isfinite(from_recent_high) and from_recent_high <= -3:
-            short_score += 6
-            short_reasons.append(f"price is {abs(from_recent_high):.1f}% below the 24h high")
-
-        if short_break:
-            short_score += 12
-            short_reasons.append("local 15m low has broken")
-
-        # MTF confirmation.
-        mtf_bull = sum(bool(x.get("bullish")) for x in (e15, e4, e1d))
-        mtf_bear = sum(bool(x.get("bearish")) for x in (e15, e4, e1d))
-        if mtf_bull >= 2:
-            long_score += 8
-            long_reasons.append("higher timeframes support continuation")
-        if mtf_bear >= 2:
-            short_score += 8
-            short_reasons.append("higher timeframes support reversal")
-
-        v10_side = v10.get("side") if v10 else None
-        v10_score = int(v10.get("score", 0)) if v10 else 0
-        if v10_side == "SHORT" and v10_score >= V10_MIN_SCORE:
-            short_score += 4
-            short_reasons.append("pump/reversal model also sees downside risk")
-        elif v10_side == "LONG" and v10_score >= V10_MIN_SCORE:
-            long_score += 4
-            long_reasons.append("pump model also sees continuation risk")
-
-        # FINAL TRIGGER RULES.
-        # A pump is never shorted merely because it is the top gainer.
-        long_confirm = (
-            s15.get("hh") and s15.get("hl") and
-            e15.get("bullish") and
-            np.isfinite(rsi) and 50 <= rsi < 75 and
-            np.isfinite(macd) and np.isfinite(macds) and macd > macds and hist > 0 and
-            np.isfinite(adx) and adx >= 20 and
-            volume_confirm
-        )
-        short_confirm = (
-            s15.get("lh") and s15.get("ll") and
-            e15.get("bearish") and
-            np.isfinite(rsi) and rsi < 50 and
-            np.isfinite(macd) and np.isfinite(macds) and macd < macds and hist < 0 and
-            np.isfinite(adx) and adx >= 20 and
-            volume_confirm
-        )
-
-        # READY requires the price trigger too.
-        long_ready = bool(long_confirm and long_break and rsi < 75)
-        short_ready = bool(short_confirm and short_break)
-
-        if long_ready and long_score >= short_score:
-            decision = "🟢 LONG READY"
-            next_step = "Local high broke with momentum and volume confirmation. Use the latest HL as the structural invalidation reference."
-            chosen = long_score
-            reasons = long_reasons
-        elif short_ready and short_score > long_score:
-            decision = "🔴 SHORT READY"
-            next_step = "Pump reversal is confirmed. Use the latest LH as the structural invalidation reference."
-            chosen = short_score
-            reasons = short_reasons
-        elif short_score >= 55 and short_score > long_score:
-            decision = "🔴 SHORT WATCH"
-            next_step = "Do NOT short the pump yet. Wait for LH → LL, bearish momentum, selling volume and a local-low break."
-            chosen = short_score
-            reasons = short_reasons
-        elif long_score >= 55:
-            decision = "🟡 LONG WATCH"
-            next_step = "Do NOT chase the pump. Wait for EMA20/50 support, volume expansion and a local-high break."
-            chosen = long_score
-            reasons = long_reasons
-        else:
-            decision = "⚪ WAIT"
-            next_step = "The pump is not confirmed for continuation or reversal. Wait for structure and volume to develop."
-            chosen = max(long_score, short_score)
-            reasons = long_reasons if long_score >= short_score else short_reasons
-
-        # Explicitly downgrade a bullish setup with weak volume. This is the
-        # exact behavior requested for charts like the ONEUSDT example.
-        if decision == "🟢 LONG READY" and not volume_confirm:
-            decision = "🟡 LONG WATCH"
-            next_step = "Bullish setup exists, but volume confirmation is missing. Wait for volume expansion and the local-high break."
-        if decision == "🔴 SHORT READY" and not volume_confirm:
-            decision = "🔴 SHORT WATCH"
-            next_step = "Bearish setup exists, but selling-volume confirmation is missing. Wait for volume expansion and the local-low break."
-
-        # Deduplicate warnings/reasons.
-        reasons = list(dict.fromkeys(reasons))
-        warnings = list(dict.fromkeys(warnings))
-
-        why = "; ".join(reasons[:7]) if reasons else "Indicators are mixed."
-        if warnings:
-            why += ". Caution: " + "; ".join(warnings[:4])
-
-        return {
-            "pair": pair, "symbol": symbol, "price": float(price),
-            "pump_24h": float(pump_pct) if np.isfinite(pump_pct) else np.nan,
-            "volume_24h": float(vol24h) if np.isfinite(vol24h) else np.nan,
-            "decision": decision,
-            "pump_phase": pump_phase,
-            "score": int(max(0, min(100, chosen))),
-            "long_score": int(max(0, min(100, long_score))),
-            "short_score": int(max(0, min(100, short_score))),
-            "rsi": rsi, "adx": adx, "volume_ratio": vr,
-            "macd_hist": hist, "atr_pct": atrp, "vwap_dist_pct": vwap_dist,
-            "from_recent_high": from_recent_high,
-            "ema20": v6_num(r.get("ema20"), np.nan),
-            "ema50": v6_num(r.get("ema50"), np.nan),
-            "next_step": next_step,
-            "why": why + ".",
-            "reasons": reasons[:10],
-            "warnings": warnings[:8],
-            "local_high": prior_hi, "local_low": prior_lo,
-            "long_break": bool(long_break), "short_break": bool(short_break),
-            "volume_confirm": bool(volume_confirm),
-            "v10_side": v10_side or "—", "v10_score": v10_score,
-        }
-    except Exception as exc:
-        # Keep the scan alive for other pumped coins; surface the error in the
-        # Pump Hunter diagnostics rather than silently failing the whole scan.
-        return {
-            "pair": pair, "symbol": symbol, "error": f"{type(exc).__name__}: {exc}"
-        }
-
-def v367_scan_top_pumps(max_coins=10, workers=6):
-    """Fast market-wide Pump Hunter.
-
-    V36 already scans every active Futures contract on 15m. V36.7 reuses those
-    results to rank the strongest 24h movers, then fetches 15m/1H/4H/1D data
-    ONLY for the top movers. This avoids the previous design's 500+ extra
-    historical candle requests, which could appear to hang.
-    """
-    snapshot = st.session_state.get("v367_market_snapshot", [])
-    if not snapshot:
-        raise RuntimeError(
-            "Run the main V36 market scan once first. V36.7 reuses its 539-coin "
-            "15m scan to identify the highest-pumped Futures without making "
-            "another hundreds-of-requests scan."
-        )
-
-    valid = [
-        x for x in snapshot
-        if np.isfinite(v6_num(x.get("price"), np.nan))
-        and float(v6_num(x.get("price"), np.nan)) > 0
-        and np.isfinite(v6_num(x.get("pump_24h"), np.nan))
-    ]
-    valid.sort(key=lambda x: float(x["pump_24h"]), reverse=True)
-    top = valid[:max(1, int(max_coins))]
-
-    from concurrent.futures import ThreadPoolExecutor, as_completed
-    results = []
-    errors = []
-
-    def analyze(item):
-        try:
-            pair = item["pair"]
-            symbol = item.get("symbol", pair)
-            price = float(item["price"])
-            data = {
-                "15m": get_tf(pair, "15m", 8),
-                "1H": get_tf(pair, "1H", 12),
-                "4H": get_tf(pair, "4H", 35),
-                "1D": get_tf(pair, "1D", 180),
-            }
-            r = v366_pump_decision(
-                pair, symbol, price,
-                data["15m"], data["1H"], data["4H"], data["1D"],
-                float(item["pump_24h"]), item.get("volume_24h", np.nan)
-            )
-            return r, None
-        except Exception as exc:
-            return None, f"{item.get('pair','?')}: {type(exc).__name__}: {exc}"
-
-    with ThreadPoolExecutor(max_workers=max(1, int(workers))) as ex:
-        fs = [ex.submit(analyze, x) for x in top]
-        for f in as_completed(fs):
-            r, err = f.result()
-            if r and "error" not in r:
-                results.append(r)
-            elif r and r.get("error"):
-                errors.append(f"{r.get('pair','?')}: {r.get('error')}")
-            if err:
-                errors.append(err)
-
-    results.sort(key=lambda r: float(r.get("pump_24h", -999999)), reverse=True)
-    return results, len(valid), errors
-
-
-st.divider()
-st.header("🚀 V36.9 — Highest Pump Hunter / Next-Leg & Reversal")
-st.caption(
-    "Ranks the strongest current USDT Futures using the 15m data already "
-    "collected by the main V36 scan, then deeply analyzes only the top movers."
-)
-
-ph1, ph2 = st.columns(2)
-with ph1:
-    ph_top = st.selectbox("Top pumped coins", [5, 10, 15], index=1, key="v367_top")
-with ph2:
-    ph_workers = st.slider("Pump analysis workers", 2, 8, 6, 1, key="v367_workers")
-
-st.info(
-    "**First run the main V36 market scan, then run Pump Hunter.** "
-    "V36.8 ranks every Futures contract that successfully supplied 15m data "
-    "using its actual trailing 24-hour price change. It then deeply analyzes "
-    "only the top movers. A large pump is NOT automatically a SHORT: "
-    "SHORT requires reversal structure and a local-low break. A healthy pump "
-    "can instead produce a LONG WATCH/READY continuation setup."
-)
-
-if st.button("🚀 SCAN HIGHEST PUMPED COINS NOW", type="primary", key="v367_run"):
-    ph_bar = st.progress(0, text="Ranking the 24h movers from the V36 market scan…")
+def v40_btc_context(coin15, coin4, btc15, btc4):
+    out = {
+        "btc24h": np.nan, "relative24h": np.nan,
+        "btc8h": np.nan, "relative8h": np.nan,
+        "corr4h": np.nan, "same_dir4h": np.nan,
+        "beta4h": np.nan, "regime": "UNKNOWN"
+    }
     try:
-        ph_bar.progress(20, text="Selecting the highest-pumped Futures…")
-        ph_results, ph_universe, ph_errors = v367_scan_top_pumps(
-            max_coins=int(ph_top), workers=int(ph_workers)
-        )
-        st.session_state["v367_results"] = ph_results
-        st.session_state["v367_universe"] = ph_universe
-        st.session_state["v367_errors"] = ph_errors
-        st.session_state["v367_time"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        ph_bar.progress(100, text=f"Complete — deeply analyzed {len(ph_results)} top movers")
-    except Exception as exc:
-        ph_bar.progress(100, text="Pump scan stopped")
-        st.error(f"V36.7 Pump Hunter: {type(exc).__name__}: {exc}")
+        c15 = pd.to_numeric(completed(coin15)["close"], errors="coerce")
+        b15 = pd.to_numeric(completed(btc15)["close"], errors="coerce")
+        c4 = pd.to_numeric(completed(coin4)["close"], errors="coerce")
+        b4 = pd.to_numeric(completed(btc4)["close"], errors="coerce")
 
-_ph = st.session_state.get("v367_results", [])
-if _ph:
-    st.caption(
-        f"Last pump scan: {st.session_state.get('v367_time','—')} | "
-        f"24h movers ranked from: {st.session_state.get('v367_universe','—')} "
-        f"Futures with valid 15m history | Top movers analyzed: {len(_ph)}"
+        if len(c15) >= 97 and len(b15) >= 97:
+            cr = c15.iloc[-1] / c15.iloc[-97] - 1
+            br = b15.iloc[-1] / b15.iloc[-97] - 1
+            out["btc24h"] = br * 100
+            out["relative24h"] = (cr - br) * 100
+
+        if len(c4) >= 3 and len(b4) >= 3:
+            cr = c4.iloc[-1] / c4.iloc[-3] - 1
+            br = b4.iloc[-1] / b4.iloc[-3] - 1
+            out["btc8h"] = br * 100
+            out["relative8h"] = (cr - br) * 100
+
+        coin_r = c4.pct_change().dropna()
+        btc_r = b4.pct_change().dropna()
+        x = pd.concat([coin_r, btc_r], axis=1, join="inner").dropna().tail(30)
+        if len(x) >= 10:
+            out["corr4h"] = x.iloc[:,0].corr(x.iloc[:,1])
+            out["same_dir4h"] = (
+                np.sign(x.iloc[:,0]) == np.sign(x.iloc[:,1])
+            ).mean() * 100
+            varb = x.iloc[:,1].var()
+            if np.isfinite(varb) and varb > 0:
+                out["beta4h"] = x.iloc[:,0].cov(x.iloc[:,1]) / varb
+
+        if np.isfinite(out["btc24h"]) and np.isfinite(out["relative24h"]):
+            coin24 = out["btc24h"] + out["relative24h"]
+            if out["btc24h"] > 1 and coin24 > out["btc24h"] * 1.15:
+                out["regime"] = "BTC UP / COIN OUTPERFORMS"
+            elif out["btc24h"] > 1 and coin24 > 0:
+                out["regime"] = "BTC UP / COIN PARTICIPATES"
+            elif out["btc24h"] < -1 and coin24 < out["btc24h"] * 1.15:
+                out["regime"] = "BTC DOWN / COIN UNDERPERFORMS"
+            elif out["btc24h"] < -1 and coin24 < 0:
+                out["regime"] = "BTC DOWN / COIN PARTICIPATES"
+            elif out["btc24h"] > 0 and coin24 < 0:
+                out["regime"] = "BTC UP / COIN DIVERGES DOWN"
+            elif out["btc24h"] < 0 and coin24 > 0:
+                out["regime"] = "BTC DOWN / COIN DIVERGES UP"
+            else:
+                out["regime"] = "MIXED"
+
+    except Exception:
+        pass
+    return out
+
+def v39_deep(item, prices, btc_data):
+    pair, symbol = item
+    try:
+        d15 = completed(get_tf(pair, "15m", 8))
+        d4 = completed(get_tf(pair, "4H", 30))
+        d1 = completed(get_tf(pair, "1D", 120))
+        btc15, btc4 = btc_data
+        if d15 is None or len(d15) < 97 or d4 is None or len(d4) < 20:
+            return None
+        c = pd.to_numeric(d15["close"], errors="coerce").dropna()
+        if len(c) < 97:
+            return None
+        move24 = v39_pct(c.iloc[-1], c.iloc[-97])
+        m15 = v39_metrics(d15, 96)
+        h4 = v39_metrics(d4, 42)
+        d1m = v39_metrics(d1, 30)
+        price = v39_num(c.iloc[-1])
+        price8h = np.nan
+        if len(d4) >= 3:
+            cc = pd.to_numeric(d4["close"], errors="coerce")
+            price8h = v39_pct(cc.iloc[-1], cc.iloc[-3])
+        tf = {"15m": d15, "4H": d4, "1D": d1}
+        try:
+            tf["1W"] = resample_weekly(d1)
+        except Exception:
+            tf["1W"] = pd.DataFrame()
+        sr = v13_mtf_support_resistance(tf, price)
+        return {
+            "pair": pair, "symbol": symbol, "price": price, "move24": move24,
+            "pattern": v39_pattern(m15, h4, move24),
+            "m15": m15, "h4": h4, "d1": d1m, "price8h": price8h, "sr": sr,
+            "btc": v40_btc_context(d15, d4, btc15, btc4)
+        }
+    except Exception:
+        return None
+
+if st.button("🔎 ANALYZE ALL GAINERS + ALL LOSERS", type="primary", key="v39_scan"):
+    try:
+        prices = futures_prices()
+        btc_pair = v40_find_btc_pair()
+        btc15 = completed(get_tf(btc_pair, "15m", 8))
+        btc4 = completed(get_tf(btc_pair, "4H", 30))
+        if btc15 is None or btc15.empty or btc4 is None or btc4.empty:
+            st.warning("BTC benchmark data unavailable; BTC comparison will show as unavailable.")
+            btc15, btc4 = pd.DataFrame(), pd.DataFrame()
+        universe = []
+        for raw in active_instruments("USDT"):
+            try:
+                pair = v61_instrument_pair(raw)
+                if pair:
+                    universe.append((pair, v61_symbol(raw, pair)))
+            except Exception:
+                pass
+
+        progress = st.progress(0, text=f"Ranking {len(universe)} Futures by 24H move…")
+        ranked = []
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def rank_one(item):
+            try:
+                pair, symbol = item
+                d = completed(get_tf(pair, "15m", 3))
+                if d is None or len(d) < 97:
+                    return None
+                c = pd.to_numeric(d["close"], errors="coerce").dropna()
+                if len(c) < 97:
+                    return None
+                return (pair, symbol, v39_pct(c.iloc[-1], c.iloc[-97]))
+            except Exception:
+                return None
+
+        with ThreadPoolExecutor(max_workers=v39_workers) as ex:
+            jobs = [ex.submit(rank_one, x) for x in universe]
+            for i, f in enumerate(as_completed(jobs), 1):
+                r = f.result()
+                if r:
+                    ranked.append(r)
+                progress.progress(int(i/max(len(jobs),1)*100),
+                                  text=f"Ranking {i}/{len(jobs)}…")
+
+        ranked.sort(key=lambda x: x[2], reverse=True)
+        selected = ranked[:10] + ranked[-10:][::-1]
+
+        progress2 = st.progress(0, text="Deep-analyzing selected charts…")
+        analyzed = []
+        with ThreadPoolExecutor(max_workers=v39_workers) as ex:
+            jobs = [ex.submit(v39_deep, (p,s), prices, (btc15, btc4)) for p,s,_ in selected]
+            for i, f in enumerate(as_completed(jobs), 1):
+                r = f.result()
+                if r:
+                    analyzed.append(r)
+                progress2.progress(int(i/max(len(jobs),1)*100),
+                                   text=f"Deep analysis {i}/{len(jobs)}…")
+
+        st.session_state["v39_results"] = analyzed
+        progress2.progress(100, text=f"Complete — {len(analyzed)} charts analyzed")
+    except Exception as exc:
+        st.error(f"V39 analysis failed: {type(exc).__name__}: {exc}")
+
+def v39_rows(records):
+    rows=[]
+    for r in sorted(records, key=lambda x:x["move24"], reverse=True):
+        m,h,d=r["m15"],r["h4"],r["d1"]
+        rows.append({
+            "Coin": r["symbol"],
+            "24H": f'{r["move24"]:+.2f}%',
+            "Pattern": r["pattern"],
+            "15m Structure": m["structure"],
+            "4H RSI": f'{h["rsi"]:.1f}' if np.isfinite(h["rsi"]) else "—",
+            "4H RSI Δ": f'{h["rsi_change"]:+.1f}' if np.isfinite(h["rsi_change"]) else "—",
+            "4H Price Δ/8H": f'{r["price8h"]:+.2f}%' if np.isfinite(r["price8h"]) else "—",
+            "15m EMA20": f'{m["ema20_dist"]:+.2f}%' if np.isfinite(m["ema20_dist"]) else "—",
+            "15m Vol": f'{m["vol_ratio"]:.1f}×' if np.isfinite(m["vol_ratio"]) else "—",
+            "BTC 24H": f'{r["btc"]["btc24h"]:+.2f}%' if np.isfinite(r["btc"]["btc24h"]) else "—",
+            "Coin-BTC 24H": f'{r["btc"]["relative24h"]:+.2f}%' if np.isfinite(r["btc"]["relative24h"]) else "—",
+            "BTC 8H": f'{r["btc"]["btc8h"]:+.2f}%' if np.isfinite(r["btc"]["btc8h"]) else "—",
+            "Coin-BTC 8H": f'{r["btc"]["relative8h"]:+.2f}%' if np.isfinite(r["btc"]["relative8h"]) else "—",
+            "4H Corr BTC": f'{r["btc"]["corr4h"]:.2f}' if np.isfinite(r["btc"]["corr4h"]) else "—",
+            "Same Direction": f'{r["btc"]["same_dir4h"]:.0f}%' if np.isfinite(r["btc"]["same_dir4h"]) else "—",
+            "BTC Regime": r["btc"]["regime"],
+            "1D Structure": d["structure"],
+        })
+    return rows
+
+res=st.session_state.get("v39_results",[])
+if res:
+    gainers=sorted([r for r in res if r["move24"]>=0],key=lambda x:x["move24"],reverse=True)
+    losers=sorted([r for r in res if r["move24"]<0],key=lambda x:x["move24"])
+    st.markdown(f"### 🚀 ALL GAINERS ({len(gainers)})")
+    st.dataframe(pd.DataFrame(v39_rows(gainers)),use_container_width=True,hide_index=True)
+    st.markdown(f"### 🔻 ALL LOSERS ({len(losers)})")
+    st.dataframe(pd.DataFrame(v39_rows(losers)),use_container_width=True,hide_index=True)
+
+    from collections import Counter
+    counts=Counter(r["pattern"] for r in res)
+    st.markdown("### 🧠 Patterns found")
+    st.dataframe(pd.DataFrame(
+        [{"Pattern":k,"Coins":v} for k,v in counts.most_common()]
+    ),use_container_width=True,hide_index=True)
+
+    from collections import Counter
+    btc_counts = Counter(r.get("btc", {}).get("regime", "UNKNOWN") for r in res)
+    st.markdown("### ₿ BTC vs Coin Momentum")
+    st.dataframe(
+        pd.DataFrame([{"BTC/Coin Regime": k, "Coins": v}
+                      for k, v in btc_counts.most_common()]),
+        use_container_width=True, hide_index=True
     )
 
-    rows = []
-    for r in _ph:
-        rows.append({
-            "Coin": r.get("symbol","—"),
-            "24h Pump": f'{r.get("pump_24h",0):+.1f}%',
-            "Pump Phase": r.get("pump_phase","—"),
-            "Decision": r.get("decision","WAIT"),
-            "Score": r.get("score",0),
-            "LONG": r.get("long_score",0),
-            "SHORT": r.get("short_score",0),
-            "RSI": f'{r.get("rsi",np.nan):.1f}' if np.isfinite(r.get("rsi",np.nan)) else "—",
-            "MACD": "BULL" if r.get("macd_hist",0) > 0 else "BEAR",
-            "ADX": f'{r.get("adx",np.nan):.1f}' if np.isfinite(r.get("adx",np.nan)) else "—",
-            "Vol": f'{r.get("volume_ratio",np.nan):.1f}x' if np.isfinite(r.get("volume_ratio",np.nan)) else "—",
-            "EMA20/50": f'{v13_format_price(r.get("ema20"))}/{v13_format_price(r.get("ema50"))}',
-            "From 24h High": f'{r.get("from_recent_high",np.nan):+.1f}%' if np.isfinite(r.get("from_recent_high",np.nan)) else "—",
-            "High Break": "YES" if r.get("long_break") else "NO",
-            "Low Break": "YES" if r.get("short_break") else "NO",
-            "Vol Confirm": "YES" if r.get("volume_confirm") else "NO",
-            "Next": r.get("next_step","—"),
-        })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-    st.markdown("### 🧠 Simple explanation")
-    for r in _ph:
-        with st.expander(
-            f"{r.get('symbol','—')} — {r.get('decision','WAIT')} — 24h {r.get('pump_24h',0):+.1f}%",
-            expanded=(r is _ph[0])
-        ):
-            st.write(f"**Pump phase:** {r.get('pump_phase','—')}")
-            st.write(f"**Why:** {r.get('why','—')}")
-            st.write(f"**What to wait for:** {r.get('next_step','—')}")
-            st.write(
-                f"**Triggers:** Local high break = {'YES' if r.get('long_break') else 'NO'} | "
-                f"Local low break = {'YES' if r.get('short_break') else 'NO'} | "
-                f"Volume confirmation = {'YES' if r.get('volume_confirm') else 'NO'}"
-            )
-            st.write(
-                f"**Indicators:** RSI {r.get('rsi',np.nan):.1f} | "
-                f"MACD {'bullish' if r.get('macd_hist',0) > 0 else 'bearish'} | "
-                f"ADX {r.get('adx',np.nan):.1f} | "
-                f"15m volume {r.get('volume_ratio',np.nan):.1f}x | "
-                f"EMA20 {v13_format_price(r.get('ema20'))} | EMA50 {v13_format_price(r.get('ema50'))}"
-            )
-            if r.get("warnings"):
-                st.warning("**Caution:** " + "; ".join(r["warnings"]))
-
-_ph_err = st.session_state.get("v367_errors", [])
-if _ph_err:
-    with st.expander("Pump Hunter data errors"):
-        for e in _ph_err[:25]:
-            st.write(e)
+    st.caption(
+        "RSI acceleration is price-derived momentum, not direct order-flow data. "
+        "A potential buying/selling zone becomes more meaningful when the same "
+        "price area later acts as support/resistance."
+    )
 
