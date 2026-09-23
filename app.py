@@ -3,6 +3,10 @@ import pandas as pd
 import numpy as np
 import requests
 import time
+import json
+import hmac
+import hashlib
+import os
 
 st.set_page_config(
     page_title="CoinDCX 4-5 Coin Position Monitor",
@@ -12,6 +16,367 @@ st.set_page_config(
 
 API = "https://api.coindcx.com"
 PUBLIC = "https://public.coindcx.com"
+
+
+
+# ============================================================
+# COINDCX PRIVATE FUTURES POSITION API
+# ============================================================
+
+PRIVATE_POSITIONS_ENDPOINT = "/exchange/v1/derivatives/futures/positions"
+
+
+def coindcx_signed_post(path, api_key, api_secret, payload=None):
+    """
+    CoinDCX private API request.
+
+    IMPORTANT:
+    - Use a READ-ONLY API key for this app.
+    - Do not give the key withdrawal/order permissions.
+    - The API secret is used only in memory for the request.
+    """
+    if not api_key or not api_secret:
+        raise RuntimeError("CoinDCX API key/secret not provided.")
+
+    body = dict(payload or {})
+    body["timestamp"] = int(time.time() * 1000)
+
+    raw = json.dumps(body, separators=(",", ":"))
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        raw.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers = {
+        "Content-Type": "application/json",
+        "X-AUTH-APIKEY": api_key,
+        "X-AUTH-SIGNATURE": signature,
+    }
+
+    response = requests.post(
+        API + path,
+        data=raw,
+        headers=headers,
+        timeout=30,
+    )
+
+    if response.status_code >= 400:
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text[:500]
+        raise RuntimeError(
+            f"CoinDCX private API HTTP {response.status_code}: {detail}"
+        )
+
+    try:
+        return response.json()
+    except Exception:
+        raise RuntimeError(
+            f"CoinDCX private API returned non-JSON response: "
+            f"{response.text[:500]}"
+        )
+
+
+def _first_number(obj, keys, default=np.nan):
+    for key in keys:
+        if isinstance(obj, dict) and key in obj:
+            try:
+                value = obj[key]
+                if value is None or value == "":
+                    continue
+                return float(value)
+            except Exception:
+                continue
+    return default
+
+
+def _first_text(obj, keys, default=""):
+    for key in keys:
+        if isinstance(obj, dict) and key in obj:
+            value = obj[key]
+            if value is not None and str(value).strip():
+                return str(value)
+    return default
+
+
+def normalize_position(row):
+    """
+    Normalize several CoinDCX position field names into one internal schema.
+    The endpoint response has changed field naming across API versions,
+    so the normalizer deliberately accepts common aliases.
+    """
+    pair = _first_text(
+        row,
+        ["pair", "symbol", "instrument", "market", "contract"],
+        "",
+    ).upper().strip()
+
+    side = _first_text(
+        row,
+        ["side", "position_side", "direction"],
+        "",
+    ).upper().strip()
+
+    qty = _first_number(
+        row,
+        ["quantity", "qty", "size", "position_size", "active_pos"],
+    )
+
+    # Some APIs expose signed active_pos instead of side.
+    if not side and np.isfinite(qty):
+        if qty > 0:
+            side = "LONG"
+        elif qty < 0:
+            side = "SHORT"
+
+    if side in ("BUY", "B"):
+        side = "LONG"
+    elif side in ("SELL", "S"):
+        side = "SHORT"
+
+    entry = _first_number(
+        row,
+        [
+            "avg_price",
+            "average_price",
+            "entry_price",
+            "avg_entry_price",
+            "average_entry_price",
+        ],
+    )
+
+    mark = _first_number(
+        row,
+        ["mark_price", "markPrice", "last_price", "price"],
+    )
+
+    liq = _first_number(
+        row,
+        ["liquidation_price", "liquidationPrice", "liq_price"],
+    )
+
+    leverage = _first_number(
+        row,
+        ["leverage", "leverage_value"],
+    )
+
+    margin = _first_number(
+        row,
+        ["margin", "initial_margin", "position_margin"],
+    )
+
+    unrealized = _first_number(
+        row,
+        ["unrealized_pnl", "unrealizedProfit", "unrealized_profit", "pnl"],
+    )
+
+    realized = _first_number(
+        row,
+        ["realized_pnl", "realizedProfit", "realized_profit"],
+    )
+
+    tp = _first_number(
+        row,
+        ["take_profit_price", "take_profit", "tp_price"],
+    )
+
+    sl = _first_number(
+        row,
+        ["stop_loss_price", "stop_loss", "sl_price"],
+    )
+
+    return {
+        "pair": pair,
+        "side": side or "UNKNOWN",
+        "quantity": qty,
+        "entry": entry,
+        "mark": mark,
+        "liquidation": liq,
+        "leverage": leverage,
+        "margin": margin,
+        "unrealized_pnl": unrealized,
+        "realized_pnl": realized,
+        "take_profit": tp,
+        "stop_loss": sl,
+        "raw": row,
+    }
+
+
+def extract_position_rows(payload):
+    if isinstance(payload, list):
+        return payload
+
+    if isinstance(payload, dict):
+        for key in ["data", "positions", "result", "active_positions"]:
+            value = payload.get(key)
+            if isinstance(value, list):
+                return value
+
+        # Sometimes one position is returned as a dict.
+        if any(
+            k in payload
+            for k in ["pair", "symbol", "avg_price", "entry_price"]
+        ):
+            return [payload]
+
+    return []
+
+
+def fetch_open_positions(api_key, api_secret):
+    payload = coindcx_signed_post(
+        PRIVATE_POSITIONS_ENDPOINT,
+        api_key,
+        api_secret,
+        {},
+    )
+
+    rows = extract_position_rows(payload)
+
+    positions = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        p = normalize_position(row)
+
+        # Ignore zero/closed positions where the API exposes a size.
+        if np.isfinite(p["quantity"]) and abs(p["quantity"]) < 1e-15:
+            continue
+
+        positions.append(p)
+
+    return positions
+
+
+def current_price_from_15m(pair):
+    now = int(time.time())
+    d = candles(pair, "15", now - 2 * 86400, now)
+    d = completed(d)
+
+    if d.empty:
+        return np.nan
+
+    return float(d.close.iloc[-1])
+
+
+def calculate_position_pnl(position, current_price):
+    entry = position["entry"]
+    if not np.isfinite(entry) or entry == 0 or not np.isfinite(current_price):
+        return np.nan
+
+    if position["side"] == "SHORT":
+        return (entry - current_price) / entry * 100
+
+    return (current_price - entry) / entry * 100
+
+
+def position_status(position, results):
+    """
+    Position-management assessment based on structure and nearby levels.
+    This is a technical status, not a guaranteed prediction.
+    """
+    side = position["side"]
+    r15 = results["15m"]
+    r4 = results["4H"]
+    r1d = results["1D"]
+
+    current = r4["current"]
+    score = 0
+    reasons = []
+
+    if side == "LONG":
+        if r15["structure"] == "HH + HL":
+            score += 2
+            reasons.append("15m HH + HL")
+        elif r15["structure"] == "LH + LL":
+            score -= 3
+            reasons.append("15m LH + LL")
+
+        if r4["structure"] == "HH + HL":
+            score += 3
+            reasons.append("4H HH + HL")
+        elif r4["structure"] == "LH + LL":
+            score -= 4
+            reasons.append("4H LH + LL")
+
+        if r1d["structure"] == "HH + HL":
+            score += 2
+            reasons.append("1D HH + HL")
+        elif r1d["structure"] == "LH + LL":
+            score -= 2
+            reasons.append("1D LH + LL")
+
+        if current > r4["ema20"]:
+            score += 1
+            reasons.append("above 4H EMA20")
+        else:
+            score -= 1
+            reasons.append("below 4H EMA20")
+
+        if score >= 5:
+            status = "🟢 LONG STRUCTURE INTACT"
+        elif score <= -4:
+            status = "🔴 LONG THESIS WEAK / REVERSAL RISK"
+        else:
+            status = "🟡 LONG — MONITOR"
+
+    elif side == "SHORT":
+        if r15["structure"] == "LH + LL":
+            score += 2
+            reasons.append("15m LH + LL")
+        elif r15["structure"] == "HH + HL":
+            score -= 3
+            reasons.append("15m HH + HL")
+
+        if r4["structure"] == "LH + LL":
+            score += 3
+            reasons.append("4H LH + LL")
+        elif r4["structure"] == "HH + HL":
+            score -= 4
+            reasons.append("4H HH + HL")
+
+        if r1d["structure"] == "LH + LL":
+            score += 2
+            reasons.append("1D LH + LL")
+        elif r1d["structure"] == "HH + HL":
+            score -= 2
+            reasons.append("1D HH + HL")
+
+        if current < r4["ema20"]:
+            score += 1
+            reasons.append("below 4H EMA20")
+        else:
+            score -= 1
+            reasons.append("above 4H EMA20")
+
+        if score >= 5:
+            status = "🟢 SHORT STRUCTURE INTACT"
+        elif score <= -4:
+            status = "🔴 SHORT THESIS WEAK / REVERSAL RISK"
+        else:
+            status = "🟡 SHORT — MONITOR"
+
+    else:
+        status = "⚪ SIDE UNKNOWN"
+        reasons.append("Could not determine LONG/SHORT")
+
+    # Nearest 4H levels.
+    nearest_support = (
+        r4["supports"][-1] if r4["supports"] else np.nan
+    )
+    nearest_resistance = (
+        r4["resistances"][0] if r4["resistances"] else np.nan
+    )
+
+    return {
+        "status": status,
+        "score": score,
+        "reasons": reasons,
+        "support": nearest_support,
+        "resistance": nearest_resistance,
+    }
 
 
 # ============================================================
@@ -539,48 +904,110 @@ def pattern_text(results):
 # APP
 # ============================================================
 
-st.title("🎯 CoinDCX Position Monitor — 4/5 Coins")
+st.title("🎯 CoinDCX Live Position Monitor")
 st.caption(
-    "Enter the 4–5 Futures coins you are already trading. "
-    "The app checks MTF support/resistance, structure, momentum and "
-    "whether the current evidence is bullish, bearish or mixed."
+    "Reads your open CoinDCX Futures positions (read-only), then checks "
+    "15m / 4H / 1D / 1M structure, support/resistance and position risk."
 )
 
 with st.sidebar:
-    st.header("Coins in your trades")
+    st.header("🔐 CoinDCX Live Positions")
 
-    raw = st.text_area(
-        "Enter 4–5 CoinDCX Futures pairs",
-        value="B-BTC_USDT\nB-ETH_USDT\nB-SOL_USDT\nB-XRP_USDT",
-        height=150,
-        help="One pair per line. Example: B-BTC_USDT",
+    st.caption(
+        "Use a CoinDCX API key with read-only permissions. "
+        "Never enable withdrawals. This app does not place orders."
+    )
+
+    env_key = os.getenv("COINDCX_API_KEY", "")
+    env_secret = os.getenv("COINDCX_API_SECRET", "")
+
+    api_key = st.text_input(
+        "CoinDCX API Key",
+        value=env_key,
+        type="password",
+    )
+
+    api_secret = st.text_input(
+        "CoinDCX API Secret",
+        value=env_secret,
+        type="password",
+    )
+
+    live_mode = st.checkbox(
+        "Read my open Futures positions automatically",
+        value=True,
+    )
+
+    manual_mode = st.checkbox(
+        "Also allow manual coin list",
+        value=False,
+    )
+
+    manual_raw = st.text_area(
+        "Manual pairs (optional)",
+        value="B-BTC_USDT\nB-ETH_USDT",
+        height=100,
     )
 
     scan = st.button(
-        "🔎 SCAN MY POSITIONS",
+        "🔎 READ POSITIONS + SCAN",
         type="primary",
         use_container_width=True,
     )
 
     st.markdown("---")
-    st.write("Timeframes")
-    st.write("• 15m — entry / immediate structure")
+    st.write("Analysis")
+    st.write("• 15m — immediate structure")
     st.write("• 4H — primary trend")
     st.write("• 1D — major trend")
     st.write("• 1M — macro trend")
+    st.write("• S1/S2/S3 + R1/R2/R3")
+
+
+
 
 pairs = []
-for p in raw.replace(",", "\n").splitlines():
-    p = p.strip().upper()
-    if p and p not in pairs:
-        pairs.append(p)
+live_positions = []
+
+if live_mode and scan:
+    try:
+        if not api_key or not api_secret:
+            raise RuntimeError(
+                "Enter your CoinDCX API key and secret, or set "
+                "COINDCX_API_KEY and COINDCX_API_SECRET environment variables."
+            )
+
+        live_positions = fetch_open_positions(api_key, api_secret)
+
+        if not live_positions:
+            st.info(
+                "CoinDCX returned no open Futures positions. "
+                "If you expected positions, verify the API key permissions "
+                "and that the positions are open in the Futures account."
+            )
+
+        for pos in live_positions:
+            if pos["pair"] and pos["pair"] not in pairs:
+                pairs.append(pos["pair"])
+
+    except Exception as exc:
+        st.error(f"Could not read CoinDCX open positions: {exc}")
+
+if manual_mode:
+    for p in manual_raw.replace(",", "\n").splitlines():
+        p = p.strip().upper()
+        if p and p not in pairs:
+            pairs.append(p)
 
 if len(pairs) > 5:
     st.warning("Only the first 5 unique pairs will be scanned.")
     pairs = pairs[:5]
 
 if not pairs:
-    st.info("Enter at least one Futures pair in the sidebar.")
+    st.info(
+        "Enter API credentials and click 'READ POSITIONS + SCAN', "
+        "or enable manual pairs."
+    )
     st.stop()
 
 if scan or "position_results" not in st.session_state:
@@ -588,6 +1015,11 @@ if scan or "position_results" not in st.session_state:
 
     progress = st.progress(0)
     status = st.empty()
+
+    # Map live positions by pair.
+    live_by_pair = {
+        p["pair"]: p for p in live_positions if p.get("pair")
+    }
 
     for idx, pair in enumerate(pairs):
         status.write(f"Scanning {pair}...")
@@ -601,10 +1033,29 @@ if scan or "position_results" not in st.session_state:
 
             combined = combined_view(tf_results)
 
+            position = live_by_pair.get(pair)
+
+            # Public market price is used as a fallback/consistent reference.
+            market_price = tf_results["15m"]["current"]
+
+            if position is not None:
+                api_mark = position.get("mark")
+                if np.isfinite(api_mark):
+                    market_price = api_mark
+
+                position["market_price"] = market_price
+                position["pnl_pct"] = calculate_position_pnl(
+                    position, market_price
+                )
+                position["management"] = position_status(
+                    position, tf_results
+                )
+
             results_all[pair] = {
                 "timeframes": tf_results,
                 "combined": combined,
                 "pattern": pattern_text(tf_results),
+                "position": position,
                 "error": None,
             }
 
@@ -613,6 +1064,7 @@ if scan or "position_results" not in st.session_state:
                 "timeframes": {},
                 "combined": {},
                 "pattern": "",
+                "position": live_by_pair.get(pair),
                 "error": str(exc),
             }
 
@@ -622,6 +1074,8 @@ if scan or "position_results" not in st.session_state:
     progress.empty()
 
     st.session_state["position_results"] = results_all
+    st.session_state["position_pairs"] = pairs
+
 
 results_all = st.session_state.get("position_results", {})
 
@@ -629,7 +1083,7 @@ results_all = st.session_state.get("position_results", {})
 # SUMMARY
 # ============================================================
 
-st.subheader("📊 Position Summary")
+st.subheader("📊 Live Position Summary")
 
 summary_rows = []
 
@@ -639,30 +1093,53 @@ for pair in pairs:
     if not item or item.get("error"):
         summary_rows.append({
             "Coin": pair,
+            "Side": "—",
+            "Entry": "—",
             "Current": "ERROR",
-            "Direction": "—",
-            "Phase": "—",
-            "Pattern": item.get("error", "No result") if item else "No result",
-            "Score": "—",
+            "P/L": "—",
+            "Position Status": "—",
             "4H Structure": "—",
-            "4H RSI": "—",
-            "4H vs EMA20": "—",
+            "Nearest 4H S": "—",
+            "Nearest 4H R": "—",
         })
         continue
 
     r4 = item["timeframes"]["4H"]
-    c = item["combined"]
+    pos = item.get("position")
+
+    if pos:
+        entry = fmt_price(pos["entry"])
+        current = fmt_price(pos["market_price"])
+        pnl = (
+            f"{pos['pnl_pct']:+.2f}%"
+            if np.isfinite(pos["pnl_pct"])
+            else "—"
+        )
+        side = pos["side"]
+        pstatus = pos["management"]["status"]
+    else:
+        entry = "Manual"
+        current = fmt_price(r4["current"])
+        pnl = "—"
+        side = "—"
+        pstatus = "MARKET ANALYSIS ONLY"
 
     summary_rows.append({
         "Coin": pair,
-        "Current": fmt_price(r4["current"]),
-        "Direction": c["direction"],
-        "Phase": c["phase"],
-        "Pattern": item["pattern"],
-        "Score": f"{c['normalized_score']:+.1f}",
+        "Side": side,
+        "Entry": entry,
+        "Current": current,
+        "P/L": pnl,
+        "Position Status": pstatus,
         "4H Structure": r4["structure"],
-        "4H RSI": f"{r4['rsi']:.1f}",
-        "4H vs EMA20": f"{r4['ema_distance']:+.2f}%",
+        "Nearest 4H S": (
+            fmt_price(r4["supports"][-1])
+            if r4["supports"] else "—"
+        ),
+        "Nearest 4H R": (
+            fmt_price(r4["resistances"][0])
+            if r4["resistances"] else "—"
+        ),
     })
 
 st.dataframe(
@@ -672,10 +1149,12 @@ st.dataframe(
 )
 
 st.warning(
-    "The Direction column is a technical bias, not a guaranteed prediction. "
-    "The model cannot know whether a coin 'will' dump or gain. "
-    "Use the structure + support/resistance reaction + confirmation."
+    "Position Status is a technical structure assessment. "
+    "It is not a guarantee that price will rise or fall. "
+    "The agent uses confirmed market data and nearby levels to identify "
+    "where the current position is strengthening or weakening."
 )
+
 
 
 # ============================================================
@@ -888,6 +1367,6 @@ for pair in pairs:
 
 st.markdown("---")
 st.caption(
-    "This tool is analysis-only. It does not place orders or access private "
-    "CoinDCX account information."
+    "This tool is analysis-only. It can read open Futures positions when "
+    "you provide a read-only CoinDCX API key. It never places or modifies orders."
 )
