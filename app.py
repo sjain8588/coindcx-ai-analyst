@@ -24,6 +24,9 @@ PUBLIC = "https://public.coindcx.com"
 # ============================================================
 
 PRIVATE_POSITIONS_ENDPOINT = "/exchange/v1/derivatives/futures/positions"
+PRIVATE_ACTIVE_POSITIONS_ENDPOINT = (
+    "/exchange/v1/derivatives/futures/positions/active_positions"
+)
 
 
 def coindcx_signed_post(path, api_key, api_secret, payload=None):
@@ -174,23 +177,39 @@ def _response_shape(payload):
 
 def fetch_open_positions_diagnostic(api_key, api_secret):
     """
-    Try the common CoinDCX Futures position request bodies.
+    Query the dedicated active-positions endpoint first.
 
-    We stop at the first response that contains a non-empty position-like
-    collection. If all are empty, diagnostics are returned so the user can
-    see whether authentication, endpoint shape, or parsing is the problem.
+    The /positions endpoint can return a catalogue of futures position
+    records (one row per contract) with active_pos=0. That is not the same
+    thing as "my open positions". The dedicated active_positions endpoint is
+    therefore preferred.
+
+    We retain the older endpoint as a fallback and show which endpoint
+    produced each diagnostic result.
     """
-    attempts = [
-        {},
-        {"page": 1, "size": 100},
-        {"page": 1, "size": 100, "margin_currency_short_name": "USDT"},
+    endpoint_attempts = [
+        (
+            "active_positions",
+            PRIVATE_ACTIVE_POSITIONS_ENDPOINT,
+            {"margin_currency_short_name": "USDT", "page": 1, "size": 100},
+        ),
+        (
+            "active_positions_minimal",
+            PRIVATE_ACTIVE_POSITIONS_ENDPOINT,
+            {},
+        ),
+        (
+            "positions",
+            PRIVATE_POSITIONS_ENDPOINT,
+            {"margin_currency_short_name": "USDT", "page": 1, "size": 100},
+        ),
     ]
 
     diagnostics = []
 
-    for request_body in attempts:
+    for label, endpoint, request_body in endpoint_attempts:
         result = coindcx_signed_post(
-            PRIVATE_POSITIONS_ENDPOINT,
+            endpoint,
             api_key,
             api_secret,
             request_body,
@@ -198,6 +217,8 @@ def fetch_open_positions_diagnostic(api_key, api_secret):
 
         shape = _response_shape(result.get("payload"))
         diagnostics.append({
+            "label": label,
+            "endpoint": endpoint,
             "request_keys": sorted(request_body.keys()),
             "http_status": result.get("status_code"),
             "ok": result.get("ok"),
@@ -206,15 +227,29 @@ def fetch_open_positions_diagnostic(api_key, api_secret):
         })
 
         if not result.get("ok"):
-            # Authentication/permission errors are useful to show directly.
             continue
 
         rows = extract_position_rows(result.get("payload"))
 
-        if rows:
+        # Prefer a response containing an actually non-zero active position.
+        normalized_nonzero = []
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            p = normalize_position(row)
+            if np.isfinite(p["active_pos"]) and abs(p["active_pos"]) > 1e-15:
+                normalized_nonzero.append(row)
+
+        if normalized_nonzero:
+            return normalized_nonzero, diagnostics
+
+        # Dedicated active_positions endpoint may already return only active
+        # positions even if quantity is represented under a different field.
+        if label.startswith("active_positions") and rows:
             return rows, diagnostics
 
     return [], diagnostics
+
 
 
 def diagnostic_text(diagnostics):
@@ -225,7 +260,8 @@ def diagnostic_text(diagnostics):
         status_fields = shape.get("status_fields", {}) or {}
 
         line = (
-            f"Attempt {i}: HTTP {d.get('http_status')} | "
+            f"Attempt {i} [{d.get('label', 'unknown')}] "
+            f"{d.get('endpoint', '')}: HTTP {d.get('http_status')} | "
             f"ok={d.get('ok')} | "
             f"top={shape.get('top_type')} | "
             f"data_type={shape.get('data_type')} | "
@@ -1260,7 +1296,7 @@ if live_mode and scan:
 
         if not live_positions:
             st.warning(
-                "CoinDCX returned position records, but the app did not identify a non-zero open position yet. "
+                "The broad positions endpoint returned contract records, but they were not your open trades. V7 first queries the dedicated active-positions endpoint. "
                 "Open the diagnostic panel below — it will show the HTTP "
                 "status and response structure without exposing your API key "
                 "or secret."
@@ -1278,7 +1314,7 @@ if live_mode and scan:
                 )
 
                 if raw_position_rows:
-                    st.markdown("**Safe position-row inspection**")
+                    st.markdown("**Safe position-row inspection (fallback endpoint)**")
                     st.dataframe(
                         pd.DataFrame(
                             inspect_position_rows(raw_position_rows, limit=15)
