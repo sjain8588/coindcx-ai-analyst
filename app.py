@@ -132,12 +132,18 @@ def _response_shape(payload):
     if isinstance(payload, dict):
         info["top_keys"] = sorted(str(k) for k in payload.keys())
 
-        for k in ["code", "message", "msg", "status", "success"]:
+        for k in ["code", "message", "msg", "status", "success", "error"]:
             if k in payload:
                 value = payload[k]
                 # Safe scalar metadata only.
                 if isinstance(value, (str, int, float, bool)):
                     info["status_fields"][k] = value
+                elif isinstance(value, dict):
+                    for subkey in ["code", "message", "msg", "status", "error"]:
+                        if subkey in value and isinstance(
+                            value[subkey], (str, int, float, bool)
+                        ):
+                            info["status_fields"][f"{k}.{subkey}"] = value[subkey]
 
         for key in ["data", "positions", "result", "active_positions"]:
             if key in payload:
@@ -213,6 +219,39 @@ def fetch_open_positions_diagnostic(api_key, api_secret):
 
 def diagnostic_text(diagnostics):
     lines = []
+
+    for i, d in enumerate(diagnostics, 1):
+        shape = d.get("shape", {})
+        status_fields = shape.get("status_fields", {}) or {}
+
+        line = (
+            f"Attempt {i}: HTTP {d.get('http_status')} | "
+            f"ok={d.get('ok')} | "
+            f"top={shape.get('top_type')} | "
+            f"data_type={shape.get('data_type')} | "
+            f"data_count={shape.get('data_count')}"
+        )
+
+        if status_fields:
+            safe_status = {
+                str(k): str(v)[:300]
+                for k, v in status_fields.items()
+            }
+            line += f" | response_status={safe_status}"
+
+        if d.get("error"):
+            line += f" | error={str(d['error'])[:500]}"
+
+        if shape.get("top_keys"):
+            line += f" | top_keys={shape['top_keys']}"
+
+        if shape.get("item_keys"):
+            line += f" | item_keys={shape['item_keys']}"
+
+        lines.append(line)
+
+    return "\n".join(lines)
+
 
     for i, d in enumerate(diagnostics, 1):
         shape = d.get("shape", {})
@@ -1164,6 +1203,20 @@ if live_mode and scan:
                     "No API key, API secret, signature, or credential value "
                     "is displayed here."
                 )
+
+                if any(
+                    d.get("http_status") == 401
+                    for d in position_diagnostics
+                ):
+                    st.error(
+                        "CoinDCX is returning HTTP 401 Unauthorized. "
+                        "This means the private API request is being rejected "
+                        "before a position list can be read. The most likely "
+                        "causes are an invalid/mismatched API key-secret pair, "
+                        "an API permission issue, or a signing/API-version "
+                        "mismatch. The exact safe response message above will "
+                        "tell us which one CoinDCX is reporting."
+                    )
 
         for pos in live_positions:
             if pos["pair"] and pos["pair"] not in pairs:
