@@ -1066,13 +1066,6 @@ st.caption(
     "15m / 4H / 1D / 1M structure, support/resistance and position risk."
 )
 
-if scan and live_mode:
-    st.info(
-        "The app now tests multiple supported Futures-position request "
-        "formats and reports the response structure if CoinDCX returns no "
-        "active positions."
-    )
-
 with st.sidebar:
     st.header("🔐 CoinDCX Live Positions")
 
@@ -1128,6 +1121,14 @@ with st.sidebar:
 
 
 
+
+
+if scan and live_mode:
+    st.info(
+        "The app will test multiple supported Futures-position request "
+        "formats and report the response structure if CoinDCX returns no "
+        "active positions."
+    )
 
 pairs = []
 live_positions = []
