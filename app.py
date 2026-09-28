@@ -30,39 +30,52 @@ def get_json(url, params=None, timeout=25):
     return r.json()
 
 def active_usdt_pairs():
-    endpoints = [
-        API + "/exchange/v1/derivatives/futures/data/instruments",
-        PUBLIC + "/exchange/v1/derivatives/futures/data/instruments",
-        API + "/exchange/v1/derivatives/futures/contracts",
-    ]
-    for url in endpoints:
-        try:
-            payload = get_json(url)
-            rows = payload.get("data", payload) if isinstance(payload, dict) else payload
-            if not isinstance(rows, list):
-                continue
-            pairs = []
-            for x in rows:
-                if isinstance(x, str):
-                    p = x
-                elif isinstance(x, dict):
-                    p = x.get("pair") or x.get("symbol") or x.get("instrument")
-                else:
-                    p = None
-                if p and "USDT" in str(p).upper():
-                    pairs.append(str(p).upper())
-            if pairs:
-                return sorted(set(pairs))
-        except Exception:
-            continue
-    return []
+    # CoinDCX's hardened public universe endpoint returns the ACTIVE
+    # futures contracts directly.  The older instruments/contracts endpoints
+    # can return catalogue data or fail for the current API version.
+    url = API + "/exchange/v1/derivatives/futures/data/active_instruments"
+    try:
+        r = requests.get(
+            url,
+            params=[("margin_currency_short_name[]", "USDT")],
+            timeout=25,
+            headers={"User-Agent": "CoinDCX-Trade-Agent/2.0"},
+        )
+        r.raise_for_status()
+        payload = r.json()
+        if not isinstance(payload, list):
+            raise RuntimeError(f"Unexpected active_instruments response: {payload}")
+
+        pairs = []
+        for x in payload:
+            if isinstance(x, str):
+                p = x
+            elif isinstance(x, dict):
+                p = (x.get("pair") or x.get("symbol") or x.get("instrument")
+                     or x.get("symbol_id") or x.get("market"))
+            else:
+                p = None
+            if p:
+                p = str(p).upper().strip()
+                # Keep only actual USDT-margined contracts.
+                if "USDT" in p:
+                    pairs.append(p)
+
+        pairs = sorted(set(pairs))
+        if not pairs:
+            raise RuntimeError("CoinDCX returned no active USDT Futures contracts.")
+        return pairs
+    except Exception as e:
+        raise RuntimeError(f"CoinDCX active Futures API error: {e}") from e
 
 def candles(pair, resolution, days):
     now = int(time.time())
     payload = get_json(
         f"{PUBLIC}/market_data/candlesticks",
         {"pair": pair, "from": now-int(days*86400), "to": now,
-         "resolution": resolution, "pcode": "f"},
+         "resolution": {"1m":"1", "5m":"5", "15":"15", "15m":"15",
+                        "1H":"60", "4H":"240", "1D":"1D"}.get(resolution, resolution),
+         "pcode": "f"},
     )
     rows = payload.get("data", []) if isinstance(payload, dict) else payload
     if not isinstance(rows, list) or not rows:
