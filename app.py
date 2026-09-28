@@ -21,7 +21,7 @@ import streamlit as st
 API = "https://api.coindcx.com"
 PUBLIC = "https://public.coindcx.com"
 MAX_WORKERS = 12
-DEEP_POOL = 50
+DEEP_POOL = 100
 
 def get_json(url, params=None, timeout=25):
     r = requests.get(url, params=params, timeout=timeout,
@@ -273,11 +273,21 @@ def scan_market():
             if x: quick_rows.append(x)
     q=pd.DataFrame(quick_rows,columns=["pair","m24","m3","m7"])
     if q.empty: raise RuntimeError("No market data returned.")
-    candidates=list(dict.fromkeys(
+    # IMPORTANT: this is a pump/dump discovery agent.  Always deep-scan
+    # the strongest gainers separately; do not let the final SHORT ranking
+    # hide the biggest pumps merely because they have not yet formed LH/LL.
+    pump_candidates=list(dict.fromkeys(
+        q.sort_values("m24",ascending=False).head(DEEP_POOL).pair.tolist()+
         q.sort_values("m3",ascending=False).head(DEEP_POOL).pair.tolist()+
-        q.sort_values("m3",ascending=True).head(DEEP_POOL).pair.tolist()+
-        q.assign(a=q.m24.abs()).sort_values("a",ascending=False).head(DEEP_POOL).pair.tolist()
+        q.sort_values("m7",ascending=False).head(DEEP_POOL).pair.tolist()
     ))
+    dump_candidates=list(dict.fromkeys(
+        q.sort_values("m24",ascending=True).head(DEEP_POOL).pair.tolist()+
+        q.sort_values("m3",ascending=True).head(DEEP_POOL).pair.tolist()+
+        q.sort_values("m7",ascending=True).head(DEEP_POOL).pair.tolist()
+    ))
+    absolute_candidates=q.assign(a=q.m24.abs()).sort_values("a",ascending=False).head(DEEP_POOL).pair.tolist()
+    candidates=list(dict.fromkeys(pump_candidates+dump_candidates+absolute_candidates))
     rows=[]
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
         fs=[ex.submit(deep_scan,p) for p in candidates]
@@ -295,6 +305,30 @@ def fp(v):
 
 def lvl(vals):
     return " | ".join(fp(v) for v in vals) if vals else "—"
+
+def top_pumps(df, n=10):
+    """Show the strongest multi-day pumps regardless of whether a short trigger exists yet."""
+    if df is None or df.empty:
+        return pd.DataFrame()
+    x=df.copy()
+    x["pump_rank"]=(
+        x["move24"].clip(lower=0)*0.35 +
+        x["move3d"].clip(lower=0)*0.40 +
+        x["move7d"].clip(lower=0)*0.25
+    )
+    x=x.sort_values(["pump_rank","move3d","move24"],ascending=False).head(n)
+    return pd.DataFrame([{
+        "Coin":r.pair,
+        "24H":f"{r.move24:+.1f}%",
+        "3D":f"{r.move3d:+.1f}%",
+        "7D":f"{r.move7d:+.1f}%",
+        "4H RSI":f"{r.rsi4:.1f}",
+        "15m":r.s15,
+        "4H":r.s4,
+        "EMA20":f"{r.ema15dist:+.1f}%",
+        "Setup":r.setup,
+        "Score":int(r.score)
+    } for _,r in x.iterrows()])
 
 def table(df, side):
     x=df[df.setup.str.contains(side,na=False)].copy()
@@ -340,10 +374,17 @@ if df is None or df.empty:
     st.info("Click SCAN MARKET NOW.")
     st.stop()
 
-st.success(f"Scan: {st.session_state.get('scan_time','—')} | Movers reviewed: {len(q)} | Deep candidates: {len(df)}")
+st.success(f"Scan: {st.session_state.get('scan_time','—')} | Movers reviewed: {len(q)} | Deep candidates: {len(df)} | Pump-focused discovery enabled")
 
 shorts=table(df,"SHORT")
 longs=table(df,"LONG")
+pumps=top_pumps(df,10)
+st.subheader("🚀 TOP 10 HIGHEST PUMPS — SHORT WATCHLIST")
+st.caption("These are ranked by multi-day upside first. A coin can appear here even when it is NOT ready to short yet.")
+if not pumps.empty:
+    st.dataframe(pumps,use_container_width=True,hide_index=True)
+else:
+    st.info("No pump candidates available.")
 a,b=st.columns(2)
 with a:
     st.subheader("🔴 TOP 5 SHORT")
