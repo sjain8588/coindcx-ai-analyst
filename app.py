@@ -1,1672 +1,370 @@
-import streamlit as st
-import pandas as pd
-import numpy as np
-import requests
 import time
-import json
-import hmac
-import hashlib
-import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import requests
+import numpy as np
+import pandas as pd
+import streamlit as st
 
-st.set_page_config(
-    page_title="CoinDCX 4-5 Coin Position Monitor",
-    page_icon="🎯",
-    layout="wide",
-)
+# ============================================================
+# CLEAN COINDCX TRADE AGENT
+# ============================================================
+# Strategy:
+# SHORT = hard pump -> extension -> bearish transition -> EMA20 rejection
+#         -> local-low break. Avoid mature dumps.
+# LONG  = hard dump -> stabilization -> bullish transition -> EMA20 hold
+#         -> local-high break. Avoid chasing extended rebounds.
+#
+# Analysis only. No private API, no orders.
+# Uses completed candles only.
+# ============================================================
 
 API = "https://api.coindcx.com"
 PUBLIC = "https://public.coindcx.com"
+MAX_WORKERS = 12
+DEEP_POOL = 50
 
+def get_json(url, params=None, timeout=25):
+    r = requests.get(url, params=params, timeout=timeout,
+                     headers={"User-Agent": "CoinDCX-Trade-Agent/1.0"})
+    r.raise_for_status()
+    return r.json()
 
-
-# ============================================================
-# COINDCX PRIVATE FUTURES POSITION API
-# ============================================================
-
-PRIVATE_POSITIONS_ENDPOINT = "/exchange/v1/derivatives/futures/positions"
-
-
-def coindcx_signed_post(path, api_key, api_secret, payload=None):
-    """
-    CoinDCX private API request.
-
-    Returns:
-        {
-          "ok": bool,
-          "status_code": int,
-          "payload": parsed JSON or None,
-          "error": str or None,
-          "request_body_keys": [...]
-        }
-
-    The diagnostic data deliberately excludes API key/secret/signature.
-    """
-    if not api_key or not api_secret:
-        return {
-            "ok": False,
-            "status_code": 0,
-            "payload": None,
-            "error": "CoinDCX API key/secret not provided.",
-            "request_body_keys": [],
-        }
-
-    body = dict(payload or {})
-    body["timestamp"] = int(time.time() * 1000)
-
-    raw = json.dumps(body, separators=(",", ":"))
-    signature = hmac.new(
-        api_secret.encode("utf-8"),
-        raw.encode("utf-8"),
-        hashlib.sha256,
-    ).hexdigest()
-
-    headers = {
-        "Content-Type": "application/json",
-        "X-AUTH-APIKEY": api_key,
-        "X-AUTH-SIGNATURE": signature,
-    }
-
-    try:
-        response = requests.post(
-            API + path,
-            data=raw,
-            headers=headers,
-            timeout=30,
-        )
-    except Exception as exc:
-        return {
-            "ok": False,
-            "status_code": 0,
-            "payload": None,
-            "error": f"Network/request error: {exc}",
-            "request_body_keys": sorted(body.keys()),
-        }
-
-    try:
-        parsed = response.json()
-    except Exception:
-        parsed = None
-
-    if response.status_code >= 400:
-        # Do not expose credentials. Return only a compact API error.
-        detail = ""
-        if isinstance(parsed, dict):
-            for k in ["code", "message", "msg", "error"]:
-                if k in parsed:
-                    detail = str(parsed[k])
-                    break
-        if not detail:
-            detail = response.text[:300]
-
-        return {
-            "ok": False,
-            "status_code": response.status_code,
-            "payload": parsed,
-            "error": f"HTTP {response.status_code}: {detail}",
-            "request_body_keys": sorted(body.keys()),
-        }
-
-    return {
-        "ok": True,
-        "status_code": response.status_code,
-        "payload": parsed,
-        "error": None,
-        "request_body_keys": sorted(body.keys()),
-    }
-
-
-def _response_shape(payload):
-    """
-    Return safe structural diagnostics only — no credentials and no raw
-    position values.
-    """
-    info = {
-        "top_type": type(payload).__name__,
-        "top_keys": [],
-        "data_type": "",
-        "data_count": None,
-        "item_keys": [],
-        "status_fields": {},
-    }
-
-    if isinstance(payload, dict):
-        info["top_keys"] = sorted(str(k) for k in payload.keys())
-
-        for k in ["code", "message", "msg", "status", "success", "error"]:
-            if k in payload:
-                value = payload[k]
-                # Safe scalar metadata only.
-                if isinstance(value, (str, int, float, bool)):
-                    info["status_fields"][k] = value
-                elif isinstance(value, dict):
-                    for subkey in ["code", "message", "msg", "status", "error"]:
-                        if subkey in value and isinstance(
-                            value[subkey], (str, int, float, bool)
-                        ):
-                            info["status_fields"][f"{k}.{subkey}"] = value[subkey]
-
-        for key in ["data", "positions", "result", "active_positions"]:
-            if key in payload:
-                value = payload[key]
-                info["data_type"] = type(value).__name__
-                if isinstance(value, list):
-                    info["data_count"] = len(value)
-                    if value and isinstance(value[0], dict):
-                        info["item_keys"] = sorted(
-                            str(k) for k in value[0].keys()
-                        )
-                elif isinstance(value, dict):
-                    info["item_keys"] = sorted(
-                        str(k) for k in value.keys()
-                    )
-                break
-
-    elif isinstance(payload, list):
-        info["data_type"] = "list"
-        info["data_count"] = len(payload)
-        if payload and isinstance(payload[0], dict):
-            info["item_keys"] = sorted(
-                str(k) for k in payload[0].keys()
-            )
-
-    return info
-
-
-def fetch_open_positions_diagnostic(api_key, api_secret):
-    """
-    Try the common CoinDCX Futures position request bodies.
-
-    We stop at the first response that contains a non-empty position-like
-    collection. If all are empty, diagnostics are returned so the user can
-    see whether authentication, endpoint shape, or parsing is the problem.
-    """
-    attempts = [
-        {},
-        {"page": 1, "size": 100},
-        {"page": 1, "size": 100, "margin_currency_short_name": "USDT"},
+def active_usdt_pairs():
+    endpoints = [
+        API + "/exchange/v1/derivatives/futures/data/instruments",
+        PUBLIC + "/exchange/v1/derivatives/futures/data/instruments",
+        API + "/exchange/v1/derivatives/futures/contracts",
     ]
-
-    diagnostics = []
-
-    for request_body in attempts:
-        result = coindcx_signed_post(
-            PRIVATE_POSITIONS_ENDPOINT,
-            api_key,
-            api_secret,
-            request_body,
-        )
-
-        shape = _response_shape(result.get("payload"))
-        diagnostics.append({
-            "request_keys": sorted(request_body.keys()),
-            "http_status": result.get("status_code"),
-            "ok": result.get("ok"),
-            "error": result.get("error"),
-            "shape": shape,
-        })
-
-        if not result.get("ok"):
-            # Authentication/permission errors are useful to show directly.
-            continue
-
-        rows = extract_position_rows(result.get("payload"))
-
-        if rows:
-            return rows, diagnostics
-
-    return [], diagnostics
-
-
-def diagnostic_text(diagnostics):
-    lines = []
-
-    for i, d in enumerate(diagnostics, 1):
-        shape = d.get("shape", {})
-        status_fields = shape.get("status_fields", {}) or {}
-
-        line = (
-            f"Attempt {i}: HTTP {d.get('http_status')} | "
-            f"ok={d.get('ok')} | "
-            f"top={shape.get('top_type')} | "
-            f"data_type={shape.get('data_type')} | "
-            f"data_count={shape.get('data_count')}"
-        )
-
-        if status_fields:
-            safe_status = {
-                str(k): str(v)[:300]
-                for k, v in status_fields.items()
-            }
-            line += f" | response_status={safe_status}"
-
-        if d.get("error"):
-            line += f" | error={str(d['error'])[:500]}"
-
-        if shape.get("top_keys"):
-            line += f" | top_keys={shape['top_keys']}"
-
-        if shape.get("item_keys"):
-            line += f" | item_keys={shape['item_keys']}"
-
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
-    for i, d in enumerate(diagnostics, 1):
-        shape = d.get("shape", {})
-        line = (
-            f"Attempt {i}: HTTP {d.get('http_status')} | "
-            f"ok={d.get('ok')} | "
-            f"top={shape.get('top_type')} | "
-            f"data_type={shape.get('data_type')} | "
-            f"data_count={shape.get('data_count')} | "
-            f"top_keys={shape.get('top_keys')}"
-        )
-
-        if d.get("error"):
-            line += f" | error={d['error']}"
-
-        if shape.get("item_keys"):
-            line += f" | item_keys={shape['item_keys']}"
-
-        lines.append(line)
-
-    return "\n".join(lines)
-
-
-
-
-def _first_number(obj, keys, default=np.nan):
-    for key in keys:
-        if isinstance(obj, dict) and key in obj:
-            try:
-                value = obj[key]
-                if value is None or value == "":
-                    continue
-                return float(value)
-            except Exception:
+    for url in endpoints:
+        try:
+            payload = get_json(url)
+            rows = payload.get("data", payload) if isinstance(payload, dict) else payload
+            if not isinstance(rows, list):
                 continue
-    return default
-
-
-def _first_text(obj, keys, default=""):
-    for key in keys:
-        if isinstance(obj, dict) and key in obj:
-            value = obj[key]
-            if value is not None and str(value).strip():
-                return str(value)
-    return default
-
-
-def normalize_position(row):
-    """
-    Normalize CoinDCX Futures position records.
-
-    CoinDCX can return active position quantity under active_pos/quantity/qty/
-    size/position_size and can expose side separately or through the sign of
-    the active position.
-    """
-    pair = _first_text(
-        row,
-        [
-            "pair",
-            "symbol",
-            "instrument",
-            "market",
-            "contract",
-            "market_pair",
-            "pair_name",
-        ],
-        "",
-    ).upper().strip()
-
-    # Preserve raw active position separately because this is the field most
-    # likely to tell us whether a returned row is actually open.
-    active_pos = _first_number(
-        row,
-        [
-            "active_pos",
-            "active_position",
-            "position_size",
-            "positionSize",
-            "quantity",
-            "qty",
-            "size",
-            "net_quantity",
-            "net_qty",
-        ],
-    )
-
-    side = _first_text(
-        row,
-        ["side", "position_side", "positionSide", "direction", "position_type"],
-        "",
-    ).upper().strip()
-
-    if side in ("BUY", "B"):
-        side = "LONG"
-    elif side in ("SELL", "S"):
-        side = "SHORT"
-
-    if not side and np.isfinite(active_pos):
-        if active_pos > 0:
-            side = "LONG"
-        elif active_pos < 0:
-            side = "SHORT"
-
-    entry = _first_number(
-        row,
-        [
-            "avg_price",
-            "average_price",
-            "entry_price",
-            "avg_entry_price",
-            "average_entry_price",
-        ],
-    )
-
-    mark = _first_number(
-        row,
-        ["mark_price", "markPrice", "last_price", "price", "mark"],
-    )
-
-    liq = _first_number(
-        row,
-        ["liquidation_price", "liquidationPrice", "liq_price"],
-    )
-
-    leverage = _first_number(
-        row,
-        ["leverage", "leverage_value"],
-    )
-
-    margin = _first_number(
-        row,
-        ["margin", "initial_margin", "position_margin", "locked_margin"],
-    )
-
-    unrealized = _first_number(
-        row,
-        ["unrealized_pnl", "unrealizedProfit", "unrealized_profit", "pnl"],
-    )
-
-    realized = _first_number(
-        row,
-        ["realized_pnl", "realizedProfit", "realized_profit"],
-    )
-
-    tp = _first_number(
-        row,
-        ["take_profit_price", "take_profit", "tp_price"],
-    )
-
-    sl = _first_number(
-        row,
-        ["stop_loss_price", "stop_loss", "sl_price"],
-    )
-
-    return {
-        "pair": pair,
-        "side": side or "UNKNOWN",
-        "quantity": active_pos,
-        "active_pos": active_pos,
-        "entry": entry,
-        "mark": mark,
-        "liquidation": liq,
-        "leverage": leverage,
-        "margin": margin,
-        "unrealized_pnl": unrealized,
-        "realized_pnl": realized,
-        "take_profit": tp,
-        "stop_loss": sl,
-        "raw": row,
-    }
-
-
-
-def extract_position_rows(payload):
-    if isinstance(payload, list):
-        return payload
-
-    if isinstance(payload, dict):
-        for key in ["data", "positions", "result", "active_positions"]:
-            value = payload.get(key)
-            if isinstance(value, list):
-                return value
-
-        # Sometimes one position is returned as a dict.
-        if any(
-            k in payload
-            for k in ["pair", "symbol", "avg_price", "entry_price"]
-        ):
-            return [payload]
-
+            pairs = []
+            for x in rows:
+                if isinstance(x, str):
+                    p = x
+                elif isinstance(x, dict):
+                    p = x.get("pair") or x.get("symbol") or x.get("instrument")
+                else:
+                    p = None
+                if p and "USDT" in str(p).upper():
+                    pairs.append(str(p).upper())
+            if pairs:
+                return sorted(set(pairs))
+        except Exception:
+            continue
     return []
 
-
-def inspect_position_rows(rows, limit=15):
-    """
-    Safe diagnostics: show only position-relevant fields and never secrets.
-    """
-    safe = []
-
-    for row in rows[:limit]:
-        if not isinstance(row, dict):
-            continue
-
-        normalized = normalize_position(row)
-
-        # Include common raw field values only for position debugging.
-        raw_active = _first_number(
-            row,
-            [
-                "active_pos",
-                "active_position",
-                "position_size",
-                "positionSize",
-                "quantity",
-                "qty",
-                "size",
-                "net_quantity",
-                "net_qty",
-            ],
-        )
-
-        safe.append({
-            "pair": normalized["pair"],
-            "active_pos": raw_active,
-            "side": normalized["side"],
-            "entry": normalized["entry"],
-            "mark": normalized["mark"],
-            "unrealized_pnl": normalized["unrealized_pnl"],
-            "leverage": normalized["leverage"],
-            "raw_keys": sorted(str(k) for k in row.keys()),
-        })
-
-    return safe
-
-
-
-def fetch_open_positions(api_key, api_secret):
-    rows, diagnostics = fetch_open_positions_diagnostic(
-        api_key, api_secret
-    )
-
-    positions = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-
-        p = normalize_position(row)
-
-        # If active_pos is present and non-zero, it is an open position.
-        if np.isfinite(p["active_pos"]):
-            if abs(p["active_pos"]) > 1e-15:
-                positions.append(p)
-        else:
-            # Some response variants may omit quantity. Retain the row if it
-            # has clear position fields rather than silently discarding it.
-            if p["pair"] and (
-                np.isfinite(p["entry"])
-                or np.isfinite(p["unrealized_pnl"])
-            ):
-                positions.append(p)
-
-    return positions, diagnostics, rows
-
-
-
-def current_price_from_15m(pair):
+def candles(pair, resolution, days):
     now = int(time.time())
-    d = candles(pair, "15", now - 2 * 86400, now)
-    d = completed(d)
-
-    if d.empty:
-        return np.nan
-
-    return float(d.close.iloc[-1])
-
-
-def calculate_position_pnl(position, current_price):
-    entry = position["entry"]
-    if not np.isfinite(entry) or entry == 0 or not np.isfinite(current_price):
-        return np.nan
-
-    if position["side"] == "SHORT":
-        return (entry - current_price) / entry * 100
-
-    return (current_price - entry) / entry * 100
-
-
-def position_status(position, results):
-    """
-    Position-management assessment based on structure and nearby levels.
-    This is a technical status, not a guaranteed prediction.
-    """
-    side = position["side"]
-    r15 = results["15m"]
-    r4 = results["4H"]
-    r1d = results["1D"]
-
-    current = r4["current"]
-    score = 0
-    reasons = []
-
-    if side == "LONG":
-        if r15["structure"] == "HH + HL":
-            score += 2
-            reasons.append("15m HH + HL")
-        elif r15["structure"] == "LH + LL":
-            score -= 3
-            reasons.append("15m LH + LL")
-
-        if r4["structure"] == "HH + HL":
-            score += 3
-            reasons.append("4H HH + HL")
-        elif r4["structure"] == "LH + LL":
-            score -= 4
-            reasons.append("4H LH + LL")
-
-        if r1d["structure"] == "HH + HL":
-            score += 2
-            reasons.append("1D HH + HL")
-        elif r1d["structure"] == "LH + LL":
-            score -= 2
-            reasons.append("1D LH + LL")
-
-        if current > r4["ema20"]:
-            score += 1
-            reasons.append("above 4H EMA20")
-        else:
-            score -= 1
-            reasons.append("below 4H EMA20")
-
-        if score >= 5:
-            status = "🟢 LONG STRUCTURE INTACT"
-        elif score <= -4:
-            status = "🔴 LONG THESIS WEAK / REVERSAL RISK"
-        else:
-            status = "🟡 LONG — MONITOR"
-
-    elif side == "SHORT":
-        if r15["structure"] == "LH + LL":
-            score += 2
-            reasons.append("15m LH + LL")
-        elif r15["structure"] == "HH + HL":
-            score -= 3
-            reasons.append("15m HH + HL")
-
-        if r4["structure"] == "LH + LL":
-            score += 3
-            reasons.append("4H LH + LL")
-        elif r4["structure"] == "HH + HL":
-            score -= 4
-            reasons.append("4H HH + HL")
-
-        if r1d["structure"] == "LH + LL":
-            score += 2
-            reasons.append("1D LH + LL")
-        elif r1d["structure"] == "HH + HL":
-            score -= 2
-            reasons.append("1D HH + HL")
-
-        if current < r4["ema20"]:
-            score += 1
-            reasons.append("below 4H EMA20")
-        else:
-            score -= 1
-            reasons.append("above 4H EMA20")
-
-        if score >= 5:
-            status = "🟢 SHORT STRUCTURE INTACT"
-        elif score <= -4:
-            status = "🔴 SHORT THESIS WEAK / REVERSAL RISK"
-        else:
-            status = "🟡 SHORT — MONITOR"
-
-    else:
-        status = "⚪ SIDE UNKNOWN"
-        reasons.append("Could not determine LONG/SHORT")
-
-    # Nearest 4H levels.
-    nearest_support = (
-        r4["supports"][-1] if r4["supports"] else np.nan
-    )
-    nearest_resistance = (
-        r4["resistances"][0] if r4["resistances"] else np.nan
-    )
-
-    return {
-        "status": status,
-        "score": score,
-        "reasons": reasons,
-        "support": nearest_support,
-        "resistance": nearest_resistance,
-    }
-
-
-# ============================================================
-# COINDCX DATA
-# ============================================================
-
-def candles(pair, resolution, start_ts, end_ts):
-    params = {
-        "pair": pair,
-        "from": int(start_ts),
-        "to": int(end_ts),
-        "resolution": resolution,
-        "pcode": "f",
-    }
-    r = requests.get(
+    payload = get_json(
         f"{PUBLIC}/market_data/candlesticks",
-        params=params,
-        timeout=30,
+        {"pair": pair, "from": now-int(days*86400), "to": now,
+         "resolution": resolution, "pcode": "f"},
     )
-    r.raise_for_status()
-    payload = r.json()
     rows = payload.get("data", []) if isinstance(payload, dict) else payload
-
-    if not isinstance(rows, list):
-        raise RuntimeError(f"Unexpected candle response for {pair}")
-
-    d = pd.DataFrame(rows)
-    if d.empty:
-        return d
-
-    required = ["open", "high", "low", "close", "volume"]
-    for c in required:
-        if c not in d.columns:
-            raise RuntimeError(f"{pair}: candle response missing {c}")
-        d[c] = pd.to_numeric(d[c], errors="coerce")
-
-    d["time"] = pd.to_datetime(
-        d["time"], unit="ms", errors="coerce", utc=True
-    )
-
-    return (
-        d.dropna(subset=["time", "open", "high", "low", "close", "volume"])
-         .sort_values("time")
-         .drop_duplicates("time")
-         .reset_index(drop=True)
-    )
-
-
-def get_tf(pair, tf):
-    now = int(time.time())
-
-    if tf == "15m":
-        return candles(pair, "15", now - 12 * 86400, now)
-
-    if tf == "4H":
-        return candles(pair, "240", now - 120 * 86400, now)
-
-    if tf == "1D":
-        return candles(pair, "1D", now - 900 * 86400, now)
-
-    if tf == "1M":
-        # CoinDCX does not need a separate monthly endpoint here.
-        # Build monthly candles from daily data.
-        d = candles(pair, "1D", now - 4 * 365 * 86400, now)
-        if d.empty:
-            return d
-
-        x = d.set_index("time")
-        m = x.resample("ME").agg({
-            "open": "first",
-            "high": "max",
-            "low": "min",
-            "close": "last",
-            "volume": "sum",
-        }).dropna().reset_index()
-
-        return m
-
-    raise ValueError(tf)
-
-
-def completed(d):
-    if d is None or len(d) < 2:
+    if not isinstance(rows, list) or not rows:
         return pd.DataFrame()
-    return d.iloc[:-1].copy().reset_index(drop=True)
+    d = pd.DataFrame(rows)
+    tcol = "time" if "time" in d.columns else "timestamp"
+    if tcol not in d.columns:
+        return pd.DataFrame()
+    for c in ["open","high","low","close","volume"]:
+        if c not in d.columns:
+            return pd.DataFrame()
+        d[c] = pd.to_numeric(d[c], errors="coerce")
+    d["time"] = pd.to_datetime(d[tcol], unit="ms", utc=True, errors="coerce")
+    d = d.dropna(subset=["time","open","high","low","close"]).sort_values("time")
+    d = d.drop_duplicates("time").reset_index(drop=True)
+    if len(d) > 2:
+        d = d.iloc[:-1].copy()
+    return d
 
-
-# ============================================================
-# INDICATORS
-# ============================================================
-
-def add_indicators(d):
+def indicators(d):
     x = d.copy()
-
-    if x.empty:
-        return x
-
-    for n in [20, 50, 100, 200]:
+    for n in [20,50,100,200]:
         x[f"ema{n}"] = x.close.ewm(span=n, adjust=False).mean()
-
     delta = x.close.diff()
-    gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
-    loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-    rs = gain / loss.replace(0, np.nan)
-    x["rsi"] = 100 - (100 / (1 + rs))
-
-    e12 = x.close.ewm(span=12, adjust=False).mean()
-    e26 = x.close.ewm(span=26, adjust=False).mean()
-    x["macd"] = e12 - e26
-    x["macd_signal"] = x.macd.ewm(span=9, adjust=False).mean()
-
-    tr = pd.concat(
-        [
-            x.high - x.low,
-            (x.high - x.close.shift()).abs(),
-            (x.low - x.close.shift()).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    x["atr"] = tr.ewm(alpha=1 / 14, adjust=False).mean()
-    x["atr_pct"] = x.atr / x.close.replace(0, np.nan) * 100
-
+    gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
+    loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
+    x["rsi"] = 100 - 100/(1 + gain/loss.replace(0,np.nan))
+    tr = pd.concat([x.high-x.low,
+                    (x.high-x.close.shift()).abs(),
+                    (x.low-x.close.shift()).abs()], axis=1).max(axis=1)
+    x["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
+    x["atr_pct"] = x.atr/x.close*100
     x["vol_ma"] = x.volume.rolling(20).mean()
-    x["vol_ratio"] = x.volume / x.vol_ma.replace(0, np.nan)
-
+    x["vol_ratio"] = x.volume/x.vol_ma.replace(0,np.nan)
     return x
 
+def pivots(d, left=3, right=3):
+    highs, lows = [], []
+    if len(d) < left+right+10:
+        return highs,lows
+    for i in range(left, len(d)-right):
+        if d.high.iloc[i] >= d.high.iloc[i-left:i+right+1].max():
+            highs.append((i,float(d.high.iloc[i])))
+        if d.low.iloc[i] <= d.low.iloc[i-left:i+right+1].min():
+            lows.append((i,float(d.low.iloc[i])))
+    return highs,lows
 
-# ============================================================
-# STRUCTURE
-# ============================================================
-
-def pivot_points(d, left=3, right=3):
-    x = d.copy().reset_index(drop=True)
-
-    if len(x) < left + right + 10:
-        return [], []
-
-    highs = []
-    lows = []
-
-    for i in range(left, len(x) - right):
-        hi = x.high.iloc[i]
-        lo = x.low.iloc[i]
-
-        if hi >= x.high.iloc[i-left:i+right+1].max():
-            highs.append((i, float(hi)))
-
-        if lo <= x.low.iloc[i-left:i+right+1].min():
-            lows.append((i, float(lo)))
-
-    return highs, lows
-
-
-def structure_state(d):
-    x = d.copy()
-
-    if len(x) < 30:
+def structure(d):
+    h,l = pivots(d)
+    if len(h)<2 or len(l)<2:
         return "MIXED"
-
-    highs, lows = pivot_points(x, 3, 3)
-
-    if len(highs) < 2 or len(lows) < 2:
-        return "MIXED"
-
-    h1, h2 = highs[-2][1], highs[-1][1]
-    l1, l2 = lows[-2][1], lows[-1][1]
-
-    if h2 > h1 and l2 > l1:
-        return "HH + HL"
-
-    if h2 < h1 and l2 < l1:
-        return "LH + LL"
-
-    if h2 > h1 and l2 <= l1:
-        return "BULLISH DEVELOPING"
-
-    if h2 <= h1 and l2 > l1:
-        return "BEARISH DEVELOPING"
-
+    h1,h2=h[-2][1],h[-1][1]
+    l1,l2=l[-2][1],l[-1][1]
+    if h2>h1 and l2>l1: return "HH + HL"
+    if h2<h1 and l2<l1: return "LH + LL"
+    if h2>h1 and l2<=l1: return "BULLISH DEVELOPING"
+    if h2<=h1 and l2>l1: return "BEARISH DEVELOPING"
     return "MIXED"
 
+def pct(d,bars):
+    if len(d)<=bars: return np.nan
+    return (d.close.iloc[-1]/d.close.iloc[-1-bars]-1)*100
 
-# ============================================================
-# SUPPORT / RESISTANCE
-# ============================================================
-
-def sr_levels(d, current, count=3):
-    """
-    Support/resistance from confirmed pivot highs/lows.
-    Levels are deduplicated into nearby price zones.
-    """
-    if d is None or len(d) < 25 or not np.isfinite(current):
-        return [], []
-
-    highs, lows = pivot_points(d, 3, 3)
-
-    raw_support = [p for _, p in lows if p < current]
-    raw_resistance = [p for _, p in highs if p > current]
-
-    # Also include recent swing extremes when pivot supply is sparse.
-    recent = d.tail(min(120, len(d)))
-    for p in recent.low.nsmallest(8).tolist():
-        if p < current:
-            raw_support.append(float(p))
-
-    for p in recent.high.nlargest(8).tolist():
-        if p > current:
-            raw_resistance.append(float(p))
-
-    def cluster(values):
-        values = sorted(float(v) for v in values if np.isfinite(v))
-        if not values:
-            return []
-
-        clusters = []
-        for v in values:
-            if not clusters:
-                clusters.append([v])
-                continue
-
-            anchor = np.mean(clusters[-1])
-
-            # Dynamic zone width: 0.6% of price, minimum based on ATR.
-            if abs(v - anchor) / max(abs(anchor), 1e-12) <= 0.006:
-                clusters[-1].append(v)
+def levels(d,current):
+    h,l=pivots(d)
+    s=sorted({round(v,12) for _,v in l if v<current}, reverse=True)
+    r=sorted({round(v,12) for _,v in h if v>current})
+    # add recent extremes
+    recent=d.tail(min(160,len(d)))
+    s += [float(v) for v in recent.low.nsmallest(8) if v<current]
+    r += [float(v) for v in recent.high.nlargest(8) if v>current]
+    def cluster(vals):
+        vals=sorted(set(vals))
+        out=[]
+        for v in vals:
+            if not out or abs(v-out[-1])/max(abs(out[-1]),1e-12)>0.007:
+                out.append(v)
             else:
-                clusters.append([v])
-
-        return [float(np.mean(c)) for c in clusters]
-
-    supports = cluster(raw_support)
-    resistances = cluster(raw_resistance)
-
-    # Nearest supports first, then farther supports.
-    supports = sorted(supports, key=lambda p: abs(current - p))[:count]
-    resistances = sorted(resistances, key=lambda p: abs(current - p))[:count]
-
-    supports = sorted(supports, reverse=True)
-    resistances = sorted(resistances)
-
-    return supports, resistances
-
-
-def pct_distance(current, level):
-    if level is None or not np.isfinite(level) or current == 0:
-        return np.nan
-    return (level / current - 1) * 100
-
-
-# ============================================================
-# TIMEFRAME ANALYSIS
-# ============================================================
-
-def analyze_tf(d):
-    x = completed(d)
-
-    if len(x) < 35:
-        raise RuntimeError("Not enough completed candles")
-
-    x = add_indicators(x)
-    last = x.iloc[-1]
-
-    current = float(last.close)
-    ema20 = float(last.ema20)
-    ema50 = float(last.ema50)
-    rsi = float(last.rsi) if np.isfinite(last.rsi) else np.nan
-    macd = float(last.macd)
-    macd_signal = float(last.macd_signal)
-
-    structure = structure_state(x)
-
-    # Recent momentum.
-    bars = 4 if len(x) >= 5 else 1
-    momentum = (current / float(x.close.iloc[-1-bars]) - 1) * 100
-
-    vol_ratio = (
-        float(last.vol_ratio)
-        if np.isfinite(last.vol_ratio)
-        else np.nan
-    )
-
-    ema_distance = (current / ema20 - 1) * 100 if ema20 else np.nan
-
-    supports, resistances = sr_levels(x, current, 3)
-
-    # Direction score is descriptive, not a guaranteed forecast.
-    score = 0
-
-    if structure == "HH + HL":
-        score += 3
-    elif structure == "BULLISH DEVELOPING":
-        score += 1
-    elif structure == "LH + LL":
-        score -= 3
-    elif structure == "BEARISH DEVELOPING":
-        score -= 1
-
-    if current > ema20:
-        score += 1
-    else:
-        score -= 1
-
-    if current > ema50:
-        score += 1
-    else:
-        score -= 1
-
-    if np.isfinite(rsi):
-        if 52 <= rsi <= 68:
-            score += 1
-        elif rsi < 42:
-            score -= 1
-        elif rsi > 75:
-            score -= 1
-
-    if macd > macd_signal:
-        score += 1
-    else:
-        score -= 1
-
-    if np.isfinite(momentum):
-        if momentum > 0:
-            score += 1
-        elif momentum < 0:
-            score -= 1
-
-    if score >= 4:
-        bias = "BULLISH"
-    elif score <= -4:
-        bias = "BEARISH"
-    else:
-        bias = "MIXED"
-
-    return {
-        "data": x,
-        "current": current,
-        "ema20": ema20,
-        "ema50": ema50,
-        "ema_distance": ema_distance,
-        "rsi": rsi,
-        "macd": macd,
-        "macd_signal": macd_signal,
-        "momentum": momentum,
-        "volume_ratio": vol_ratio,
-        "structure": structure,
-        "score": score,
-        "bias": bias,
-        "supports": supports,
-        "resistances": resistances,
-    }
-
-
-# ============================================================
-# CROSS-TIMEFRAME DECISION
-# ============================================================
-
-def combined_view(results):
-    """
-    Higher timeframes carry more weight.
-    15m = entry/short-term
-    4H  = primary trend
-    1D  = major trend
-    1M  = macro regime
-    """
-    weights = {
-        "15m": 1.0,
-        "4H": 2.0,
-        "1D": 2.5,
-        "1M": 1.5,
-    }
-
-    weighted = 0.0
-    total = 0.0
-
-    for tf, result in results.items():
-        weighted += result["score"] * weights[tf]
-        total += 6 * weights[tf]
-
-    normalized = weighted / total * 100 if total else 0
-
-    # Current location relative to nearest levels.
-    r4 = results["4H"]
-    current = r4["current"]
-
-    s1 = r4["supports"][-1] if r4["supports"] else np.nan
-    r1 = r4["resistances"][0] if r4["resistances"] else np.nan
-
-    near_support = (
-        np.isfinite(s1)
-        and abs(current - s1) / current <= 0.015
-    )
-
-    near_resistance = (
-        np.isfinite(r1)
-        and abs(r1 - current) / current <= 0.015
-    )
-
-    # Do not call this a guaranteed future move.
-    if normalized >= 22:
-        direction = "BULLISH BIAS"
-    elif normalized <= -22:
-        direction = "BEARISH BIAS"
-    else:
-        direction = "MIXED / WAIT"
-
-    # Phase classification.
-    if (
-        r4["structure"] in ("HH + HL", "BULLISH DEVELOPING")
-        and r4["ema_distance"] > -1.5
-        and results["1D"]["score"] >= 0
-    ):
-        phase = "BULLISH / RECOVERY PHASE"
-    elif (
-        r4["structure"] in ("LH + LL", "BEARISH DEVELOPING")
-        and r4["ema_distance"] < 1.5
-        and results["1D"]["score"] <= 0
-    ):
-        phase = "BEARISH / DUMP PHASE"
-    else:
-        phase = "TRANSITION / MIXED"
-
-    # Risk flags for someone already holding the position.
-    risks = []
-
-    if near_resistance:
-        risks.append("Near 4H resistance")
-
-    if near_support:
-        risks.append("Near 4H support")
-
-    if r4["structure"] == "LH + LL":
-        risks.append("4H bearish structure")
-
-    if r4["structure"] == "HH + HL":
-        risks.append("4H bullish structure")
-
-    if r4["ema_distance"] < -3:
-        risks.append("Price extended below 4H EMA20")
-
-    if r4["ema_distance"] > 5:
-        risks.append("Price extended above 4H EMA20")
-
-    return {
-        "normalized_score": normalized,
-        "direction": direction,
-        "phase": phase,
-        "risks": risks,
-    }
-
-
-# ============================================================
-# DISPLAY HELPERS
-# ============================================================
-
-def fmt_price(x):
-    if not np.isfinite(x):
-        return "—"
-    if abs(x) >= 1000:
-        return f"{x:,.2f}"
-    if abs(x) >= 1:
-        return f"{x:,.4f}"
-    if abs(x) >= 0.01:
-        return f"{x:,.6f}"
-    return f"{x:.10f}"
-
-
-def level_table(result):
-    rows = []
-
-    for i, p in enumerate(result["supports"], 1):
-        rows.append({
-            "Level": f"S{i}",
-            "Price": fmt_price(p),
-            "Distance": f"{pct_distance(result['current'], p):+.2f}%",
-            "Type": "Support",
-        })
-
-    for i, p in enumerate(result["resistances"], 1):
-        rows.append({
-            "Level": f"R{i}",
-            "Price": fmt_price(p),
-            "Distance": f"{pct_distance(result['current'], p):+.2f}%",
-            "Type": "Resistance",
-        })
-
-    return pd.DataFrame(rows)
-
-
-def pattern_text(results):
-    r15 = results["15m"]
-    r4 = results["4H"]
-    r1d = results["1D"]
-    r1m = results["1M"]
-
-    if r4["structure"] == "HH + HL" and r1d["structure"] in ("HH + HL", "BULLISH DEVELOPING"):
-        return "🟢 Bullish structure across 4H/1D"
-
-    if r4["structure"] == "LH + LL" and r1d["structure"] in ("LH + LL", "BEARISH DEVELOPING"):
-        return "🔴 Bearish structure across 4H/1D"
-
-    if r4["structure"] in ("HH + HL", "BULLISH DEVELOPING") and r15["structure"] == "LH + LL":
-        return "🟡 Higher-timeframe bullish, 15m pullback"
-
-    if r4["structure"] in ("LH + LL", "BEARISH DEVELOPING") and r15["structure"] == "HH + HL":
-        return "🟡 Higher-timeframe bearish, 15m bounce"
-
-    if r4["structure"] == "HH + HL" and r4["ema_distance"] < -1:
-        return "🔄 Bullish structure but below 4H EMA20"
-
-    if r4["structure"] == "LH + LL" and r4["ema_distance"] > 1:
-        return "🔄 Bearish structure but above 4H EMA20"
-
-    if r1m["score"] >= 3 and r4["score"] < 0:
-        return "⚠️ Macro bullish, short-term weakness"
-
-    if r1m["score"] <= -3 and r4["score"] > 0:
-        return "⚠️ Macro bearish, short-term recovery"
-
-    return "⚪ Mixed / transition"
-
-
-# ============================================================
-# APP
-# ============================================================
-
-st.title("📌 CoinDCX My Trade Monitor")
-st.caption(
-    "Reads your open CoinDCX Futures positions (read-only), then checks "
-    "15m / 4H / 1D / 1M structure, support/resistance and position risk."
-)
+                out[-1]=(out[-1]+v)/2
+        return out
+    s=cluster(s)
+    r=cluster(r)
+    return sorted(s,reverse=True)[:3], sorted(r)[:3]
+
+def deep_scan(pair):
+    try:
+        d15=indicators(candles(pair,"15",10))
+        d4=indicators(candles(pair,"240",120))
+        d1=indicators(candles(pair,"1D",500))
+        if len(d15)<120 or len(d4)<40 or len(d1)<30:
+            return None
+        current=float(d15.close.iloc[-1])
+        s15=structure(d15.tail(160)); s4=structure(d4.tail(80)); s1=structure(d1.tail(50))
+        ema15=float(d15.ema20.iloc[-1]); ema4=float(d4.ema20.iloc[-1])
+        e15=(current/ema15-1)*100; e4=(current/ema4-1)*100
+        r15=float(d15.rsi.iloc[-1]); r4=float(d4.rsi.iloc[-1])
+        vol=float(d15.vol_ratio.iloc[-1]) if np.isfinite(d15.vol_ratio.iloc[-1]) else np.nan
+        m24=pct(d15,96); m3=pct(d15,min(288,len(d15)-1)); m7=pct(d15,min(672,len(d15)-1))
+        peak=float(d15.tail(96).high.max())
+        low=float(d15.tail(96).low.min())
+        draw=(current/peak-1)*100 if peak else np.nan
+        recovery=(current/low-1)*100 if low else np.nan
+        h,l=pivots(d15.tail(160))
+        local_hi=h[-1][1] if h else np.nan
+        local_lo=l[-1][1] if l else np.nan
+        s15l,r15l=levels(d15,current)
+        s4l,r4l=levels(d4,current)
+        s1l,r1l=levels(d1,current)
+
+        pump=0
+        if m24>=15: pump+=2
+        if m3>=30: pump+=3
+        if m7>=50: pump+=3
+        if r4>=70: pump+=2
+        if e15>=6: pump+=2
+
+        dump=0
+        if m24<=-15: dump+=2
+        if m3<=-30: dump+=3
+        if m7<=-50: dump+=3
+        if r4<=30: dump+=2
+        if e15<=-6: dump+=2
+
+        short_score=pump
+        if s15=="LH + LL": short_score+=4
+        elif s15=="BEARISH DEVELOPING": short_score+=2
+        if current<ema15: short_score+=2
+        if -12<=draw<=-2: short_score+=2
+        if draw<-20: short_score-=4
+        if r15<40: short_score-=2
+
+        long_score=dump
+        if s15=="HH + HL": long_score+=4
+        elif s15=="BULLISH DEVELOPING": long_score+=2
+        if current>=ema15: long_score+=2
+        if 2<=recovery<=15: long_score+=2
+        if recovery>18: long_score-=3
+        if r15>70: long_score-=2
+
+        short_ready=(pump>=5 and s15 in ("LH + LL","BEARISH DEVELOPING")
+                     and current<=ema15*1.01 and draw>-18)
+        long_ready=(dump>=5 and s15 in ("HH + HL","BULLISH DEVELOPING")
+                    and current>=ema15*0.99 and recovery<=18)
+
+        if short_ready:
+            setup="SHORT READY"; side="SHORT"; score=short_score
+            trigger=f"Break below {local_lo:.8g}" if np.isfinite(local_lo) else "Break recent 15m low"
+            invalid=f"Reclaim 15m EMA20 {ema15:.8g}"
+            thesis="Hard pump is transitioning into fresh bearish structure."
+        elif long_ready:
+            setup="LONG READY"; side="LONG"; score=long_score
+            trigger=f"Break above {local_hi:.8g}" if np.isfinite(local_hi) else "Break recent 15m high"
+            invalid=f"Loss of 15m EMA20 {ema15:.8g}"
+            thesis="Hard dump is transitioning into fresh bullish structure."
+        elif s4=="LH + LL" and s15 in ("LH + LL","BEARISH DEVELOPING"):
+            setup="SHORT WATCH"; side="SHORT"; score=short_score
+            trigger="Wait for EMA20 rejection + local-low break"
+            invalid="15m HH/HL + EMA20 reclaim"
+            thesis="Bearish trend; wait for a fresh bounce/rejection instead of chasing."
+        elif s4=="HH + HL" and s15 in ("HH + HL","BULLISH DEVELOPING"):
+            setup="LONG WATCH"; side="LONG"; score=long_score
+            trigger="Wait for EMA20 hold + local-high break"
+            invalid="15m LH/LL + EMA20 loss"
+            thesis="Bullish trend; wait for a fresh pullback instead of chasing."
+        else:
+            setup="WAIT"; side="WAIT"; score=max(short_score,long_score)
+            trigger="No fresh trigger"; invalid="Structure unresolved"
+            thesis="No sufficiently fresh confirmed setup."
+
+        return dict(pair=pair,current=current,move24=m24,move3d=m3,move7d=m7,
+                    draw24=draw,recovery24=recovery,rsi15=r15,rsi4=r4,
+                    ema15dist=e15,ema4dist=e4,vol=vol,s15=s15,s4=s4,s1=s1,
+                    support15=s15l,resistance15=r15l,support4=s4l,resistance4=r4l,
+                    support1=s1l,resistance1=r1l,local_hi=local_hi,local_lo=local_lo,
+                    pump=pump,dump=dump,score=score,setup=setup,side=side,
+                    trigger=trigger,invalidation=invalid,thesis=thesis)
+    except Exception:
+        return None
+
+def scan_market():
+    pairs=active_usdt_pairs()
+    if not pairs: raise RuntimeError("Could not retrieve active USDT Futures.")
+    # First-pass 15m scan keeps the deep scan focused and fast.
+    def quick(p):
+        try:
+            d=candles(p,"15",8)
+            if len(d)<100: return None
+            return (p,pct(d,96),pct(d,min(288,len(d)-1)),pct(d,min(672,len(d)-1)))
+        except Exception: return None
+    quick_rows=[]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fs=[ex.submit(quick,p) for p in pairs]
+        for f in as_completed(fs):
+            x=f.result()
+            if x: quick_rows.append(x)
+    q=pd.DataFrame(quick_rows,columns=["pair","m24","m3","m7"])
+    if q.empty: raise RuntimeError("No market data returned.")
+    candidates=list(dict.fromkeys(
+        q.sort_values("m3",ascending=False).head(DEEP_POOL).pair.tolist()+
+        q.sort_values("m3",ascending=True).head(DEEP_POOL).pair.tolist()+
+        q.assign(a=q.m24.abs()).sort_values("a",ascending=False).head(DEEP_POOL).pair.tolist()
+    ))
+    rows=[]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        fs=[ex.submit(deep_scan,p) for p in candidates]
+        for f in as_completed(fs):
+            x=f.result()
+            if x: rows.append(x)
+    return q,pd.DataFrame(rows)
+
+def fp(v):
+    if not np.isfinite(v): return "—"
+    if abs(v)>=1000: return f"{v:,.2f}"
+    if abs(v)>=1: return f"{v:,.4f}"
+    if abs(v)>=.01: return f"{v:,.6f}"
+    return f"{v:.10f}"
+
+def lvl(vals):
+    return " | ".join(fp(v) for v in vals) if vals else "—"
+
+def table(df, side):
+    x=df[df.setup.str.contains(side,na=False)].copy()
+    if x.empty: return pd.DataFrame()
+    x["rank"]=x.score+x.pump*.5 if side=="SHORT" else x.score+x.dump*.5
+    x=x.sort_values("rank",ascending=False).head(5)
+    return pd.DataFrame([{
+        "Coin":r.pair,"Setup":r.setup,"Score":int(r.score),
+        "24H":f"{r.move24:+.1f}%","3D":f"{r.move3d:+.1f}%","7D":f"{r.move7d:+.1f}%",
+        "15m":r.s15,"4H":r.s4,"4H RSI":f"{r.rsi4:.1f}",
+        "EMA20":f"{r.ema15dist:+.1f}%","Trigger":r.trigger,
+        "Invalidation":r.invalidation,"4H S":lvl(r.support4),"4H R":lvl(r.resistance4)
+    } for _,r in x.iterrows()])
+
+st.set_page_config(page_title="CoinDCX Trade Agent",page_icon="🎯",layout="wide")
+st.title("🎯 CoinDCX Trade Agent — Fresh LONG / SHORT")
+st.caption("Clean strategy only: hard-move exhaustion + structure transition + fresh trigger. No order placement.")
 
 with st.sidebar:
-    st.header("📌 My Current Trades")
-
-    st.caption(
-        "Enter up to 5 trades you are currently holding. "
-        "The agent reads live market data and analyzes each position."
-    )
-
-    manual_raw = st.text_area(
-        "CoinDCX Futures pairs — one per line",
-        value="B-CHR_USDT\nB-BTC_USDT\nB-AKE_USDT",
-        height=100,
-        help="Example: B-CHR_USDT",
-    )
-
-    st.markdown("### Position details")
-
-    st.caption(
-        "Enter the side and entry price for each coin. "
-        "Leverage is optional and is shown for context."
-    )
-
-    # Parse up to 5 unique pairs from the text box.
-    manual_pairs_ui = []
-    for p in manual_raw.replace(",", "\n").splitlines():
-        p = p.strip().upper()
-        if p and p not in manual_pairs_ui:
-            manual_pairs_ui.append(p)
-
-    manual_pairs_ui = manual_pairs_ui[:5]
-
-    manual_positions = {}
-
-    for i, pair in enumerate(manual_pairs_ui):
-        st.markdown(f"**{i+1}. {pair}**")
-
-        c1, c2 = st.columns(2)
-
-        side = c1.selectbox(
-            f"Side — {pair}",
-            ["LONG", "SHORT"],
-            key=f"manual_side_{i}_{pair}",
-        )
-
-        entry = c2.number_input(
-            f"Entry — {pair}",
-            min_value=0.0,
-            value=0.0,
-            format="%.12f",
-            key=f"manual_entry_{i}_{pair}",
-        )
-
-        leverage = st.number_input(
-            f"Leverage — {pair}",
-            min_value=0.0,
-            value=0.0,
-            step=1.0,
-            format="%.1f",
-            key=f"manual_leverage_{i}_{pair}",
-        )
-
-        manual_positions[pair] = {
-            "pair": pair,
-            "side": side,
-            "entry": float(entry) if entry > 0 else np.nan,
-            "leverage": float(leverage) if leverage > 0 else np.nan,
-            "quantity": np.nan,
-            "active_pos": np.nan,
-            "mark": np.nan,
-            "liquidation": np.nan,
-            "margin": np.nan,
-            "unrealized_pnl": np.nan,
-            "realized_pnl": np.nan,
-            "take_profit": np.nan,
-            "stop_loss": np.nan,
-        }
-
-    scan = st.button(
-        "🔎 SCAN MY CURRENT TRADES",
-        type="primary",
-        use_container_width=True,
-    )
-
+    st.header("Scan")
+    workers=st.slider("Scan workers",4,20,12)
+    run=st.button("🔎 SCAN MARKET NOW",type="primary",use_container_width=True)
     st.markdown("---")
-    st.write("The agent checks:")
-    st.write("• 15m — immediate structure")
-    st.write("• 4H — primary trend")
-    st.write("• 1D — major trend")
-    st.write("• 1M — macro trend")
-    st.write("• S1/S2/S3 + R1/R2/R3")
-    st.write("• EMA20 / RSI / volume")
-    st.write("• Position-specific P/L and risk")
+    st.write("🔴 SHORT: hard pump → LH/LL → EMA20 rejection → low break")
+    st.write("🟢 LONG: hard dump → HH/HL → EMA20 hold → high break")
+    st.write("🟡 WATCH: trend exists, but entry is not fresh")
+    st.write("⚪ WAIT: mixed structure")
 
-
-
-
-pairs = list(manual_positions.keys())
-live_positions = []
-position_diagnostics = []
-raw_position_rows = []
-
-if scan:
-    missing_entry = [
-        p for p, pos in manual_positions.items()
-        if not np.isfinite(pos["entry"])
-    ]
-
-    if missing_entry:
-        st.warning(
-            "Please enter an entry price for: "
-            + ", ".join(missing_entry)
-        )
-
-    for p, pos in manual_positions.items():
-        if np.isfinite(pos["entry"]):
-            live_positions.append(pos)
-
-if len(pairs) > 5:
-    pairs = pairs[:5]
-
-
-if len(pairs) > 5:
-    st.warning("Only the first 5 unique pairs will be scanned.")
-    pairs = pairs[:5]
-
-if not pairs:
-    st.info("Enter at least one Futures pair in the sidebar.")
-    st.stop()
-
-if not scan:
-    st.info("Enter your current trades in the sidebar and click **SCAN MY CURRENT TRADES**.")
-    st.stop()
-
-if scan or "position_results" not in st.session_state:
-    results_all = {}
-
-    progress = st.progress(0)
-    status = st.empty()
-
-    # Map live positions by pair.
-    live_by_pair = {
-        p["pair"]: p for p in live_positions if p.get("pair")
-    }
-
-    for idx, pair in enumerate(pairs):
-        status.write(f"Scanning {pair}...")
-
+if run:
+    with st.spinner("Scanning active USDT Futures..."):
         try:
-            tf_results = {}
-
-            for tf in ["15m", "4H", "1D", "1M"]:
-                d = get_tf(pair, tf)
-                tf_results[tf] = analyze_tf(d)
-
-            combined = combined_view(tf_results)
-
-            position = live_by_pair.get(pair)
-
-            # Public market price is used as a fallback/consistent reference.
-            market_price = tf_results["15m"]["current"]
-
-            if position is not None:
-                api_mark = position.get("mark")
-                if np.isfinite(api_mark):
-                    market_price = api_mark
-
-                position["market_price"] = market_price
-                position["pnl_pct"] = calculate_position_pnl(
-                    position, market_price
-                )
-                position["management"] = position_status(
-                    position, tf_results
-                )
-
-            results_all[pair] = {
-                "timeframes": tf_results,
-                "combined": combined,
-                "pattern": pattern_text(tf_results),
-                "position": position,
-                "error": None,
-            }
-
-        except Exception as exc:
-            results_all[pair] = {
-                "timeframes": {},
-                "combined": {},
-                "pattern": "",
-                "position": live_by_pair.get(pair),
-                "error": str(exc),
-            }
-
-        progress.progress((idx + 1) / len(pairs))
-
-    status.empty()
-    progress.empty()
-
-    st.session_state["position_results"] = results_all
-    st.session_state["position_pairs"] = pairs
-
-
-results_all = st.session_state.get("position_results", {})
-
-# ============================================================
-# SUMMARY
-# ============================================================
-
-st.subheader("📊 Live Position Summary")
-
-summary_rows = []
-
-for pair in pairs:
-    item = results_all.get(pair)
-
-    if not item or item.get("error"):
-        summary_rows.append({
-            "Coin": pair,
-            "Side": "—",
-            "Entry": "—",
-            "Current": "ERROR",
-            "P/L": "—",
-            "Position Status": "—",
-            "4H Structure": "—",
-            "Nearest 4H S": "—",
-            "Nearest 4H R": "—",
-        })
-        continue
-
-    r4 = item["timeframes"]["4H"]
-    pos = item.get("position")
-
-    if pos:
-        entry = fmt_price(pos["entry"])
-        current = fmt_price(pos["market_price"])
-        pnl = (
-            f"{pos['pnl_pct']:+.2f}%"
-            if np.isfinite(pos["pnl_pct"])
-            else "—"
-        )
-        side = pos["side"]
-        pstatus = pos["management"]["status"]
-    else:
-        entry = "Manual"
-        current = fmt_price(r4["current"])
-        pnl = "—"
-        side = "—"
-        pstatus = "MARKET ANALYSIS ONLY"
-
-    summary_rows.append({
-        "Coin": pair,
-        "Side": side,
-        "Entry": entry,
-        "Current": current,
-        "P/L": pnl,
-        "Position Status": pstatus,
-        "4H Structure": r4["structure"],
-        "Nearest 4H S": (
-            fmt_price(r4["supports"][-1])
-            if r4["supports"] else "—"
-        ),
-        "Nearest 4H R": (
-            fmt_price(r4["resistances"][0])
-            if r4["resistances"] else "—"
-        ),
-    })
-
-st.dataframe(
-    pd.DataFrame(summary_rows),
-    use_container_width=True,
-    hide_index=True,
-)
-
-st.warning(
-    "Position Status is a technical structure assessment. "
-    "It is not a guarantee that price will rise or fall. "
-    "The agent uses confirmed market data and nearby levels to identify "
-    "where the current position is strengthening or weakening."
-)
-
-
-
-# ============================================================
-# DETAILED POSITION CARDS
-# ============================================================
-
-st.subheader("🔬 Detailed Analysis")
-
-for pair in pairs:
-    item = results_all.get(pair)
-
-    if not item:
-        continue
-
-    with st.expander(f"📌 {pair}", expanded=True):
-
-        if item.get("error"):
-            st.error(item["error"])
-            continue
-
-        tf_results = item["timeframes"]
-        combined = item["combined"]
-
-        c1, c2, c3, c4 = st.columns(4)
-
-        c1.metric(
-            "Current",
-            fmt_price(tf_results["4H"]["current"]),
-        )
-
-        c2.metric(
-            "Overall Bias",
-            combined["direction"],
-        )
-
-        c3.metric(
-            "Phase",
-            combined["phase"],
-        )
-
-        c4.metric(
-            "MTF Score",
-            f"{combined['normalized_score']:+.1f}",
-        )
-
-        st.markdown(f"### Pattern: {item['pattern']}")
-
-        if combined["risks"]:
-            st.info(" | ".join(combined["risks"]))
-
-        # ----------------------------------------------------
-        # SUPPORT / RESISTANCE TABLE
-        # ----------------------------------------------------
-
-        st.markdown("#### 🧱 Support & Resistance")
-
-        sr_rows = []
-
-        for tf in ["15m", "4H", "1D", "1M"]:
-            r = tf_results[tf]
-
-            for i, p in enumerate(r["supports"], 1):
-                sr_rows.append({
-                    "Timeframe": tf,
-                    "Level": f"S{i}",
-                    "Price": fmt_price(p),
-                    "Distance": f"{pct_distance(r['current'], p):+.2f}%",
-                })
-
-            for i, p in enumerate(r["resistances"], 1):
-                sr_rows.append({
-                    "Timeframe": tf,
-                    "Level": f"R{i}",
-                    "Price": fmt_price(p),
-                    "Distance": f"{pct_distance(r['current'], p):+.2f}%",
-                })
-
-        st.dataframe(
-            pd.DataFrame(sr_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------------------------
-        # TIMEFRAME ANALYSIS
-        # ----------------------------------------------------
-
-        st.markdown("#### 📈 Timeframe Pattern Analysis")
-
-        tf_rows = []
-
-        for tf in ["15m", "4H", "1D", "1M"]:
-            r = tf_results[tf]
-
-            tf_rows.append({
-                "TF": tf,
-                "Structure": r["structure"],
-                "Bias": r["bias"],
-                "RSI": f"{r['rsi']:.1f}",
-                "EMA20": fmt_price(r["ema20"]),
-                "Price vs EMA20": f"{r['ema_distance']:+.2f}%",
-                "EMA50": fmt_price(r["ema50"]),
-                "Momentum": f"{r['momentum']:+.2f}%",
-                "Volume": (
-                    f"{r['volume_ratio']:.1f}x"
-                    if np.isfinite(r["volume_ratio"])
-                    else "—"
-                ),
-                "Score": f"{r['score']:+d}",
-            })
-
-        st.dataframe(
-            pd.DataFrame(tf_rows),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-        # ----------------------------------------------------
-        # TRADE INTERPRETATION
-        # ----------------------------------------------------
-
-        st.markdown("#### 🧭 What the Agent Sees")
-
-        r15 = tf_results["15m"]
-        r4 = tf_results["4H"]
-        r1d = tf_results["1D"]
-        r1m = tf_results["1M"]
-
-        bullets = []
-
-        if r15["structure"] == "HH + HL":
-            bullets.append("15m is making higher highs and higher lows.")
-        elif r15["structure"] == "LH + LL":
-            bullets.append("15m is making lower highs and lower lows.")
-        else:
-            bullets.append(f"15m structure is {r15['structure'].lower()}.")
-
-        if r4["structure"] == "HH + HL":
-            bullets.append("4H structure is bullish.")
-        elif r4["structure"] == "LH + LL":
-            bullets.append("4H structure is bearish.")
-        else:
-            bullets.append(f"4H structure is {r4['structure'].lower()}.")
-
-        if r4["ema_distance"] > 0:
-            bullets.append(
-                f"Price is {r4['ema_distance']:.2f}% above the 4H EMA20."
-            )
-        else:
-            bullets.append(
-                f"Price is {abs(r4['ema_distance']):.2f}% below the 4H EMA20."
-            )
-
-        if r4["supports"]:
-            s1 = r4["supports"][-1]
-            bullets.append(
-                f"Nearest major 4H support zone: {fmt_price(s1)}."
-            )
-
-        if r4["resistances"]:
-            r1 = r4["resistances"][0]
-            bullets.append(
-                f"Nearest major 4H resistance zone: {fmt_price(r1)}."
-            )
-
-        if r1d["structure"] == "HH + HL":
-            bullets.append("Daily structure supports the bullish side.")
-        elif r1d["structure"] == "LH + LL":
-            bullets.append("Daily structure supports the bearish side.")
-
-        if r1m["structure"] == "HH + HL":
-            bullets.append("Monthly structure is bullish.")
-        elif r1m["structure"] == "LH + LL":
-            bullets.append("Monthly structure is bearish.")
-
-        for b in bullets:
-            st.write("• " + b)
-
-        # ----------------------------------------------------
-        # DECISION FRAMEWORK
-        # ----------------------------------------------------
-
-        st.markdown("#### 🎯 Entry / Exit Decision Framework")
-
-        if combined["direction"] == "BULLISH BIAS":
-            st.success(
-                "Bullish technical bias. For an existing LONG, watch whether "
-                "support holds and 15m/4H structure remains HH + HL. "
-                "Avoid chasing if price is already far above EMA20 or sitting "
-                "directly under major resistance."
-            )
-        elif combined["direction"] == "BEARISH BIAS":
-            st.error(
-                "Bearish technical bias. For an existing LONG, watch the "
-                "nearest 15m/4H support carefully. A confirmed LH + LL sequence "
-                "and loss of support increases downside risk."
-            )
-        else:
-            st.warning(
-                "Mixed technical picture. Avoid assuming either a dump or a "
-                "rally. Wait for structure to resolve around the nearby "
-                "support/resistance zones."
-            )
-
-        st.caption(
-            "Important: support/resistance are reaction zones, not guaranteed "
-            "reversal points. A support break can turn S1 into resistance; "
-            "a resistance breakout can turn R1 into support."
-        )
+            MAX_WORKERS=workers
+            q,df=scan_market()
+            st.session_state["q"]=q
+            st.session_state["df"]=df
+            st.session_state["scan_time"]=time.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception as e:
+            st.error(f"Scan failed: {e}")
+
+df=st.session_state.get("df")
+q=st.session_state.get("q")
+if df is None or df.empty:
+    st.info("Click SCAN MARKET NOW.")
+    st.stop()
+
+st.success(f"Scan: {st.session_state.get('scan_time','—')} | Movers reviewed: {len(q)} | Deep candidates: {len(df)}")
+
+shorts=table(df,"SHORT")
+longs=table(df,"LONG")
+a,b=st.columns(2)
+with a:
+    st.subheader("🔴 TOP 5 SHORT")
+    st.dataframe(shorts,use_container_width=True,hide_index=True) if not shorts.empty else st.info("No fresh SHORT setup.")
+with b:
+    st.subheader("🟢 TOP 5 LONG")
+    st.dataframe(longs,use_container_width=True,hide_index=True) if not longs.empty else st.info("No fresh LONG setup.")
+
+st.subheader("🔍 Detailed Setup")
+names=sorted(set((shorts.Coin.tolist() if not shorts.empty else [])+
+                 (longs.Coin.tolist() if not longs.empty else [])))
+if names:
+    selected=st.selectbox("Select coin",names)
+    r=df[df.pair==selected].iloc[0]
+    st.markdown(f"### {r.pair} — {r.setup}")
+    st.write(f"**Thesis:** {r.thesis}")
+    c1,c2,c3,c4,c5=st.columns(5)
+    c1.metric("Current",fp(r.current)); c2.metric("24H",f"{r.move24:+.2f}%")
+    c3.metric("3D",f"{r.move3d:+.2f}%"); c4.metric("7D",f"{r.move7d:+.2f}%")
+    c5.metric("4H RSI",f"{r.rsi4:.1f}")
+    st.write(f"**15m:** {r.s15} | **4H:** {r.s4} | **1D:** {r.s1}")
+    st.write(f"**15m EMA20:** {r.ema15dist:+.2f}% | **4H EMA20:** {r.ema4dist:+.2f}% | **15m volume:** {r.vol:.1f}x")
+    rows=[]
+    for tf,supports,resists in [("15m",r.support15,r.resistance15),("4H",r.support4,r.resistance4),("1D",r.support1,r.resistance1)]:
+        for i,p in enumerate(supports,1): rows.append({"TF":tf,"Level":f"S{i}","Price":fp(p),"Distance":f"{(p/r.current-1)*100:+.2f}%"})
+        for i,p in enumerate(resists,1): rows.append({"TF":tf,"Level":f"R{i}","Price":fp(p),"Distance":f"{(p/r.current-1)*100:+.2f}%"})
+    st.markdown("#### Support / Resistance")
+    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+    st.markdown("#### Trade Plan")
+    st.write(f"**Trigger:** {r.trigger}")
+    st.write(f"**Invalidation:** {r.invalidation}")
+    st.write("**Rule:** do not chase a mature pump/dump; wait for the trigger.")
+else:
+    st.info("No fresh LONG/SHORT setup passed the filters.")
 
 st.markdown("---")
-st.caption(
-    "This tool is analysis-only. It can read open Futures positions when "
-    "you provide a read-only CoinDCX API key. It never places or modifies orders."
-)
+st.caption("A hard pump/dump alone is not a signal. The agent requires a structure transition and a fresh trigger. This is technical analysis, not a guarantee of future price movement.")
