@@ -65,7 +65,14 @@ DEFAULT_PARTIAL_PCT = 50
 DEFAULT_COOLDOWN_MIN = 30
 
 # CoinDCX Futures API paths used by this implementation.
-POSITIONS_ENDPOINT = "/exchange/v1/derivatives/futures/positions"
+# CoinDCX has exposed different futures-position response shapes/endpoints over time.
+# V5.5 tries the dedicated active-position route first, then the broad positions route.
+# It only adopts rows with a genuinely non-zero position quantity.
+POSITION_ENDPOINTS = [
+    "/exchange/v1/derivatives/futures/positions/active_positions",
+    "/exchange/v1/derivatives/futures/positions",
+]
+POSITIONS_ENDPOINT = POSITION_ENDPOINTS[-1]  # backwards-compatible reference
 FUTURES_BALANCE_ENDPOINT = "/exchange/v1/derivatives/futures/wallets"
 ORDER_CREATE_ENDPOINT = "/exchange/v1/derivatives/futures/orders/create"
 ORDER_CANCEL_ALL_ENDPOINT = "/exchange/v1/derivatives/futures/orders/cancel_all"
@@ -464,142 +471,197 @@ def lvl(vals):
     return " | ".join(fp(v) for v in vals) if vals else "—"
 
 
+
+def _num(row, keys):
+    for k in keys:
+        try:
+            v = row.get(k)
+            if v not in (None, ""):
+                v = float(v)
+                if np.isfinite(v):
+                    return v
+        except Exception:
+            pass
+    return np.nan
+
+
+def _txt(row, keys):
+    for k in keys:
+        v = row.get(k)
+        if v not in (None, ""):
+            return str(v).upper().strip()
+    return ""
+
+
+def _normalize_pair(pair):
+    p = str(pair or "").upper().strip()
+    p = p.replace("/", "-").replace("_", "-")
+    if p.startswith("B-"):
+        return p
+    if p.endswith("_USDT"):
+        return "B-" + p.replace("_", "-")
+    if p.endswith("-USDT") and not p.startswith("B-"):
+        return "B-" + p
+    return p
+
+
 def normalize_position(row):
-    def num(keys):
-        for k in keys:
-            try:
-                if k in row and row[k] not in (None, ""):
-                    return float(row[k])
-            except Exception:
-                pass
-        return np.nan
-    def txt(keys):
-        for k in keys:
-            if k in row and row[k] not in (None, ""):
-                return str(row[k]).upper().strip()
-        return ""
-    pair = txt(["pair", "symbol", "instrument", "market", "contract"])
-    side = txt(["side", "position_side", "direction"])
-    qty = num(["quantity", "qty", "size", "position_size", "active_pos", "open_quantity"])
-    entry = num(["entry_price", "avg_entry_price", "avgPrice", "average_entry_price"])
-    mark = num(["mark_price", "markPrice", "last_price", "price"])
-    pnl = num(["pnl", "unrealized_pnl", "unrealizedPnl", "active_pnl"])
-    lev = num(["leverage", "lev"])
-    return {"pair": pair, "side": side, "qty": qty, "entry": entry, "mark": mark, "pnl": pnl, "leverage": lev, "raw": row}
+    """
+    Normalize several CoinDCX position schemas.
+
+    We deliberately require a non-zero position quantity before adoption.
+    Contract catalogue rows with active_pos=0 are ignored.
+    """
+    pair = _normalize_pair(_txt(row, [
+        "pair", "symbol", "instrument", "market", "contract",
+        "instrument_name", "contract_name", "product_symbol"
+    ]))
+
+    side = _txt(row, [
+        "side", "position_side", "direction", "positionSide",
+        "position_type", "trade_side"
+    ])
+
+    # Some schemas use signed quantity. Others expose side separately.
+    qty = _num(row, [
+        "quantity", "qty", "size", "position_size", "active_pos",
+        "open_quantity", "positionQty", "position_qty", "current_qty",
+        "net_qty", "net_position", "contracts"
+    ])
+
+    entry = _num(row, [
+        "entry_price", "avg_entry_price", "avgPrice",
+        "average_entry_price", "avg_entry", "entryPrice",
+        "averagePrice", "open_price"
+    ])
+    mark = _num(row, [
+        "mark_price", "markPrice", "last_price", "price",
+        "current_price", "mark", "index_price"
+    ])
+    pnl = _num(row, [
+        "pnl", "unrealized_pnl", "unrealizedPnl", "active_pnl",
+        "unrealized_profit", "unrealizedProfit", "profit"
+    ])
+    lev = _num(row, ["leverage", "lev", "leverage_value"])
+    margin = _num(row, [
+        "margin", "margin_amount", "position_margin",
+        "initial_margin", "isolated_margin"
+    ])
+    liq = _num(row, [
+        "liq_price", "liquidation_price", "liquidationPrice",
+        "liquidation_price_usdt"
+    ])
+
+    # If side is absent, infer it from a signed quantity.
+    if side not in ("LONG", "SHORT"):
+        if np.isfinite(qty) and qty != 0:
+            side = "LONG" if qty > 0 else "SHORT"
+    if np.isfinite(qty):
+        qty = abs(qty)
+
+    return {
+        "pair": pair, "side": side, "qty": qty,
+        "entry": entry, "mark": mark, "pnl": pnl,
+        "leverage": lev, "margin": margin, "liq": liq,
+        "raw": row
+    }
+
+
+def _walk_dicts(obj):
+    """Yield every dictionary nested inside a CoinDCX JSON response."""
+    if isinstance(obj, dict):
+        yield obj
+        for v in obj.values():
+            yield from _walk_dicts(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            yield from _walk_dicts(v)
+
+
+def _extract_candidate_rows(payload):
+    """Find position-like dictionaries anywhere in a nested API response."""
+    candidates = []
+    seen = set()
+
+    for row in _walk_dicts(payload):
+        keys = {str(k).lower() for k in row.keys()}
+        has_pair = bool(keys.intersection({
+            "pair", "symbol", "instrument", "market", "contract",
+            "instrument_name", "contract_name", "product_symbol"
+        }))
+        has_position_field = bool(keys.intersection({
+            "quantity", "qty", "size", "position_size", "active_pos",
+            "open_quantity", "positionqty", "position_qty",
+            "current_qty", "net_qty", "net_position", "contracts"
+        }))
+        has_entry = bool(keys.intersection({
+            "entry_price", "avg_entry_price", "avgprice",
+            "average_entry_price", "entryprice", "averageprice"
+        }))
+        if has_pair and (has_position_field or has_entry):
+            ident = id(row)
+            if ident not in seen:
+                seen.add(ident)
+                candidates.append(row)
+
+    return candidates
+
+
+def fetch_positions_with_diagnostics():
+    """
+    Try the dedicated active-position endpoint and the broad endpoint.
+
+    Returns:
+      positions, diagnostics
+
+    IMPORTANT:
+      A response is not considered an open position unless the normalized
+      quantity is non-zero and a recognizable pair is present.
+    """
+    diagnostics = []
+
+    for endpoint in POSITION_ENDPOINTS:
+        try:
+            payload = signed_post(endpoint, {})
+            rows = _extract_candidate_rows(payload)
+            normalized = [normalize_position(r) for r in rows]
+
+            # Only real non-zero positions are adoptable.
+            active = [
+                p for p in normalized
+                if p["pair"] and np.isfinite(p["qty"]) and p["qty"] > 0
+            ]
+
+            diagnostics.append({
+                "endpoint": endpoint,
+                "http": "OK",
+                "candidate_rows": len(rows),
+                "active_nonzero": len(active),
+                "sample_pairs": ", ".join(sorted({
+                    p["pair"] for p in normalized if p["pair"]
+                })[:10]),
+            })
+
+            if active:
+                return active, diagnostics
+
+        except Exception as e:
+            diagnostics.append({
+                "endpoint": endpoint,
+                "http": "ERROR",
+                "candidate_rows": 0,
+                "active_nonzero": 0,
+                "sample_pairs": "",
+                "error": str(e)[:500],
+            })
+
+    return [], diagnostics
 
 
 def fetch_positions():
-    # The broad positions endpoint can contain zero-size contract rows.
-    # We filter aggressively for actual non-zero positions.
-    payload = signed_post(POSITIONS_ENDPOINT, {})
-    rows = []
-    if isinstance(payload, list): rows = payload
-    elif isinstance(payload, dict):
-        for k in ["data", "positions", "result", "active_positions"]:
-            if isinstance(payload.get(k), list):
-                rows = payload[k]
-                break
-        if not rows and any(k in payload for k in ["pair", "symbol", "instrument"]):
-            rows = [payload]
-    out = []
-    for row in rows:
-        if not isinstance(row, dict): continue
-        p = normalize_position(row)
-        if p["pair"] and np.isfinite(p["qty"]) and abs(p["qty"]) > 0:
-            out.append(p)
-    return out
+    positions, _ = fetch_positions_with_diagnostics()
+    return positions
 
-
-def round_step(value, step):
-    try:
-        step = float(step)
-        if step <= 0 or not np.isfinite(step): return float(value)
-        return math.floor(float(value) / step) * step
-    except Exception:
-        return float(value)
-
-
-def instrument_step(meta_row, names, default):
-    for n in names:
-        if isinstance(meta_row, dict) and n in meta_row:
-            try:
-                v = float(meta_row[n])
-                if v > 0: return v
-            except Exception: pass
-    return default
-
-
-def suggested_leverage(stop_distance_pct, max_leverage, atr_pct=None):
-    """Conservative leverage suggestion based on stop distance/volatility.
-    This is a safety heuristic, not a prediction or guarantee.
-    """
-    try:
-        s = abs(float(stop_distance_pct))
-    except Exception:
-        return 1.0
-    if not np.isfinite(s) or s <= 0:
-        return 1.0
-    # Wider stops -> lower leverage. Keep a hard cap configured by the user.
-    if s >= 8:
-        base = 1.0
-    elif s >= 5:
-        base = 1.5
-    elif s >= 3.5:
-        base = 2.0
-    elif s >= 2.5:
-        base = 3.0
-    elif s >= 1.5:
-        base = 4.0
-    else:
-        base = 5.0
-    if atr_pct is not None:
-        try:
-            a = float(atr_pct)
-            if np.isfinite(a):
-                if a >= 6: base = min(base, 1.5)
-                elif a >= 4: base = min(base, 2.0)
-                elif a >= 3: base = min(base, 3.0)
-        except Exception:
-            pass
-    return max(1.0, min(float(max_leverage), base))
-
-
-def trade_risk(margin, leverage, entry, stop):
-    """Approximate loss at stop from selected margin/leverage.
-    Excludes fees, funding, slippage and liquidation effects.
-    """
-    margin = float(margin)
-    leverage = float(leverage)
-    entry = float(entry)
-    stop = float(stop)
-    notional = margin * leverage
-    stop_pct = abs(stop-entry) / entry if entry else np.nan
-    loss = notional * stop_pct if np.isfinite(stop_pct) else np.nan
-    return notional, stop_pct * 100 if np.isfinite(stop_pct) else np.nan, loss
-
-
-def usdt_inr_rate():
-    """Best-effort live USDT/INR reference from CoinDCX spot ticker."""
-    try:
-        r = requests.get(API + "/exchange/ticker", timeout=15, headers={"User-Agent": USER_AGENT})
-        r.raise_for_status()
-        payload = r.json()
-        rows = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
-        for row in rows or []:
-            if not isinstance(row, dict):
-                continue
-            market = str(row.get("market") or row.get("pair") or row.get("symbol") or "").upper()
-            if market in ("USDTINR", "USDT-INR", "I-USDT_INR", "USDT/INR"):
-                for k in ["last_price", "lastPrice", "price", "close"]:
-                    try:
-                        v = float(row[k])
-                        if np.isfinite(v) and v > 0:
-                            return v
-                    except Exception:
-                        pass
-    except Exception:
-        pass
-    return None
 
 
 def account_balance_usdt():
@@ -921,6 +983,21 @@ def analyze_all_patterns(d15, d1h, d4, d1, side):
     }
 
 
+
+def adopt_existing_positions():
+    """
+    Read the exchange now and place every real non-zero position into the
+    agent's managed-position state. This does not place, add to, or resize
+    any position.
+    """
+    positions, diagnostics = fetch_positions_with_diagnostics()
+    st.session_state["positions"] = positions
+    st.session_state["position_diagnostics"] = diagnostics
+    st.session_state["positions_last_sync"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    st.session_state["positions_adopted"] = bool(positions)
+    return positions, diagnostics
+
+
 def position_manager_signal(pos, auto_manage=False):
     """
     Comprehensive existing-position decision engine.
@@ -1126,18 +1203,22 @@ def manage_existing_positions(positions, auto_manage=False):
         sig = position_manager_signal(p, auto_manage=auto_manage)
         results.append(sig)
         if sig.get("action") == "EXIT_SIGNAL" and sig.get("close_allowed"):
-            try:
-                response = close_position(p)
-                sig["close_response"] = str(response)[:1000]
-                journal_event({
-                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    "pair": p["pair"], "side": p["side"],
-                    "event": "AUTO_CLOSE",
-                    "reason": sig.get("reason", ""),
-                    "response": str(response)[:1000],
-                })
-            except Exception as e:
-                sig["close_error"] = str(e)
+            if not LIVE_TRADING_ENABLED:
+                sig["close_allowed"] = False
+                sig["reason"] += " | Live Trading is OFF, so no close order was sent."
+            else:
+                try:
+                    response = close_position(p)
+                    sig["close_response"] = str(response)[:1000]
+                    journal_event({
+                        "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        "pair": p["pair"], "side": p["side"],
+                        "event": "AUTO_CLOSE",
+                        "reason": sig.get("reason", ""),
+                        "response": str(response)[:1000],
+                    })
+                except Exception as e:
+                    sig["close_error"] = str(e)
     return results
 
 
@@ -1195,6 +1276,11 @@ with st.sidebar:
                             help="Manage existing positions without adding margin or averaging down.")
     auto_manage = st.checkbox("AUTO-MANAGE ADOPTED POSITIONS", value=False,
                               help="When enabled, the manager may close an adopted position if its predefined exit/invalidation rules trigger. It never adds margin.")
+    continuous_manage = st.checkbox(
+        "CONTINUOUS POSITION MONITOR (15s)",
+        value=False,
+        help="Re-sync and re-evaluate adopted positions every 15 seconds. Auto-close still requires LIVE TRADING ON."
+    )
     st.caption("Takeover does NOT add margin, average down, or increase position size.")
     scan = st.button("🔎 SCAN TOP PUMPS", type="primary", use_container_width=True)
     refresh = st.button("🔄 REFRESH POSITIONS", use_container_width=True)
@@ -1202,6 +1288,35 @@ with st.sidebar:
     close_all = st.button("🚨 CLOSE ALL OPEN POSITIONS", use_container_width=True)
 
 LIVE_TRADING_ENABLED = bool(live_toggle)
+
+# ------------------------ REAL POSITION TAKEOVER ----------------------------
+# On the first page load, synchronize actual non-zero positions automatically.
+# This is read-only unless AUTO-MANAGE + LIVE TRADING are both enabled.
+if takeover and "positions_last_sync" not in st.session_state:
+    try:
+        _adopted, _diag = adopt_existing_positions()
+    except Exception as _e:
+        st.session_state["positions"] = []
+        st.session_state["position_diagnostics"] = [{
+            "endpoint": "startup_sync",
+            "http": "ERROR",
+            "candidate_rows": 0,
+            "active_nonzero": 0,
+            "sample_pairs": "",
+            "error": str(_e)[:500],
+        }]
+
+
+
+if refresh:
+    try:
+        _adopted, _diag = adopt_existing_positions()
+        if _adopted:
+            st.success(f"🟢 Position synchronization complete: {len(_adopted)} real position(s) adopted.")
+        else:
+            st.warning("No non-zero positions were returned. Review Position API Diagnostics.")
+    except Exception as _e:
+        st.error(f"Position synchronization failed: {_e}")
 
 if close_all:
     if not LIVE_TRADING_ENABLED:
@@ -1373,68 +1488,163 @@ else:
         for i, x in enumerate(rr, 1): sr.append({"TF": tf, "Level": f"R{i}", "Price": fp(x), "Distance": f"{(x/r.current-1)*100:+.2f}%"})
     st.dataframe(pd.DataFrame(sr), use_container_width=True, hide_index=True)
 
+
+# ------------------------ CONTINUOUS MANAGER --------------------------------
+if continuous_manage and takeover:
+    if hasattr(st, "fragment"):
+        @st.fragment(run_every="15s")
+        def _continuous_position_manager():
+            try:
+                live_positions, diag = adopt_existing_positions()
+                if live_positions:
+                    results = manage_existing_positions(live_positions, auto_manage=auto_manage)
+                    st.caption(
+                        f"🟢 Manager cycle {time.strftime('%H:%M:%S')} | "
+                        f"Adopted {len(live_positions)} position(s) | "
+                        f"Live trading: {'ON' if LIVE_TRADING_ENABLED else 'OFF'}"
+                    )
+                    st.dataframe(pd.DataFrame([{
+                        "Coin": r.get("pair"),
+                        "Side": r.get("side"),
+                        "Action": r.get("action"),
+                        "Exit score": r.get("exit_score"),
+                        "P&L": f"{r.get('pnl_pct_from_entry', float('nan')):+.2f}%",
+                        "Reason": r.get("reason"),
+                    } for r in results]), use_container_width=True, hide_index=True)
+                else:
+                    st.caption(f"Manager cycle {time.strftime('%H:%M:%S')}: no verified open positions returned.")
+            except Exception as e:
+                st.error(f"Continuous position manager error: {e}")
+        _continuous_position_manager()
+    else:
+        st.info("Your Streamlit version does not support st.fragment(run_every=...). Use MANAGE OPEN POSITIONS NOW for each manager cycle.")
+
 # ============================== POSITIONS ===================================
 st.divider()
-st.subheader("📌 LIVE POSITIONS")
-if refresh:
-    try:
-        st.session_state["positions"] = fetch_positions()
-    except Exception as e:
-        st.error(f"Could not read positions: {e}")
+st.subheader("🛡️ Existing Position Takeover")
+
+if takeover:
+    st.success("TAKEOVER MODE: ON — the agent will adopt real non-zero positions returned by CoinDCX.")
+else:
+    st.info("TAKEOVER MODE: OFF")
+
+if st.session_state.get("positions_last_sync"):
+    st.caption(
+        f"Last position synchronization: {st.session_state['positions_last_sync']} | "
+        f"Adopted positions: {len(st.session_state.get('positions', []))}"
+    )
 
 positions = st.session_state.get("positions", [])
-if not positions:
-    st.info("Click REFRESH POSITIONS to read open CoinDCX Futures positions.")
-else:
+
+if positions:
+    st.success("🟢 REAL OPEN POSITION(S) ADOPTED")
     st.dataframe(pd.DataFrame([{
-        "Coin": p["pair"], "Side": p["side"], "Qty": fp(p["qty"]),
-        "Entry": fp(p["entry"]), "Mark": fp(p["mark"]),
-        "P&L": fp(p["pnl"]), "Leverage": fp(p["leverage"]),
+        "Coin": p["pair"],
+        "Side": p["side"],
+        "Qty": fp(p["qty"]),
+        "Entry": fp(p["entry"]),
+        "Mark": fp(p["mark"]),
+        "P&L": fp(p["pnl"]),
+        "Leverage": fp(p["leverage"]),
+        "Margin": fp(p.get("margin", np.nan)),
+        "Liq. Price": fp(p.get("liq", np.nan)),
+        "Status": "ADOPTED",
     } for p in positions]), use_container_width=True, hide_index=True)
+else:
+    st.warning(
+        "The agent currently has NO verified open position to manage. "
+        "This does not mean your CoinDCX position is closed; it means the private API response "
+        "has not supplied a non-zero position row yet."
+    )
 
-    if takeover:
-        st.markdown("### 🧠 EXISTING POSITION TAKEOVER")
-        st.caption("The manager evaluates structure, EMA, RSI, MACD, ADX/DMI, volume, Bollinger position, stochastic, candle patterns, divergences, ATR and multi-timeframe agreement before deciding HOLD / TRAIL / EXIT. Loss alone is not an exit signal.")
-        if manage_now or auto_manage:
+    diagnostics = st.session_state.get("position_diagnostics", [])
+    if diagnostics:
+        st.markdown("#### 🔎 Position API Diagnostics")
+        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True, hide_index=True)
+
+        st.caption(
+            "The agent will not guess a position from a contract catalogue. "
+            "It adopts only a verified non-zero position."
+        )
+
+if takeover and positions:
+    # Always refresh the exchange state before evaluating an existing position.
+    if manage_now:
+        try:
+            positions, diagnostics = adopt_existing_positions()
+        except Exception as _e:
+            st.error(f"Could not synchronize before management: {_e}")
+    st.markdown("### 🧠 Position Manager")
+    st.caption(
+        "The adopted position is analyzed continuously when you run MANAGE OPEN POSITIONS NOW. "
+        "No margin is added and quantity is never increased."
+    )
+
+    if manage_now or auto_manage:
+        try:
+            management = manage_existing_positions(positions, auto_manage=auto_manage)
+            st.dataframe(pd.DataFrame([{
+                "Coin": x.get("pair"),
+                "Side": x.get("side"),
+                "Action": x.get("action"),
+                "P&L from entry": f"{x.get('pnl_pct_from_entry', float('nan')):+.2f}%",
+                "15m": x.get("structure15"),
+                "1H": x.get("structure1h"),
+                "4H": x.get("structure4h"),
+                "1D": x.get("structure1d"),
+                "RSI": fp(x.get("rsi15")),
+                "MACD": fp(x.get("macd_hist15")),
+                "ADX": fp(x.get("adx15")),
+                "Vol": fp(x.get("vol_ratio15")),
+                "Patterns": x.get("patterns15"),
+                "Divergence": x.get("divergence15"),
+                "Pattern score": x.get("pattern_score"),
+                "Exit score": x.get("exit_score"),
+                "Trail": fp(x.get("trail_stop", np.nan)),
+                "Decision": x.get("reason"),
+                "Auto-close allowed": "YES" if x.get("close_allowed") else "NO",
+            } for x in management]), use_container_width=True, hide_index=True)
+        except Exception as e:
+            st.error(f"Position manager failed: {e}")
+
+for i, p in enumerate(positions):
+    with st.expander(f"{p['pair']} — {p['side']}"):
+        st.write({
+            "Entry": p.get("entry"),
+            "Mark": p.get("mark"),
+            "Quantity": p.get("qty"),
+            "Leverage": p.get("leverage"),
+            "Margin": p.get("margin"),
+            "Liquidation": p.get("liq"),
+            "P&L": p.get("pnl"),
+        })
+        if st.button("Close this position", key=f"close_{i}"):
             try:
-                management = manage_existing_positions(positions, auto_manage=auto_manage)
-                st.dataframe(pd.DataFrame([{
-                    "Coin": x.get("pair"),
-                    "Side": x.get("side"),
-                    "Action": x.get("action"),
-                    "P&L from entry": f"{x.get('pnl_pct_from_entry', float('nan')):+.2f}%",
-                    "15m": x.get("structure15"),
-                    "1H": x.get("structure1h"),
-                    "4H": x.get("structure4h"),
-                    "1D": x.get("structure1d"),
-                    "RSI": fp(x.get("rsi15")),
-                    "MACD": fp(x.get("macd_hist15")),
-                    "ADX": fp(x.get("adx15")),
-                    "Vol": fp(x.get("vol_ratio15")),
-                    "Patterns": x.get("patterns15"),
-                    "Divergence": x.get("divergence15"),
-                    "Pattern score": x.get("pattern_score"),
-                    "Exit score": x.get("exit_score"),
-                    "Trail": fp(x.get("trail_stop", np.nan)),
-                    "Decision": x.get("reason"),
-                } for x in management]), use_container_width=True, hide_index=True)
+                resp = close_position(p)
+                st.success("Close request sent.")
+                st.json(resp)
+                st.session_state["positions"] = [x for j, x in enumerate(positions) if j != i]
             except Exception as e:
-                st.error(f"Position manager failed: {e}")
+                st.error(f"Close failed: {e}")
+
+if st.button("🔄 SYNC & ADOPT POSITIONS NOW", use_container_width=True):
+    try:
+        positions, diagnostics = adopt_existing_positions()
+        if positions:
+            st.success(f"🟢 Adopted {len(positions)} real open position(s).")
         else:
-            st.info("Click MANAGE OPEN POSITIONS NOW to evaluate the current trade. AUTO-MANAGE may perform an exit only when an explicit invalidation rule is triggered.")
+            st.warning("No verified non-zero positions returned. Review diagnostics.")
+        st.rerun()
+    except Exception as e:
+        st.error(f"Position synchronization failed: {e}")
 
-    for i, p in enumerate(positions):
-        if st.button(f"Close {p['pair']} {p['side']}", key=f"close_{i}"):
-            if not LIVE_TRADING_ENABLED:
-                st.error("Live trading is OFF. No close order was sent.")
-            else:
-                try:
-                    result = close_position(p)
-                    journal_event({"time": time.strftime("%Y-%m-%d %H:%M:%S"), "pair": p["pair"], "side": p["side"], "event": "MANUAL_CLOSE", "response": str(result)[:1000]})
-                    st.success(f"Close request sent for {p['pair']}.")
-                    st.json(result)
-                except Exception as e:
-                    st.error(f"Close failed: {e}")
+if st.button("🚨 CLOSE ALL OPEN POSITIONS", use_container_width=True):
+    try:
+        positions = fetch_positions()
+        results = []
+        for p in positions:
+            results.append(close_position(p))
+        st.warning(f"Close requests sent for {len(results)} verified positions.")
+    except Exception as e:
+        st.error(f"Close-all failed: {e}")
 
-st.divider()
-st.caption("V5 is approval-gated. Live trading is OFF by default. Hard pump alone is never an entry; the strategy requires a fresh structure transition and trigger. Trading involves substantial risk, especially with leverage.")
