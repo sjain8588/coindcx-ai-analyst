@@ -55,6 +55,7 @@ DEFAULT_RISK_PCT = 0.50
 DEFAULT_MAX_DAILY_LOSS_PCT = 2.0
 DEFAULT_MAX_OPEN_POSITIONS = 2
 DEFAULT_MAX_LEVERAGE = 5.0
+DEFAULT_DEFAULT_MARGIN = 1000.0
 DEFAULT_MIN_RR = 2.0
 DEFAULT_ATR_STOP_MULT = 1.25
 DEFAULT_TRAIL_ATR_MULT = 1.50
@@ -65,6 +66,7 @@ DEFAULT_COOLDOWN_MIN = 30
 
 # CoinDCX Futures API paths used by this implementation.
 POSITIONS_ENDPOINT = "/exchange/v1/derivatives/futures/positions"
+FUTURES_BALANCE_ENDPOINT = "/exchange/v1/derivatives/futures/wallets"
 ORDER_CREATE_ENDPOINT = "/exchange/v1/derivatives/futures/orders/create"
 ORDER_CANCEL_ALL_ENDPOINT = "/exchange/v1/derivatives/futures/orders/cancel_all"
 
@@ -169,19 +171,66 @@ def indicators(d):
     x = d.copy()
     for n in [20, 50, 100, 200]:
         x[f"ema{n}"] = x.close.ewm(span=n, adjust=False).mean()
+
+    # RSI
     delta = x.close.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, adjust=False).mean()
     x["rsi"] = 100 - 100 / (1 + gain / loss.replace(0, np.nan))
+
+    # ATR / volatility
     tr = pd.concat([
         x.high - x.low,
         (x.high - x.close.shift()).abs(),
         (x.low - x.close.shift()).abs(),
     ], axis=1).max(axis=1)
+    x["tr"] = tr
     x["atr"] = tr.ewm(alpha=1/14, adjust=False).mean()
     x["atr_pct"] = x.atr / x.close * 100
+
+    # Volume
     x["vol_ma"] = x.volume.rolling(20).mean()
     x["vol_ratio"] = x.volume / x.vol_ma.replace(0, np.nan)
+
+    # MACD
+    ema12 = x.close.ewm(span=12, adjust=False).mean()
+    ema26 = x.close.ewm(span=26, adjust=False).mean()
+    x["macd"] = ema12 - ema26
+    x["macd_signal"] = x.macd.ewm(span=9, adjust=False).mean()
+    x["macd_hist"] = x.macd - x.macd_signal
+
+    # Bollinger Bands
+    x["bb_mid"] = x.close.rolling(20).mean()
+    bb_std = x.close.rolling(20).std()
+    x["bb_upper"] = x.bb_mid + 2 * bb_std
+    x["bb_lower"] = x.bb_mid - 2 * bb_std
+    x["bb_width"] = (x.bb_upper - x.bb_lower) / x.bb_mid.replace(0, np.nan)
+    x["bb_pct"] = (x.close - x.bb_lower) / (x.bb_upper - x.bb_lower).replace(0, np.nan)
+
+    # Stochastic
+    low14 = x.low.rolling(14).min()
+    high14 = x.high.rolling(14).max()
+    x["stoch_k"] = 100 * (x.close - low14) / (high14 - low14).replace(0, np.nan)
+    x["stoch_d"] = x.stoch_k.rolling(3).mean()
+
+    # ADX / DMI
+    up_move = x.high.diff()
+    down_move = -x.low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr14 = x.atr.replace(0, np.nan)
+    x["pdi"] = 100 * pd.Series(plus_dm, index=x.index).ewm(alpha=1/14, adjust=False).mean() / atr14
+    x["mdi"] = 100 * pd.Series(minus_dm, index=x.index).ewm(alpha=1/14, adjust=False).mean() / atr14
+    dx = 100 * (x.pdi - x.mdi).abs() / (x.pdi + x.mdi).replace(0, np.nan)
+    x["adx"] = dx.ewm(alpha=1/14, adjust=False).mean()
+
+    # Candle anatomy
+    x["body"] = (x.close - x.open).abs()
+    x["range"] = (x.high - x.low).replace(0, np.nan)
+    x["upper_wick"] = x.high - x[["open", "close"]].max(axis=1)
+    x["lower_wick"] = x[["open", "close"]].min(axis=1) - x.low
+    x["body_pct"] = x.body / x["range"]
+
     return x
 
 
@@ -480,6 +529,101 @@ def instrument_step(meta_row, names, default):
     return default
 
 
+def suggested_leverage(stop_distance_pct, max_leverage, atr_pct=None):
+    """Conservative leverage suggestion based on stop distance/volatility.
+    This is a safety heuristic, not a prediction or guarantee.
+    """
+    try:
+        s = abs(float(stop_distance_pct))
+    except Exception:
+        return 1.0
+    if not np.isfinite(s) or s <= 0:
+        return 1.0
+    # Wider stops -> lower leverage. Keep a hard cap configured by the user.
+    if s >= 8:
+        base = 1.0
+    elif s >= 5:
+        base = 1.5
+    elif s >= 3.5:
+        base = 2.0
+    elif s >= 2.5:
+        base = 3.0
+    elif s >= 1.5:
+        base = 4.0
+    else:
+        base = 5.0
+    if atr_pct is not None:
+        try:
+            a = float(atr_pct)
+            if np.isfinite(a):
+                if a >= 6: base = min(base, 1.5)
+                elif a >= 4: base = min(base, 2.0)
+                elif a >= 3: base = min(base, 3.0)
+        except Exception:
+            pass
+    return max(1.0, min(float(max_leverage), base))
+
+
+def trade_risk(margin, leverage, entry, stop):
+    """Approximate loss at stop from selected margin/leverage.
+    Excludes fees, funding, slippage and liquidation effects.
+    """
+    margin = float(margin)
+    leverage = float(leverage)
+    entry = float(entry)
+    stop = float(stop)
+    notional = margin * leverage
+    stop_pct = abs(stop-entry) / entry if entry else np.nan
+    loss = notional * stop_pct if np.isfinite(stop_pct) else np.nan
+    return notional, stop_pct * 100 if np.isfinite(stop_pct) else np.nan, loss
+
+
+def usdt_inr_rate():
+    """Best-effort live USDT/INR reference from CoinDCX spot ticker."""
+    try:
+        r = requests.get(API + "/exchange/ticker", timeout=15, headers={"User-Agent": USER_AGENT})
+        r.raise_for_status()
+        payload = r.json()
+        rows = payload if isinstance(payload, list) else payload.get("data", []) if isinstance(payload, dict) else []
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            market = str(row.get("market") or row.get("pair") or row.get("symbol") or "").upper()
+            if market in ("USDTINR", "USDT-INR", "I-USDT_INR", "USDT/INR"):
+                for k in ["last_price", "lastPrice", "price", "close"]:
+                    try:
+                        v = float(row[k])
+                        if np.isfinite(v) and v > 0:
+                            return v
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return None
+
+
+def account_balance_usdt():
+    """Best-effort futures wallet read. Returns None if endpoint/schema differs."""
+    try:
+        payload = signed_post(FUTURES_BALANCE_ENDPOINT, {})
+        rows = payload if isinstance(payload, list) else payload.get("data", payload.get("wallets", payload.get("result", []))) if isinstance(payload, dict) else []
+        if isinstance(rows, dict): rows = [rows]
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            currency = str(row.get("currency_short_name") or row.get("currency") or row.get("asset") or row.get("short_name") or "").upper()
+            if currency == "USDT":
+                for k in ["available_balance", "available", "balance", "wallet_balance", "equity"]:
+                    try:
+                        v=float(row[k])
+                        if np.isfinite(v): return v
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return None
+
+
 def calc_trade_plan(r, risk_pct, max_leverage, atr_mult, min_rr):
     entry = float(r.trigger)
     if not np.isfinite(entry) or entry <= 0:
@@ -506,11 +650,13 @@ def calc_trade_plan(r, risk_pct, max_leverage, atr_mult, min_rr):
     rr = []
     for t in targets:
         rr.append(abs(entry-t)/risk_per_unit)
+    stop_pct = abs(stop-entry) / entry * 100 if entry else np.nan
+    rec_lev = suggested_leverage(stop_pct, max_leverage, getattr(r, "atr_pct", np.nan))
     return {
         "side": side, "entry": entry, "stop": stop,
         "targets": targets, "risk_per_unit": risk_per_unit,
         "rr": rr, "risk_pct": risk_pct, "max_leverage": max_leverage,
-        "atr_mult": atr_mult,
+        "atr_mult": atr_mult, "stop_pct": stop_pct, "suggested_leverage": rec_lev,
     }
 
 
@@ -543,6 +689,458 @@ def close_position(pos):
     return create_market_order(pos["pair"], side, qty, max(1, int(pos["leverage"]) if np.isfinite(pos["leverage"]) else 1), reduce_only=True)
 
 
+
+
+def candle_patterns(d):
+    """Detect common completed-candle reversal/continuation patterns."""
+    if len(d) < 5:
+        return []
+    x = d.iloc[-5:].copy()
+    out = []
+    a = x.iloc[-1]
+    b = x.iloc[-2]
+    c = x.iloc[-3]
+
+    # Current candle anatomy
+    body = max(float(a.body), 1e-12)
+    rng = max(float(a.range), 1e-12)
+
+    # Doji / indecision
+    if float(a.body_pct) <= 0.12:
+        out.append("DOJI / INDECISION")
+
+    # Hammer / shooting star
+    if float(a.lower_wick) >= body * 2 and float(a.upper_wick) <= body * 0.8:
+        out.append("HAMMER")
+    if float(a.upper_wick) >= body * 2 and float(a.lower_wick) <= body * 0.8:
+        out.append("SHOOTING STAR")
+
+    # Engulfing
+    if b.close < b.open and a.close > a.open and a.open <= b.close and a.close >= b.open:
+        out.append("BULLISH ENGULFING")
+    if b.close > b.open and a.close < a.open and a.open >= b.close and a.close <= b.open:
+        out.append("BEARISH ENGULFING")
+
+    # Inside bar / breakout
+    if a.high < b.high and a.low > b.low:
+        out.append("INSIDE BAR")
+    if a.close > b.high:
+        out.append("BULLISH BREAKOUT")
+    if a.close < b.low:
+        out.append("BEARISH BREAKDOWN")
+
+    # Three-candle reversal approximations
+    if c.close < c.open and b.close < b.open and a.close > a.open and a.close > b.high:
+        out.append("BULLISH REVERSAL SEQUENCE")
+    if c.close > c.open and b.close > b.open and a.close < a.open and a.close < b.low:
+        out.append("BEARISH REVERSAL SEQUENCE")
+
+    return out
+
+
+def divergence_signal(d, lookback=40):
+    """Simple price/RSI and price/MACD divergence detector."""
+    if len(d) < lookback + 5:
+        return []
+    x = d.tail(lookback)
+    out = []
+    h, l = pivots(x, left=2, right=2)
+
+    if len(l) >= 2:
+        p1, p2 = l[-2][1], l[-1][1]
+        i1, i2 = l[-2][0], l[-1][0]
+        r1, r2 = float(x.rsi.iloc[i1]), float(x.rsi.iloc[i2])
+        if p2 < p1 and r2 > r1:
+            out.append("BULLISH RSI DIVERGENCE")
+        m1, m2 = float(x.macd.iloc[i1]), float(x.macd.iloc[i2])
+        if p2 < p1 and m2 > m1:
+            out.append("BULLISH MACD DIVERGENCE")
+
+    if len(h) >= 2:
+        p1, p2 = h[-2][1], h[-1][1]
+        i1, i2 = h[-2][0], h[-1][0]
+        r1, r2 = float(x.rsi.iloc[i1]), float(x.rsi.iloc[i2])
+        if p2 > p1 and r2 < r1:
+            out.append("BEARISH RSI DIVERGENCE")
+        m1, m2 = float(x.macd.iloc[i1]), float(x.macd.iloc[i2])
+        if p2 > p1 and m2 < m1:
+            out.append("BEARISH MACD DIVERGENCE")
+    return out
+
+
+def analyze_all_patterns(d15, d1h, d4, d1, side):
+    """Build a multi-factor pattern score used for position-exit decisions."""
+    frames = {"15m": d15, "1H": d1h, "4H": d4, "1D": d1}
+    score = 0
+    evidence = []
+    warnings = []
+
+    for tf, d in frames.items():
+        if len(d) < 30:
+            continue
+        row = d.iloc[-1]
+        prev = d.iloc[-2]
+
+        s = structure(d.tail(min(180, len(d))))
+        rsi = float(row.rsi)
+        macd_h = float(row.macd_hist)
+        macd_prev = float(prev.macd_hist)
+        adx = float(row.adx) if np.isfinite(row.adx) else np.nan
+        pdi = float(row.pdi) if np.isfinite(row.pdi) else np.nan
+        mdi = float(row.mdi) if np.isfinite(row.mdi) else np.nan
+        vr = float(row.vol_ratio) if np.isfinite(row.vol_ratio) else np.nan
+        bbp = float(row.bb_pct) if np.isfinite(row.bb_pct) else np.nan
+        sk = float(row.stoch_k) if np.isfinite(row.stoch_k) else np.nan
+
+        if side == "SHORT":
+            if s == "HH + HL":
+                score += 3 if tf in ("15m", "1H") else 2
+                warnings.append(f"{tf}: HH+HL")
+            elif s == "LH + LL":
+                score -= 3 if tf in ("15m", "1H") else 2
+                evidence.append(f"{tf}: LH+LL")
+
+            if float(row.close) > float(row.ema20):
+                score += 2 if tf == "15m" else 1
+                warnings.append(f"{tf}: above EMA20")
+            else:
+                evidence.append(f"{tf}: below EMA20")
+
+            if rsi >= 55:
+                score -= 1
+                warnings.append(f"{tf}: RSI {rsi:.1f} still strong")
+            elif rsi <= 42:
+                score += 1
+                evidence.append(f"{tf}: RSI {rsi:.1f} weakening")
+
+            if macd_h > 0:
+                score -= 1
+            if macd_prev > 0 and macd_h < macd_prev:
+                score -= 1
+                evidence.append(f"{tf}: MACD momentum fading")
+
+            if np.isfinite(pdi) and np.isfinite(mdi):
+                if pdi > mdi:
+                    score += 1
+                    warnings.append(f"{tf}: buyers dominate DMI")
+                else:
+                    score -= 1
+                    evidence.append(f"{tf}: sellers dominate DMI")
+
+            if np.isfinite(adx) and adx >= 25 and np.isfinite(mdi) and np.isfinite(pdi) and mdi > pdi:
+                score -= 1
+                evidence.append(f"{tf}: bearish ADX trend")
+        else:
+            if s == "LH + LL":
+                score += 3 if tf in ("15m", "1H") else 2
+                warnings.append(f"{tf}: LH+LL")
+            elif s == "HH + HL":
+                score -= 3 if tf in ("15m", "1H") else 2
+                evidence.append(f"{tf}: HH+HL")
+
+            if float(row.close) < float(row.ema20):
+                score += 2 if tf == "15m" else 1
+                warnings.append(f"{tf}: below EMA20")
+            else:
+                evidence.append(f"{tf}: above EMA20")
+
+            if rsi <= 45:
+                score -= 1
+                warnings.append(f"{tf}: RSI {rsi:.1f} still weak")
+            elif rsi >= 58:
+                score += 1
+                evidence.append(f"{tf}: RSI {rsi:.1f} recovering")
+
+            if macd_h < 0:
+                score -= 1
+            if macd_prev < 0 and macd_h > macd_prev:
+                score -= 1
+                evidence.append(f"{tf}: MACD momentum improving")
+
+            if np.isfinite(pdi) and np.isfinite(mdi):
+                if mdi > pdi:
+                    score += 1
+                    warnings.append(f"{tf}: sellers dominate DMI")
+                else:
+                    score -= 1
+                    evidence.append(f"{tf}: buyers dominate DMI")
+
+            if np.isfinite(adx) and adx >= 25 and np.isfinite(mdi) and np.isfinite(pdi) and pdi > mdi:
+                score -= 1
+                evidence.append(f"{tf}: bullish ADX trend")
+
+        # Volume climax / reversal context
+        pats = candle_patterns(d)
+        divs = divergence_signal(d)
+        if side == "SHORT":
+            if "BEARISH ENGULFING" in pats or "SHOOTING STAR" in pats or "BEARISH REVERSAL SEQUENCE" in pats:
+                score -= 2
+                evidence.append(f"{tf}: bearish candle reversal")
+            if "BULLISH ENGULFING" in pats or "HAMMER" in pats or "BULLISH REVERSAL SEQUENCE" in pats:
+                score += 2
+                warnings.append(f"{tf}: bullish candle reversal")
+            if any("BEARISH" in x for x in divs):
+                score -= 2
+                evidence.append(f"{tf}: bearish divergence")
+            if any("BULLISH" in x for x in divs):
+                score += 2
+                warnings.append(f"{tf}: bullish divergence")
+        else:
+            if "BULLISH ENGULFING" in pats or "HAMMER" in pats or "BULLISH REVERSAL SEQUENCE" in pats:
+                score -= 2
+                evidence.append(f"{tf}: bullish candle reversal")
+            if "BEARISH ENGULFING" in pats or "SHOOTING STAR" in pats or "BEARISH REVERSAL SEQUENCE" in pats:
+                score += 2
+                warnings.append(f"{tf}: bearish candle reversal")
+            if any("BULLISH" in x for x in divs):
+                score -= 2
+                evidence.append(f"{tf}: bullish divergence")
+            if any("BEARISH" in x for x in divs):
+                score += 2
+                warnings.append(f"{tf}: bearish divergence")
+
+        if np.isfinite(vr) and vr >= 2.5:
+            evidence.append(f"{tf}: high volume {vr:.1f}x")
+
+        # Keep BB/Stoch observations visible without letting them dominate.
+        if np.isfinite(bbp):
+            if side == "SHORT" and bbp > 0.95:
+                warnings.append(f"{tf}: near upper Bollinger Band")
+            if side == "LONG" and bbp < 0.05:
+                warnings.append(f"{tf}: near lower Bollinger Band")
+        if np.isfinite(sk):
+            if side == "SHORT" and sk > 80:
+                warnings.append(f"{tf}: stochastic overbought")
+            if side == "LONG" and sk < 20:
+                warnings.append(f"{tf}: stochastic oversold")
+
+    return {
+        "pattern_score": int(score),
+        "evidence": evidence[-12:],
+        "warnings": warnings[-12:],
+    }
+
+
+def position_manager_signal(pos, auto_manage=False):
+    """
+    Comprehensive existing-position decision engine.
+
+    It evaluates structure, EMA alignment, RSI, MACD, DMI/ADX, volume,
+    Bollinger position, stochastic, candle patterns, divergences, ATR and
+    multi-timeframe agreement before deciding HOLD / TRAIL_CANDIDATE /
+    EXIT_SIGNAL.
+
+    Negative P&L alone is never an exit reason.
+    Liquidation distance is a safety metric, not a directional signal.
+    No averaging down or margin addition is performed.
+    """
+    pair = pos.get("pair", "")
+    side = pos.get("side", "")
+    entry = float(pos.get("entry", np.nan))
+    mark = float(pos.get("mark", np.nan))
+    if not pair or side not in ("SHORT", "LONG") or not np.isfinite(entry) or not np.isfinite(mark):
+        return {"action": "HOLD", "reason": "Insufficient position data."}
+
+    try:
+        d15 = indicators(candles(pair, "15m", 10))
+        d1h = indicators(candles(pair, "1H", 30))
+        d4 = indicators(candles(pair, "4H", 150))
+        d1 = indicators(candles(pair, "1D", 500))
+    except Exception as e:
+        return {"action": "HOLD", "reason": f"Market-data error: {e}"}
+
+    if min(len(d15), len(d1h), len(d4), len(d1)) < 30:
+        return {"action": "HOLD", "reason": "Not enough completed candles for full pattern analysis."}
+
+    s15 = structure(d15.tail(180))
+    s1h = structure(d1h.tail(120))
+    s4 = structure(d4.tail(80))
+    s1 = structure(d1.tail(50))
+
+    e15 = float(d15.ema20.iloc[-1])
+    atr15 = float(d15.atr.iloc[-1])
+    r15 = float(d15.rsi.iloc[-1])
+    row15 = d15.iloc[-1]
+
+    h, l = pivots(d15.tail(180))
+    last_hi = h[-1][1] if h else np.nan
+    last_lo = l[-1][1] if l else np.nan
+
+    favorable = ((entry - mark) / entry * 100) if side == "SHORT" else ((mark - entry) / entry * 100)
+    risk_pct = abs(mark-entry)/entry*100 if entry else np.nan
+    patterns15 = candle_patterns(d15)
+    div15 = divergence_signal(d15)
+
+    allp = analyze_all_patterns(d15, d1h, d4, d1, side)
+    score = int(allp["pattern_score"])
+
+    # A second, explicit exit score makes the decision easier to audit.
+    exit_score = 0
+    exit_reasons = []
+    hold_reasons = []
+
+    if side == "SHORT":
+        if s15 in ("HH + HL", "BULLISH DEVELOPING"):
+            exit_score += 4
+            exit_reasons.append("15m bullish structure")
+        if s1h == "HH + HL":
+            exit_score += 3
+            exit_reasons.append("1H HH+HL")
+        if s4 == "HH + HL":
+            exit_score += 2
+            exit_reasons.append("4H HH+HL")
+        if mark > e15:
+            exit_score += 3
+            exit_reasons.append("price above 15m EMA20")
+        if r15 >= 58:
+            exit_score += 2
+            exit_reasons.append(f"15m RSI strong ({r15:.1f})")
+        if float(row15.macd_hist) > float(d15.macd_hist.iloc[-2]):
+            exit_score += 1
+            exit_reasons.append("MACD momentum improving")
+        if "BULLISH ENGULFING" in patterns15 or "HAMMER" in patterns15:
+            exit_score += 2
+            exit_reasons.append("bullish reversal candle")
+        if any("BULLISH" in x for x in div15):
+            exit_score += 2
+            exit_reasons.append("bullish divergence")
+        if np.isfinite(row15.pdi) and np.isfinite(row15.mdi) and row15.pdi > row15.mdi:
+            exit_score += 1
+            exit_reasons.append("buyers dominate DMI")
+
+        # Bearish evidence keeps the trade alive.
+        if s15 == "LH + LL": hold_reasons.append("15m LH+LL")
+        if s1h == "LH + LL": hold_reasons.append("1H LH+LL")
+        if s4 == "LH + LL": hold_reasons.append("4H LH+LL")
+        if mark < e15: hold_reasons.append("below 15m EMA20")
+        if r15 < 50: hold_reasons.append(f"15m RSI not strong ({r15:.1f})")
+        if np.isfinite(row15.mdi) and np.isfinite(row15.pdi) and row15.mdi > row15.pdi:
+            hold_reasons.append("sellers dominate DMI")
+    else:
+        if s15 in ("LH + LL", "BEARISH DEVELOPING"):
+            exit_score += 4
+            exit_reasons.append("15m bearish structure")
+        if s1h == "LH + LL":
+            exit_score += 3
+            exit_reasons.append("1H LH+LL")
+        if s4 == "LH + LL":
+            exit_score += 2
+            exit_reasons.append("4H LH+LL")
+        if mark < e15:
+            exit_score += 3
+            exit_reasons.append("price below 15m EMA20")
+        if r15 <= 42:
+            exit_score += 2
+            exit_reasons.append(f"15m RSI weak ({r15:.1f})")
+        if float(row15.macd_hist) < float(d15.macd_hist.iloc[-2]):
+            exit_score += 1
+            exit_reasons.append("MACD momentum weakening")
+        if "BEARISH ENGULFING" in patterns15 or "SHOOTING STAR" in patterns15:
+            exit_score += 2
+            exit_reasons.append("bearish reversal candle")
+        if any("BEARISH" in x for x in div15):
+            exit_score += 2
+            exit_reasons.append("bearish divergence")
+        if np.isfinite(row15.mdi) and np.isfinite(row15.pdi) and row15.mdi > row15.pdi:
+            exit_score += 1
+            exit_reasons.append("sellers dominate DMI")
+
+        if s15 == "HH + HL": hold_reasons.append("15m HH+HL")
+        if s1h == "HH + HL": hold_reasons.append("1H HH+HL")
+        if s4 == "HH + HL": hold_reasons.append("4H HH+HL")
+        if mark > e15: hold_reasons.append("above 15m EMA20")
+        if r15 > 50: hold_reasons.append(f"15m RSI healthy ({r15:.1f})")
+        if np.isfinite(row15.pdi) and np.isfinite(row15.mdi) and row15.pdi > row15.mdi:
+            hold_reasons.append("buyers dominate DMI")
+
+    # Confirmed swing invalidation is stronger than one noisy candle.
+    if side == "SHORT" and np.isfinite(last_hi) and mark > last_hi:
+        exit_score += 3
+        exit_reasons.append("latest 15m swing high broken")
+    if side == "LONG" and np.isfinite(last_lo) and mark < last_lo:
+        exit_score += 3
+        exit_reasons.append("latest 15m swing low broken")
+
+    # Pattern score is supporting evidence, not a standalone trigger.
+    if side == "SHORT" and score >= 7:
+        exit_score += 2
+        exit_reasons.append(f"multi-factor bullish reversal score {score}")
+    if side == "LONG" and score >= 7:
+        exit_score += 2
+        exit_reasons.append(f"multi-factor bearish reversal score {score}")
+
+    # Profit-aware trailing candidate.
+    trail = np.nan
+    if favorable > 0 and np.isfinite(atr15):
+        if side == "SHORT":
+            candidates = [e15]
+            if np.isfinite(last_hi):
+                candidates.append(last_hi)
+            trail = max(candidates) + 0.35 * atr15
+        else:
+            candidates = [e15]
+            if np.isfinite(last_lo):
+                candidates.append(last_lo)
+            trail = min(candidates) - 0.35 * atr15
+
+    # Decision thresholds:
+    # >=8 = strong multi-factor invalidation; 5-7 = warning, continue watching.
+    if exit_score >= 8:
+        action = "EXIT_SIGNAL"
+        close_allowed = bool(auto_manage)
+        reason = "Strong multi-factor exit: " + "; ".join(exit_reasons[:6])
+    elif favorable > 0 and exit_score >= 5:
+        action = "TRAIL_CANDIDATE"
+        close_allowed = False
+        reason = "Trend is weakening while profitable; tighten the trailing protection. " + "; ".join(exit_reasons[:5])
+    else:
+        action = "HOLD"
+        close_allowed = False
+        reason = "Thesis still has supporting evidence. " + "; ".join(hold_reasons[:6])
+
+    return {
+        "pair": pair, "side": side, "entry": entry, "mark": mark,
+        "pnl_pct_from_entry": favorable,
+        "move_against_entry_pct": risk_pct,
+        "structure15": s15, "structure1h": s1h, "structure4h": s4, "structure1d": s1,
+        "rsi15": r15, "ema20": e15, "atr15": atr15,
+        "macd_hist15": float(row15.macd_hist),
+        "adx15": float(row15.adx) if np.isfinite(row15.adx) else np.nan,
+        "vol_ratio15": float(row15.vol_ratio) if np.isfinite(row15.vol_ratio) else np.nan,
+        "patterns15": ", ".join(patterns15) if patterns15 else "None",
+        "divergence15": ", ".join(div15) if div15 else "None",
+        "pattern_score": score, "exit_score": exit_score,
+        "last_hi": last_hi, "last_lo": last_lo, "trail_stop": trail,
+        "action": action, "close_allowed": close_allowed,
+        "reason": reason,
+        "exit_reasons": "; ".join(exit_reasons[:8]),
+        "hold_reasons": "; ".join(hold_reasons[:8]),
+        "evidence": "; ".join(allp["evidence"][-8:]),
+        "warnings": "; ".join(allp["warnings"][-8:]),
+    }
+
+
+def manage_existing_positions(positions, auto_manage=False):
+    results = []
+    for p in positions:
+        sig = position_manager_signal(p, auto_manage=auto_manage)
+        results.append(sig)
+        if sig.get("action") == "EXIT_SIGNAL" and sig.get("close_allowed"):
+            try:
+                response = close_position(p)
+                sig["close_response"] = str(response)[:1000]
+                journal_event({
+                    "time": time.strftime("%Y-%m-%d %H:%M:%S"),
+                    "pair": p["pair"], "side": p["side"],
+                    "event": "AUTO_CLOSE",
+                    "reason": sig.get("reason", ""),
+                    "response": str(response)[:1000],
+                })
+            except Exception as e:
+                sig["close_error"] = str(e)
+    return results
+
+
 def journal_event(event):
     path = "coindcx_trade_journal.csv"
     row = pd.DataFrame([event])
@@ -557,7 +1155,7 @@ def journal_event(event):
 # ============================== UI ==========================================
 st.set_page_config(page_title="CoinDCX Expert Trader V5", page_icon="🎯", layout="wide")
 st.title("🎯 CoinDCX Expert Futures Trader V5")
-st.caption("Top-pump universe → expert MTF analysis → your approval → execution → active position management.")
+st.caption("Top-pump universe → expert MTF analysis → approval → execution → existing-position takeover → trailing → exit → re-entry.")
 
 with st.sidebar:
     st.header("Bot Controls")
@@ -577,8 +1175,30 @@ with st.sidebar:
     st.warning("Live trading is OFF by default.")
     live_toggle = st.checkbox("ENABLE LIVE TRADING", value=False)
     st.caption("Approval is still required for every new entry.")
+    st.markdown("### 💰 INR-M Capital")
+    st.caption("This account is INR-M. New trades use only the INR margin you explicitly enter.")
+    available_inr = st.number_input(
+        "Available INR margin (read from CoinDCX)",
+        min_value=0.0, value=float(st.session_state.get("available_inr", 0.0)), step=10.0,
+        key="available_inr_input"
+    )
+    investment_inr = st.number_input(
+        "How much INR do you want to invest in this trade?",
+        min_value=0.0, value=500.0, step=50.0, key="investment_inr"
+    )
+    if investment_inr > available_inr:
+        st.error("Investment exceeds available INR margin. The agent will not use locked margin or other wallet funds.")
+    else:
+        st.caption(f"New-trade margin: ₹{investment_inr:,.2f}. Remaining wallet funds are untouched.")
+    st.markdown("### 🛡️ Existing-position takeover")
+    takeover = st.checkbox("TAKE OVER EXISTING POSITIONS", value=True,
+                            help="Manage existing positions without adding margin or averaging down.")
+    auto_manage = st.checkbox("AUTO-MANAGE ADOPTED POSITIONS", value=False,
+                              help="When enabled, the manager may close an adopted position if its predefined exit/invalidation rules trigger. It never adds margin.")
+    st.caption("Takeover does NOT add margin, average down, or increase position size.")
     scan = st.button("🔎 SCAN TOP PUMPS", type="primary", use_container_width=True)
     refresh = st.button("🔄 REFRESH POSITIONS", use_container_width=True)
+    manage_now = st.button("🧠 MANAGE OPEN POSITIONS NOW", use_container_width=True)
     close_all = st.button("🚨 CLOSE ALL OPEN POSITIONS", use_container_width=True)
 
 LIVE_TRADING_ENABLED = bool(live_toggle)
@@ -684,23 +1304,40 @@ else:
         p3.metric("Risk / unit", fp(plan["risk_per_unit"]))
         p4.metric("R:R", rr_text)
         st.write(f"**Targets:** {', '.join(fp(x) for x in plan['targets']) if plan['targets'] else 'None'}")
-        st.write(f"**Risk:** {risk_pct:.2f}% account | **Max leverage:** {max_lev:g}x | **Trailing:** structure + {trail_atr:.2f} ATR after {trail_r:.2f}R")
-        st.warning("The trigger must actually occur before approval. The approval button is for a live order only after the trigger is confirmed.")
+        notional_preview, stop_pct_preview, loss_preview = trade_risk(investment, plan["suggested_leverage"], plan["entry"], plan["stop"])
+        st.write(f"**Stop distance:** {plan['stop_pct']:.2f}% | **Suggested leverage:** **{plan['suggested_leverage']:.1f}x** | **Max allowed:** {max_lev:g}x")
+        rp1, rp2, rp3, rp4 = st.columns(4)
+        rp1.metric("Your investment", f"₹{investment_inr:,.0f}")
+        rp2.metric("Suggested leverage", f"{plan['suggested_leverage']:.1f}x")
+        rp3.metric("Approx. notional", f"{notional_preview:,.2f} USDT")
+        rp4.metric("Approx. SL loss", f"₹{loss_preview*usdtinr:,.0f}")
+        st.caption("Leverage is a risk/position-sizing suggestion based on stop distance and volatility; it is not a guarantee. Fees, funding, slippage and liquidation can change actual results.")
+        st.warning("Before any live order, you choose the capital to commit. The agent will not use the rest of your wallet. The trigger must be confirmed before execution.")
+
+        lev = st.number_input("Leverage you want to use", 1.0, float(max_lev), float(plan["suggested_leverage"]), 0.5, key=f"lev_{r.pair}")
+        if lev != plan["suggested_leverage"]:
+            n2, s2, l2 = trade_risk(investment, lev, plan["entry"], plan["stop"])
+            st.info(f"With {lev:.1f}x: notional ≈ {n2:,.2f} USDT; approximate stop loss ≈ ₹{l2*usdtinr:,.0f} ({s2:.2f}% price move).")
 
         if st.button(f"🟠 APPROVE {r.pair} SHORT", type="primary", use_container_width=True):
             if not LIVE_TRADING_ENABLED:
                 st.error("Approval received, but LIVE TRADING is OFF. No order was sent.")
             else:
-                # User sets margin in the UI immediately before execution.
                 st.session_state["pending_plan"] = plan
                 st.session_state["pending_pair"] = r.pair
+                st.session_state["pending_margin"] = investment
+                st.session_state["pending_leverage"] = lev
                 st.rerun()
 
         if st.session_state.get("pending_pair") == r.pair and st.session_state.get("pending_plan"):
-            st.markdown("#### Confirm order sizing")
-            margin = st.number_input("Margin to use (quote currency)", min_value=1.0, value=100.0, step=10.0, key=f"margin_{r.pair}")
-            lev = st.number_input("Leverage for this trade", 1.0, float(max_lev), min(5.0, float(max_lev)), 0.5, key=f"lev_{r.pair}")
-            if st.button("✅ SEND LIVE ORDER", type="primary", key=f"send_{r.pair}"):
+            st.markdown("#### Final order confirmation")
+            margin = float(st.session_state.get("pending_margin", investment))
+            lev = float(st.session_state.get("pending_leverage", plan["suggested_leverage"]))
+            final_notional, final_stop_pct, final_loss = trade_risk(margin, lev, plan["entry"], plan["stop"])
+            st.write(f"**Invest:** ₹{investment_inr:,.0f} ({margin:,.2f} USDT) | **Leverage:** {lev:.1f}x | **Notional:** {final_notional:,.2f} USDT | **Approx. SL loss:** ₹{final_loss*usdtinr:,.0f}")
+            if margin > available_inr:
+                st.error("Investment amount is greater than available INR margin. Reduce the investment amount.")
+            if st.button("✅ CONFIRM & SEND LIVE ORDER", type="primary", key=f"send_{r.pair}"):
                 try:
                     qty = (margin * lev) / plan["entry"]
                     mrow = meta.get(r.pair, {})
@@ -754,6 +1391,38 @@ else:
         "Entry": fp(p["entry"]), "Mark": fp(p["mark"]),
         "P&L": fp(p["pnl"]), "Leverage": fp(p["leverage"]),
     } for p in positions]), use_container_width=True, hide_index=True)
+
+    if takeover:
+        st.markdown("### 🧠 EXISTING POSITION TAKEOVER")
+        st.caption("The manager evaluates structure, EMA, RSI, MACD, ADX/DMI, volume, Bollinger position, stochastic, candle patterns, divergences, ATR and multi-timeframe agreement before deciding HOLD / TRAIL / EXIT. Loss alone is not an exit signal.")
+        if manage_now or auto_manage:
+            try:
+                management = manage_existing_positions(positions, auto_manage=auto_manage)
+                st.dataframe(pd.DataFrame([{
+                    "Coin": x.get("pair"),
+                    "Side": x.get("side"),
+                    "Action": x.get("action"),
+                    "P&L from entry": f"{x.get('pnl_pct_from_entry', float('nan')):+.2f}%",
+                    "15m": x.get("structure15"),
+                    "1H": x.get("structure1h"),
+                    "4H": x.get("structure4h"),
+                    "1D": x.get("structure1d"),
+                    "RSI": fp(x.get("rsi15")),
+                    "MACD": fp(x.get("macd_hist15")),
+                    "ADX": fp(x.get("adx15")),
+                    "Vol": fp(x.get("vol_ratio15")),
+                    "Patterns": x.get("patterns15"),
+                    "Divergence": x.get("divergence15"),
+                    "Pattern score": x.get("pattern_score"),
+                    "Exit score": x.get("exit_score"),
+                    "Trail": fp(x.get("trail_stop", np.nan)),
+                    "Decision": x.get("reason"),
+                } for x in management]), use_container_width=True, hide_index=True)
+            except Exception as e:
+                st.error(f"Position manager failed: {e}")
+        else:
+            st.info("Click MANAGE OPEN POSITIONS NOW to evaluate the current trade. AUTO-MANAGE may perform an exit only when an explicit invalidation rule is triggered.")
+
     for i, p in enumerate(positions):
         if st.button(f"Close {p['pair']} {p['side']}", key=f"close_{i}"):
             if not LIVE_TRADING_ENABLED:
