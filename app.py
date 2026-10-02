@@ -68,11 +68,22 @@ DEFAULT_COOLDOWN_MIN = 30
 # CoinDCX has exposed different futures-position response shapes/endpoints over time.
 # V5.5 tries the dedicated active-position route first, then the broad positions route.
 # It only adopts rows with a genuinely non-zero position quantity.
+# CoinDCX futures position APIs can require the margin currency and pagination.
+# Your account is INR-M, so INR is tried first.
 POSITION_ENDPOINTS = [
     "/exchange/v1/derivatives/futures/positions/active_positions",
     "/exchange/v1/derivatives/futures/positions",
 ]
 POSITIONS_ENDPOINT = POSITION_ENDPOINTS[-1]  # backwards-compatible reference
+
+POSITION_REQUESTS = [
+    {"margin_currency_short_name": "INR", "page": 1, "size": 100},
+    {"margin_currency_short_name": "INR"},
+    {"margin_currency_short_name": "USDT", "page": 1, "size": 100},
+    {"margin_currency_short_name": "USDT"},
+    {"page": 1, "size": 100},
+    {},
+]
 FUTURES_BALANCE_ENDPOINT = "/exchange/v1/derivatives/futures/wallets"
 ORDER_CREATE_ENDPOINT = "/exchange/v1/derivatives/futures/orders/create"
 ORDER_CANCEL_ALL_ENDPOINT = "/exchange/v1/derivatives/futures/orders/cancel_all"
@@ -609,53 +620,58 @@ def _extract_candidate_rows(payload):
 
 def fetch_positions_with_diagnostics():
     """
-    Try the dedicated active-position endpoint and the broad endpoint.
+    Try the active-position and broad-position APIs using the request shapes
+    used by CoinDCX futures. INR-M is attempted first.
 
-    Returns:
-      positions, diagnostics
-
-    IMPORTANT:
-      A response is not considered an open position unless the normalized
-      quantity is non-zero and a recognizable pair is present.
+    A row is adopted only when it contains a recognizable pair and a
+    genuinely non-zero position quantity.
     """
     diagnostics = []
 
     for endpoint in POSITION_ENDPOINTS:
-        try:
-            payload = signed_post(endpoint, {})
-            rows = _extract_candidate_rows(payload)
-            normalized = [normalize_position(r) for r in rows]
+        for request_body in POSITION_REQUESTS:
+            try:
+                payload = signed_post(endpoint, request_body)
+                rows = _extract_candidate_rows(payload)
+                normalized = [normalize_position(r) for r in rows]
 
-            # Only real non-zero positions are adoptable.
-            active = [
-                p for p in normalized
-                if p["pair"] and np.isfinite(p["qty"]) and p["qty"] > 0
-            ]
+                active = [
+                    p for p in normalized
+                    if p["pair"]
+                    and np.isfinite(p["qty"])
+                    and p["qty"] > 0
+                    and p["side"] in ("LONG", "SHORT")
+                ]
 
-            diagnostics.append({
-                "endpoint": endpoint,
-                "http": "OK",
-                "candidate_rows": len(rows),
-                "active_nonzero": len(active),
-                "sample_pairs": ", ".join(sorted({
-                    p["pair"] for p in normalized if p["pair"]
-                })[:10]),
-            })
+                diagnostics.append({
+                    "endpoint": endpoint,
+                    "margin": request_body.get("margin_currency_short_name", "default"),
+                    "page": request_body.get("page", ""),
+                    "http": "OK",
+                    "candidate_rows": len(rows),
+                    "active_nonzero": len(active),
+                    "sample_pairs": ", ".join(sorted({
+                        p["pair"] for p in normalized if p["pair"]
+                    })[:10]),
+                })
 
-            if active:
-                return active, diagnostics
+                if active:
+                    return active, diagnostics
 
-        except Exception as e:
-            diagnostics.append({
-                "endpoint": endpoint,
-                "http": "ERROR",
-                "candidate_rows": 0,
-                "active_nonzero": 0,
-                "sample_pairs": "",
-                "error": str(e)[:500],
-            })
+            except Exception as e:
+                diagnostics.append({
+                    "endpoint": endpoint,
+                    "margin": request_body.get("margin_currency_short_name", "default"),
+                    "page": request_body.get("page", ""),
+                    "http": "ERROR",
+                    "candidate_rows": 0,
+                    "active_nonzero": 0,
+                    "sample_pairs": "",
+                    "error": str(e)[:500],
+                })
 
     return [], diagnostics
+
 
 
 def fetch_positions():
@@ -1524,7 +1540,7 @@ st.divider()
 st.subheader("🛡️ Existing Position Takeover")
 
 if takeover:
-    st.success("TAKEOVER MODE: ON — the agent will adopt real non-zero positions returned by CoinDCX.")
+    st.success("TAKEOVER MODE: ON — INR-M active-position synchronization is enabled.")
 else:
     st.info("TAKEOVER MODE: OFF")
 
@@ -1563,8 +1579,9 @@ else:
         st.dataframe(pd.DataFrame(diagnostics), use_container_width=True, hide_index=True)
 
         st.caption(
-            "The agent will not guess a position from a contract catalogue. "
-            "It adopts only a verified non-zero position."
+            "INR-M is tried first with CoinDCX's margin_currency_short_name parameter, "
+            "followed by USDT and minimal requests. The agent will not guess a position "
+            "from a contract catalogue; it adopts only a verified non-zero position."
         )
 
 if takeover and positions:
