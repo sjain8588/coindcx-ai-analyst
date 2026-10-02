@@ -1052,6 +1052,20 @@ def adopt_existing_positions():
     st.session_state["positions"] = positions
     st.session_state["position_diagnostics"] = diagnostics
     st.session_state["positions_last_sync"] = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    # Keep the most useful API error separately so it is visible even when
+    # Streamlit's dataframe is horizontally clipped.
+    _api_errors = [
+        {
+            "label": d.get("label", ""),
+            "endpoint": d.get("endpoint", ""),
+            "request": d.get("request", ""),
+            "error": d.get("error", ""),
+        }
+        for d in diagnostics
+        if d.get("http") == "ERROR" and d.get("error")
+    ]
+    st.session_state["position_api_errors"] = _api_errors
     st.session_state["positions_adopted"] = bool(positions)
     return positions, diagnostics
 
@@ -1628,6 +1642,20 @@ else:
 
     diagnostics = st.session_state.get("position_diagnostics", [])
     if diagnostics:
+        api_errors = st.session_state.get("position_api_errors", [])
+        if api_errors:
+            st.markdown("#### 🚨 Exact Position API Error")
+            for i, err in enumerate(api_errors):
+                with st.expander(
+                    f"{i+1}. {err.get('label')} — {err.get('endpoint')}",
+                    expanded=(i == 0),
+                ):
+                    st.code(
+                        "REQUEST: " + err.get("request", "") + "\n\n" +
+                        "ERROR: " + err.get("error", ""),
+                        language="text",
+                    )
+
         st.markdown("#### 🔎 Position API Diagnostics")
         st.dataframe(
             pd.DataFrame(diagnostics),
