@@ -1640,6 +1640,18 @@ else:
         "has not supplied a non-zero position row yet."
     )
 
+    # Put the actual private-API exception here, above the table.
+    api_errors = st.session_state.get("position_api_errors", [])
+    if api_errors:
+        st.markdown("### 🚨 ACTUAL COINDCX API ERROR")
+        for i, err in enumerate(api_errors):
+            st.error(
+                f"{err.get('label', 'request')}\n\n"
+                f"Endpoint: {err.get('endpoint', '')}\n"
+                f"Request: {err.get('request', '')}\n"
+                f"Response/Error: {err.get('error', '')}"
+            )
+
     diagnostics = st.session_state.get("position_diagnostics", [])
     if diagnostics:
         api_errors = st.session_state.get("position_api_errors", [])
