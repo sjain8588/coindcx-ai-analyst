@@ -255,8 +255,22 @@ def quick_row(pair):
 
 
 def pump_rank(r):
-    # Multi-day pump is deliberately dominant over a one-candle spike.
-    return max(r.m24, 0)*0.30 + max(r.m3, 0)*0.45 + max(r.m7, 0)*0.25
+    # Works with both quick-scan rows (m24/m3/m7) and deep-scan rows
+    # (move24/move3d/move7d). Multi-day pump remains dominant.
+    def get(name, fallback=0.0):
+        try:
+            if isinstance(r, dict):
+                return float(r.get(name, fallback))
+            if name in r.index:
+                return float(r[name])
+        except Exception:
+            pass
+        return float(fallback)
+
+    m24 = get("m24", get("move24"))
+    m3 = get("m3", get("move3d"))
+    m7 = get("m7", get("move7d"))
+    return max(m24, 0)*0.30 + max(m3, 0)*0.45 + max(m7, 0)*0.25
 
 
 def deep_scan(pair):
