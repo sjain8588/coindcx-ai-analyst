@@ -620,55 +620,97 @@ def _extract_candidate_rows(payload):
 
 def fetch_positions_with_diagnostics():
     """
-    Try the active-position and broad-position APIs using the request shapes
-    used by CoinDCX futures. INR-M is attempted first.
+    Position API diagnostic based on the previously working CoinDCX private
+    request pattern.
 
-    A row is adopted only when it contains a recognizable pair and a
-    genuinely non-zero position quantity.
+    IMPORTANT:
+    - Do not hammer the API with many speculative requests.
+    - Try the known broad endpoint with {} first.
+    - Preserve the exact HTTP status and safe API error in diagnostics.
+    - Never infer an open position from a contract catalogue row.
     """
+    attempts = [
+        (
+            "positions_default",
+            "/exchange/v1/derivatives/futures/positions",
+            {},
+        ),
+        (
+            "positions_page",
+            "/exchange/v1/derivatives/futures/positions",
+            {"page": 1, "size": 100},
+        ),
+        (
+            "positions_INR",
+            "/exchange/v1/derivatives/futures/positions",
+            {
+                "margin_currency_short_name": "INR",
+                "page": 1,
+                "size": 100,
+            },
+        ),
+        (
+            "active_positions_default",
+            "/exchange/v1/derivatives/futures/positions/active_positions",
+            {},
+        ),
+    ]
+
     diagnostics = []
 
-    for endpoint in POSITION_ENDPOINTS:
-        for request_body in POSITION_REQUESTS:
-            try:
-                payload = signed_post(endpoint, request_body)
-                rows = _extract_candidate_rows(payload)
-                normalized = [normalize_position(r) for r in rows]
+    for label, endpoint, request_body in attempts:
+        try:
+            payload = signed_post(endpoint, request_body)
 
-                active = [
-                    p for p in normalized
-                    if p["pair"]
-                    and np.isfinite(p["qty"])
-                    and p["qty"] > 0
-                    and p["side"] in ("LONG", "SHORT")
-                ]
+            rows = _extract_candidate_rows(payload)
+            normalized = [normalize_position(r) for r in rows]
 
-                diagnostics.append({
-                    "endpoint": endpoint,
-                    "margin": request_body.get("margin_currency_short_name", "default"),
-                    "page": request_body.get("page", ""),
-                    "http": "OK",
-                    "candidate_rows": len(rows),
-                    "active_nonzero": len(active),
-                    "sample_pairs": ", ".join(sorted({
-                        p["pair"] for p in normalized if p["pair"]
-                    })[:10]),
-                })
+            # Recognize any non-zero position exposed by the response.
+            active = [
+                p for p in normalized
+                if p["pair"]
+                and np.isfinite(p["qty"])
+                and p["qty"] > 0
+                and p["side"] in ("LONG", "SHORT")
+            ]
 
-                if active:
-                    return active, diagnostics
+            # Safe structural diagnostics. No credentials or signatures.
+            top_keys = list(payload.keys())[:30] if isinstance(payload, dict) else []
+            sample_pairs = sorted({
+                p["pair"] for p in normalized if p["pair"]
+            })[:10]
 
-            except Exception as e:
-                diagnostics.append({
-                    "endpoint": endpoint,
-                    "margin": request_body.get("margin_currency_short_name", "default"),
-                    "page": request_body.get("page", ""),
-                    "http": "ERROR",
-                    "candidate_rows": 0,
-                    "active_nonzero": 0,
-                    "sample_pairs": "",
-                    "error": str(e)[:500],
-                })
+            diagnostics.append({
+                "label": label,
+                "endpoint": endpoint,
+                "request": json.dumps(request_body, separators=(",", ":")),
+                "http": "200",
+                "candidate_rows": len(rows),
+                "active_nonzero": len(active),
+                "sample_pairs": ", ".join(sample_pairs),
+                "response_keys": ", ".join(map(str, top_keys)),
+                "error": "",
+            })
+
+            if active:
+                return active, diagnostics
+
+        except Exception as e:
+            msg = str(e)
+            diagnostics.append({
+                "label": label,
+                "endpoint": endpoint,
+                "request": json.dumps(request_body, separators=(",", ":")),
+                "http": "ERROR",
+                "candidate_rows": 0,
+                "active_nonzero": 0,
+                "sample_pairs": "",
+                "response_keys": "",
+                "error": msg[:1000],
+            })
+
+        # Small pause prevents a burst of private API requests.
+        time.sleep(0.7)
 
     return [], diagnostics
 
@@ -1554,6 +1596,17 @@ positions = st.session_state.get("positions", [])
 
 if positions:
     st.success("🟢 REAL OPEN POSITION(S) ADOPTED")
+elif st.session_state.get("position_diagnostics"):
+    errors = [
+        d.get("error", "")
+        for d in st.session_state["position_diagnostics"]
+        if d.get("http") == "ERROR"
+    ]
+    if errors:
+        st.error(
+            "CoinDCX private position API is rejecting the position request. "
+            "Read the ERROR column below; V5.8 now exposes the exact safe API response."
+        )
     st.dataframe(pd.DataFrame([{
         "Coin": p["pair"],
         "Side": p["side"],
@@ -1576,11 +1629,15 @@ else:
     diagnostics = st.session_state.get("position_diagnostics", [])
     if diagnostics:
         st.markdown("#### 🔎 Position API Diagnostics")
-        st.dataframe(pd.DataFrame(diagnostics), use_container_width=True, hide_index=True)
+        st.dataframe(
+            pd.DataFrame(diagnostics),
+            use_container_width=True,
+            hide_index=True,
+        )
 
         st.caption(
-            "INR-M is tried first with CoinDCX's margin_currency_short_name parameter, "
-            "followed by USDT and minimal requests. The agent will not guess a position "
+            "V5.8 deliberately makes only four position requests and shows the "
+            "actual safe CoinDCX HTTP/API error. The agent will not guess a position "
             "from a contract catalogue; it adopts only a verified non-zero position."
         )
 
